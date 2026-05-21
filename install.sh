@@ -6,6 +6,7 @@ name="${1:-srs}"
 rust_dir="${SRS_RUST_DIR:-$root/repos/rust}"
 toolchain_dir="${2:-}"
 cargo_bin="${3:-}"
+sld_bin="${SRS_SLD_BIN:-$root/target/sld/opt/sld}"
 
 if [[ -z "$toolchain_dir" ]]; then
     host_stage2="$rust_dir/build/host/stage2"
@@ -53,7 +54,21 @@ if [[ ! -x "$cargo_bin" ]]; then
     exit 2
 fi
 
+if [[ ! -x "$sld_bin" ]]; then
+    printf 'missing sld binary at %s; run %s/build-sld.sh first\n' "$sld_bin" "$root" >&2
+    exit 2
+fi
+
 # A linked Rust bootstrap sysroot does not include Cargo by default.
 ln -sf "$cargo_bin" "$toolchain_dir/bin/cargo"
+
+# Rustc prepends this per-target tools directory to PATH before spawning the
+# configured linker. Keep the baked-in default linker name relocatable.
+host="$("$toolchain_dir/bin/rustc" --print host-tuple)"
+tools_bin="$toolchain_dir/lib/rustlib/$host/bin"
+mkdir -p "$tools_bin"
+ln -sf "$sld_bin" "$tools_bin/sld"
+
 rustup toolchain link "$name" "$toolchain_dir"
 printf 'linked rustup toolchain %s -> %s\n' "$name" "$toolchain_dir"
+printf 'attached sld linker %s -> %s\n' "$tools_bin/sld" "$sld_bin"

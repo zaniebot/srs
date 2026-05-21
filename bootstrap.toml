@@ -12,3 +12,7 @@ download-ci-llvm = true
 channel = "dev"
 codegen-backends = ["llvm", "cranelift"]
 deny-warnings = false
+
+[target.aarch64-apple-darwin]
+linker = "cc"
+default-linker = "sld"

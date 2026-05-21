@@ -11,18 +11,20 @@ Cranelift backend needed to compile Astral workloads on macOS arm64.
   backend in the Rust fork.
 - `repos/sld/`: the pinned `zanieb/sld` linker checkout.
 - `bootstrap.toml`: Rust bootstrap configuration for the SRS toolchain build.
-- `build.sh`: builds a stage 2 Rust toolchain with LLVM and Cranelift backends,
-  plus Cargo from the Rust tree's Cargo submodule.
-- `build-sld.sh`: builds the `sld` binary with the linked SRS toolchain.
+- `build.sh`: builds `sld`, then a stage 2 Rust toolchain with LLVM and
+  Cranelift backends, plus Cargo from the Rust tree's Cargo submodule.
+- `build-sld.sh`: builds the `sld` binary, using the linked SRS toolchain by
+  default when called directly.
 - `install.sh`: links the built stage 2 toolchain into rustup under a custom
-  name and attaches the built Cargo binary to that linked sysroot.
+  name and attaches the built Cargo and `sld` binaries to that linked sysroot.
 - `prove-uv.sh`: builds `uv` with the installed SRS toolchain and Cranelift.
 - `with-sld.sh`: runs a command with the macOS Rust flags needed to link
   through SRS's built `sld` binary.
 
 The bootstrap config keeps LLVM first in `rust.codegen-backends`. This leaves
-the Rust compiler and default Cargo behavior on LLVM while the uv proof opts the
-dev profile into Cranelift explicitly.
+the Rust compiler and default Cargo codegen behavior on LLVM while the uv proof
+opts the dev profile into Cranelift explicitly. For macOS arm64, SRS bakes
+`sld` in as rustc's default linker.
 
 ## Quick Start
 
@@ -32,12 +34,11 @@ Initialize the pinned Rust, Cranelift, and sld source trees after cloning SRS:
 git submodule update --init repos/rust repos/cranelift repos/sld
 ```
 
-Build a stage 2 toolchain, link it into rustup as `srs`, and build sld:
+Build a stage 2 toolchain and link it into rustup as `srs`:
 
 ```bash
 ./build.sh
 ./install.sh
-./build-sld.sh
 ```
 
 Check that rustup can see it:
@@ -47,13 +48,19 @@ rustc +srs -Vv
 cargo +srs -Vv
 ```
 
-`./build.sh` is the slow step. Re-run it after changing Rust, cg_clif, or
-Cranelift. `./install.sh` relinks the resulting stage 2 sysroot; it does not
+`./build.sh` is the slow step. Re-run it after changing Rust, cg_clif,
+Cranelift, or the linker default. It builds `sld` with `stable` first so the
+installer can attach the pinned binary. Rust bootstrap stays on the system
+compiler driver while the installed SRS compiler defaults to `sld`; set
+`SRS_SLD_BOOTSTRAP_TOOLCHAIN` to choose another existing rustup toolchain for
+that step. `./install.sh` relinks the resulting stage 2 sysroot; it does not
 copy the toolchain.
 
 ## Usage
 
-The SRS toolchain still has LLVM available and uses it by default:
+The SRS toolchain still has LLVM available and uses it by default for codegen.
+On macOS arm64 it links through the `sld` binary attached to the installed
+toolchain:
 
 ```bash
 cargo +srs build
@@ -73,7 +80,9 @@ under SRS:
 ./prove-uv.sh ../uv
 ```
 
-`with-sld.sh` composes the same proof with `zanieb/sld` as the Darwin linker:
+`with-sld.sh` is useful when the `sld` choice needs to be explicit, such as
+testing a non-installed linker binary or composing the proof with another
+toolchain:
 
 ```bash
 ./with-sld.sh ./prove-uv.sh ../uv
@@ -91,13 +100,13 @@ CARGO_PROFILE_DEV_CODEGEN_BACKEND=cranelift \
 The wrapper sets the `RUSTFLAGS` form used by sld's own macOS Rust workflows:
 `-C linker=<sld> -C link-arg=-flavor -C link-arg=darwin`. By default it uses
 the `sld` binary from `./build-sld.sh` at `target/sld/opt/sld`; set
-`SRS_SLD_BIN` to test another binary.
+`SRS_SLD_BIN` to test another binary. Normal `cargo +srs` commands do not need
+the wrapper after `./install.sh`.
 
 Use a separate rustup toolchain name when keeping multiple SRS builds linked:
 
 ```bash
 ./install.sh srs-dev
-SRS_TOOLCHAIN=srs-dev ./build-sld.sh
 SRS_TOOLCHAIN=srs-dev ./prove-uv.sh ../uv
 ```
 
@@ -106,6 +115,8 @@ The installer also accepts an explicit stage 2 sysroot and Cargo binary:
 ```bash
 ./install.sh srs-dev /path/to/stage2 /path/to/cargo
 ```
+
+Set `SRS_SLD_BIN=/path/to/sld` when installing an alternate `sld` binary.
 
 ## Development
 
