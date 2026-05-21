@@ -1,0 +1,14 @@
+change-id = 999999
+profile = "compiler"
+
+[build]
+extended = true
+tools = ["cargo"]
+
+[llvm]
+download-ci-llvm = true
+
+[rust]
+channel = "dev"
+codegen-backends = ["llvm", "cranelift"]
+deny-warnings = false
