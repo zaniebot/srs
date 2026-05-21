@@ -17,14 +17,13 @@ Cranelift backend needed to compile Astral workloads on macOS arm64.
   default when called directly.
 - `install.sh`: links the built stage 2 toolchain into rustup under a custom
   name and attaches the built Cargo and `sld` binaries to that linked sysroot.
-- `prove-uv.sh`: builds `uv` with the installed SRS toolchain and Cranelift.
 - `with-sld.sh`: runs a command with the macOS Rust flags needed to link
   through SRS's built `sld` binary.
 
 The bootstrap config keeps LLVM first in `rust.codegen-backends`. This leaves
-the Rust compiler and default Cargo codegen behavior on LLVM while the uv proof
-opts the dev profile into Cranelift explicitly. For macOS arm64, SRS bakes
-`sld` in as rustc's default linker.
+the Rust compiler and default Cargo codegen behavior on LLVM while workloads
+opt into Cranelift explicitly. For macOS arm64, SRS bakes `sld` in as rustc's
+default linker.
 
 ## Quick Start
 
@@ -73,22 +72,9 @@ CARGO_PROFILE_DEV_CODEGEN_BACKEND=cranelift \
     cargo +srs build -Zcodegen-backend
 ```
 
-The repository includes a uv proof that keeps its Cargo home and build output
-under SRS:
-
-```bash
-./prove-uv.sh ../uv
-```
-
 `with-sld.sh` is useful when the `sld` choice needs to be explicit, such as
-testing a non-installed linker binary or composing the proof with another
+testing a non-installed linker binary or composing the linker with another
 toolchain:
-
-```bash
-./with-sld.sh ./prove-uv.sh ../uv
-```
-
-It wraps arbitrary Cargo commands too:
 
 ```bash
 ./with-sld.sh cargo +srs build
@@ -107,7 +93,8 @@ Use a separate rustup toolchain name when keeping multiple SRS builds linked:
 
 ```bash
 ./install.sh srs-dev
-SRS_TOOLCHAIN=srs-dev ./prove-uv.sh ../uv
+CARGO_PROFILE_DEV_CODEGEN_BACKEND=cranelift \
+    cargo +srs-dev build -Zcodegen-backend
 ```
 
 The installer also accepts an explicit stage 2 sysroot and Cargo binary:
