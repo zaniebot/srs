@@ -24,6 +24,7 @@ export PATH="$(dirname "$sld_bin"):$PATH"
 cd "$rust_dir"
 exec ./x build \
     --config "$root/bootstrap.toml" \
+    "$@" \
     --stage 2 \
     compiler/rustc \
     rustc_codegen_cranelift \

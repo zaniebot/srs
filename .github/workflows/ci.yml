@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build SRS
+    runs-on: macos-15
+    timeout-minutes: 360
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Build SRS
+        # Standard macOS arm64 runners are tight on storage for rustc stage2 builds.
+        run: ./build.sh --set=rust.incremental=false --set=rust.debuginfo-level=0
