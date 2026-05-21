@@ -20,10 +20,11 @@ Cranelift backend needed to compile Astral workloads on macOS arm64.
 - `with-sld.sh`: runs a command with the macOS Rust flags needed to link
   through SRS's built `sld` binary.
 
-The bootstrap config keeps LLVM first in `rust.codegen-backends`. This leaves
-the Rust compiler and default Cargo codegen behavior on LLVM while workloads
-opt into Cranelift explicitly. For macOS arm64, SRS bakes `sld` in as rustc's
-default linker.
+The bootstrap config keeps LLVM first in `rust.codegen-backends` and forces the
+bootstrap build back through LLVM. The Rust fork makes the installed macOS
+arm64 compiler prefer Cranelift for normal SRS workloads. LLVM stays available
+in the toolchain for explicit overrides. For macOS arm64, SRS bakes `sld` in as
+rustc's default linker.
 
 ## Quick Start
 
@@ -57,19 +58,12 @@ copy the toolchain.
 
 ## Usage
 
-The SRS toolchain still has LLVM available and uses it by default for codegen.
-On macOS arm64 it links through the `sld` binary attached to the installed
+The SRS toolchain uses Cranelift by default and still has LLVM available. On
+macOS arm64 it links through the `sld` binary attached to the installed
 toolchain:
 
 ```bash
 cargo +srs build
-```
-
-Opt a Cargo profile into the SRS Cranelift backend explicitly:
-
-```bash
-CARGO_PROFILE_DEV_CODEGEN_BACKEND=cranelift \
-    cargo +srs build -Zcodegen-backend
 ```
 
 `with-sld.sh` is useful when the `sld` choice needs to be explicit, such as
@@ -78,9 +72,6 @@ toolchain:
 
 ```bash
 ./with-sld.sh cargo +srs build
-
-CARGO_PROFILE_DEV_CODEGEN_BACKEND=cranelift \
-    ./with-sld.sh cargo +srs build -Zcodegen-backend
 ```
 
 The wrapper sets the `RUSTFLAGS` form used by sld's own macOS Rust workflows:
@@ -93,8 +84,7 @@ Use a separate rustup toolchain name when keeping multiple SRS builds linked:
 
 ```bash
 ./install.sh srs-dev
-CARGO_PROFILE_DEV_CODEGEN_BACKEND=cranelift \
-    cargo +srs-dev build -Zcodegen-backend
+cargo +srs-dev build
 ```
 
 The installer also accepts an explicit stage 2 sysroot and Cargo binary:

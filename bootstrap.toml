@@ -16,3 +16,4 @@ deny-warnings = false
 [target.aarch64-apple-darwin]
 linker = "cc"
 default-linker = "sld"
+rustflags = ["-Zcodegen-backend=llvm"]
