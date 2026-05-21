@@ -17,3 +17,6 @@ deny-warnings = false
 linker = "cc"
 default-linker = "sld"
 rustflags = ["-Zcodegen-backend=llvm"]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-Zcodegen-backend=llvm"]

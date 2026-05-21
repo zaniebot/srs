@@ -16,9 +16,20 @@ concurrency:
 
 jobs:
   build:
-    name: Build SRS
-    runs-on: macos-15
+    name: Build SRS and workloads (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-24.04
+          - name: macOS arm64
+            os: macos-15
+    env:
+      # Keep the workload builds from growing debug incremental caches on CI.
+      CARGO_INCREMENTAL: 0
 
     steps:
       - uses: actions/checkout@v6
@@ -29,3 +40,32 @@ jobs:
       - name: Build SRS
         # Standard macOS arm64 runners are tight on storage for rustc stage2 builds.
         run: ./build.sh --set=rust.incremental=false --set=rust.debuginfo-level=0
+
+      - name: Install SRS
+        run: ./install.sh
+
+      - name: Verify SRS default backend
+        run: |
+          rustc +srs -Vv
+          rustc +srs -Z unstable-options --print target-spec-json \
+            | grep -q '"default-codegen-backend": "cranelift"'
+
+      - uses: actions/checkout@v6
+        with:
+          repository: astral-sh/uv
+          persist-credentials: false
+          path: workloads/uv
+
+      - name: Build uv
+        working-directory: workloads/uv
+        run: cargo +srs build --locked -p uv
+
+      - uses: actions/checkout@v6
+        with:
+          repository: astral-sh/ruff
+          persist-credentials: false
+          path: workloads/ruff
+
+      - name: Build Ruff and ty
+        working-directory: workloads/ruff
+        run: cargo +srs build --locked -p ruff -p ty

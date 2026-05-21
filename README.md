@@ -22,9 +22,9 @@ Cranelift backend needed to compile Astral workloads on macOS arm64.
 
 The bootstrap config keeps LLVM first in `rust.codegen-backends` and forces the
 bootstrap build back through LLVM. The Rust fork makes the installed macOS
-arm64 compiler prefer Cranelift for normal SRS workloads. LLVM stays available
-in the toolchain for explicit overrides. For macOS arm64, SRS bakes `sld` in as
-rustc's default linker.
+arm64 and Linux x86_64 compilers prefer Cranelift for normal SRS workloads.
+LLVM stays available in the toolchain for explicit overrides. For macOS arm64,
+SRS bakes `sld` in as rustc's default linker.
 
 ## Quick Start
 
