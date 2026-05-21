@@ -1,9 +1,9 @@
 [submodule "repos/rust"]
 	path = repos/rust
-	url = https://github.com/rust-lang/rust.git
+	url = https://github.com/zanieb/srust.git
 [submodule "repos/cranelift"]
 	path = repos/cranelift
-	url = https://github.com/bytecodealliance/wasmtime.git
+	url = https://github.com/zanieb/scranelift.git
 [submodule "repos/sld"]
 	path = repos/sld
 	url = https://github.com/zanieb/sld.git
