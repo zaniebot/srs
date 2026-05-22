@@ -6,7 +6,8 @@ Cranelift backend needed to compile Astral workloads on macOS arm64.
 ## Layout
 
 - `repos/rust/`: the Rust fork that builds the toolchain and owns the
-  `compiler/rustc_codegen_cranelift` integration.
+  `compiler/rustc_codegen_cranelift` integration. Its `src/tools/cargo/`
+  submodule points at the SRS Cargo fork.
 - `repos/cranelift/`: the patched Wasmtime/Cranelift checkout consumed by the
   backend in the Rust fork.
 - `repos/sld/`: the pinned `zanieb/sld` linker checkout.
@@ -121,11 +122,14 @@ Set `SRS_SLD_BIN=/path/to/sld` when installing an alternate `sld` binary.
 
 ## Development
 
-Development happens inside each submodule. Commit Rust, Cranelift, and sld
-changes in their owning repositories, then stage the updated submodule paths in
-SRS to pin the integrated stack revision.
+Development happens inside each submodule. Cargo is nested under Rust because
+Rust bootstrap expects `src/tools/cargo`: commit Cargo changes in that checkout,
+stage its new submodule pin in Rust, commit Rust, then stage the updated Rust,
+Cranelift, and sld pins in SRS.
 
 ```bash
+git -C repos/rust/src/tools/cargo commit
+git -C repos/rust add src/tools/cargo
 git -C repos/cranelift commit
 git -C repos/rust commit
 git -C repos/sld commit
@@ -141,4 +145,4 @@ git submodule update --init repos/rust repos/cranelift repos/sld
 ```
 
 Fresh clones need the configured submodule remotes to contain the pinned SRS
-Rust, Cranelift, and sld commits.
+Rust, Cargo, Cranelift, and sld commits.
