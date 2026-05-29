@@ -1,0 +1,14 @@
+{
+    "configurations": [
+        {
+            "name": "sld-tests",
+            "browse": {
+                "path": [
+                    "${workspaceFolder}/sld/tests/sources"
+                ],
+                "limitSymbolsToIncludedHeaders": true
+            }
+        }
+    ],
+    "version": 4
+}

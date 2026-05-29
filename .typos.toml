@@ -1,0 +1,12 @@
+[default.extend-words]
+flate = "flate"
+rela = "rela"
+ot = "ot"
+FRE = "FRE"
+aranges = "aranges"
+
+[files]
+extend-exclude = [
+  "external_test_suites",
+  "sld/tests/bins",
+]

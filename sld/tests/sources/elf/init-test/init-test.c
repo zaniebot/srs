@@ -1,0 +1,19 @@
+//#Object:init.c
+//#Object:runtime.c
+//#CompArgs:default:
+//#CompArgs:-static -pie
+
+#include "../common/init.h"
+
+#include "../common/runtime.h"
+
+static int value = 0;
+
+void __attribute__((constructor(1000))) premain_priority() { value += 40; }
+void __attribute__((constructor)) premain() { value += 2; }
+
+void _start(void) {
+  runtime_init();
+  call_init_functions();
+  exit_syscall(value);
+}

@@ -1,0 +1,491 @@
+pub(crate) mod alignment;
+pub use args::Args;
+pub(crate) mod arch;
+pub(crate) mod archive;
+pub mod args;
+pub(crate) mod compression;
+pub(crate) mod debug_trace;
+pub(crate) mod diagnostics;
+pub(crate) mod diff;
+pub(crate) mod dwarf_address_info;
+pub(crate) mod elf;
+pub(crate) mod elf_aarch64;
+pub(crate) mod elf_loongarch64;
+pub(crate) mod elf_riscv64;
+pub(crate) mod elf_writer;
+pub(crate) mod elf_x86_64;
+pub mod error;
+pub(crate) mod export_list;
+pub(crate) mod expression_eval;
+pub(crate) mod file_kind;
+pub(crate) mod file_writer;
+pub(crate) mod fs;
+pub(crate) mod gc_stats;
+pub(crate) mod glob_match;
+pub(crate) mod grouping;
+pub(crate) mod hash;
+pub(crate) mod incremental;
+pub(crate) mod input_data;
+pub(crate) mod input_section_id;
+pub(crate) mod layout;
+pub(crate) mod layout_rules;
+#[cfg_attr(not(feature = "plugins"), path = "linker_plugins_disabled.rs")]
+mod linker_plugins;
+pub(crate) mod linker_script;
+pub(crate) mod macho;
+pub(crate) mod macho_aarch64;
+pub(crate) mod macho_writer;
+pub(crate) mod output_kind;
+pub(crate) mod output_section_id;
+pub(crate) mod output_section_map;
+pub(crate) mod output_section_part_map;
+pub(crate) mod output_trace;
+pub(crate) mod parsing;
+pub(crate) mod part_id;
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub(crate) mod perf;
+#[cfg(any(
+    not(target_os = "linux"),
+    all(
+        target_os = "linux",
+        any(target_arch = "riscv64", target_arch = "loongarch64")
+    )
+))]
+#[path = "perf_unsupported.rs"]
+pub(crate) mod perf;
+pub(crate) mod platform;
+pub(crate) mod program_segments;
+pub(crate) mod resolution;
+pub(crate) mod save_dir;
+pub(crate) mod sframe;
+pub(crate) mod sharding;
+pub(crate) mod string_merging;
+#[cfg(all(feature = "fork", unix))]
+pub(crate) mod subprocess;
+#[cfg(not(all(feature = "fork", unix)))]
+#[path = "subprocess_unsupported.rs"]
+pub(crate) mod subprocess;
+pub(crate) mod symbol;
+pub(crate) mod symbol_db;
+pub(crate) mod thunks;
+#[cfg(all(test, not(target_family = "wasm")))]
+mod tidy_tests;
+pub(crate) mod timing;
+pub(crate) mod validation;
+pub(crate) mod value_flags;
+pub(crate) mod verification;
+pub(crate) mod version_script;
+pub(crate) mod wasm;
+pub(crate) mod wasm_wasm32;
+
+pub fn print_incremental_log(writer: impl std::io::Write) -> error::Result {
+    incremental::print_global_log(writer)
+}
+
+use crate::elf::Elf;
+use crate::error::Context;
+use crate::error::Result;
+use crate::layout_rules::LayoutRulesBuilder;
+use crate::macho::MachO;
+use crate::output_kind::OutputKind;
+use crate::platform::Arch;
+use crate::platform::Args as _;
+use crate::platform::Platform;
+use crate::value_flags::PerSymbolFlags;
+use crate::version_script::VersionScript;
+use colosseum::sync::Arena;
+use crossbeam_utils::atomic::AtomicCell;
+use error::AlreadyInitialised;
+pub use fs::make_executable;
+use hashbrown::HashSet;
+use input_data::FileLoader;
+use input_data::InputFile;
+use input_data::InputLinkerScript;
+use layout_rules::LayoutRules;
+use output_section_id::OutputSections;
+use std::io::BufWriter;
+use std::io::Write;
+use std::path::Path;
+pub use subprocess::run_in_subprocess;
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+
+/// Runs the linker and cleans up associated resources. Only use this function if you've OK with
+/// waiting for cleanup.
+pub fn run(mut args: Args) -> error::Result {
+    let thread_pool = args.common_mut().activate_thread_pool()?;
+    let linker = Linker::new();
+    linker.run(&args, &thread_pool)?;
+    drop(linker);
+    timing::finalise_perfetto_trace()?;
+    Ok(())
+}
+
+/// Sets up whatever tracing, if any, is indicated by the supplied arguments. This can only be
+/// called once and only if nothing else has already set the global tracing dispatcher. Calling this
+/// is optional. If it isn't called, no tracing-based features will function. e.g. --time.
+pub fn setup_tracing(args: &Args) -> Result<(), AlreadyInitialised> {
+    if let Some(opts) = args.common().time_phase_options.as_ref() {
+        timing::init_tracing(opts)
+    } else if args.common().print_allocations.is_some() {
+        debug_trace::init()
+    } else {
+        tracing_subscriber::registry()
+            .with(fmt::layer())
+            .with(EnvFilter::from_default_env())
+            .try_init()
+            .map_err(|_| AlreadyInitialised)
+    }
+}
+
+/// This is effectively a data store for use while linking. It takes ownership of all the input data
+/// that we read, which allows the linking stages to borrow that data. Dropping this struct might be
+/// expensive, so the caller of the linker might want to think about when best to drop it - probably
+/// together with the `LinkerOutput`. Note, calling `exit` without dropping this struct is an
+/// option, but likely won't save any time, since the bulk of the work done during drop (unmapping
+/// pages) will still happen anyway.
+pub struct Linker {
+    /// We store our input files here once we've read them.
+    inputs_arena: Arena<InputFile>,
+
+    linker_plugin_arena: Arena<linker_plugins::LoadedPlugin>,
+
+    /// Anything that doesn't need a custom Drop implementation can go in here. In practice, it's
+    /// mostly just the decompressed copy of compressed string-merge sections.
+    herd: bumpalo_herd::Herd,
+
+    /// We'll fill this in when we're done linking and start shutting down. Once this is dropped,
+    /// that signals the end of shutdown for the purposes of timing measurement.
+    #[allow(dyn_drop)]
+    shutdown_scope: AtomicCell<Vec<Box<dyn Drop>>>,
+
+    /// A timing scope that exists for the whole time we're linking.
+    #[allow(dyn_drop)]
+    _link_scope: Vec<Box<dyn Drop>>,
+}
+
+pub struct LinkerOutput<'layout_inputs> {
+    #[allow(dyn_drop)]
+    /// This is just here so that we defer its destruction. This allows us to (a) measure how long
+    /// it takes to drop and (b) if we forked, signal our parent that we're done, then drop it in
+    /// the background.
+    layout: Option<Box<dyn Drop + 'layout_inputs>>,
+}
+
+impl Linker {
+    pub fn new() -> Self {
+        let (guard_a, guard_b) = timing_guard!("Link");
+
+        Self {
+            inputs_arena: Arena::new(),
+            linker_plugin_arena: Arena::new(),
+            herd: Default::default(),
+            shutdown_scope: Default::default(),
+            _link_scope: vec![Box::new(guard_a), Box::new(guard_b)],
+        }
+    }
+
+    /// Runs the linker. The returned value isn't useful for anything, but is somewhat expensive to
+    /// drop, so we leave it up to the caller to decide when to drop it. At the point at which we
+    /// return, the output file should be usable.
+    pub fn run<'layout_inputs>(
+        &'layout_inputs self,
+        args: &'layout_inputs Args,
+        // We don't actually use this, but take it as an argument to ensure that the caller has
+        // created it. We may decide to actually use it in future, if we stop using rayon's global
+        // thread pool.
+        _thread_pool: &crate::args::ThreadPool,
+    ) -> error::Result<LinkerOutput<'layout_inputs>> {
+        let identity = args.common().linker_identity();
+        match args.common().version_mode {
+            args::VersionMode::ExitAfterPrint => {
+                let mut stdout = std::io::stdout().lock();
+                writeln!(stdout, "{identity}")?;
+                return Ok(LinkerOutput { layout: None });
+            }
+            args::VersionMode::Verbose => {
+                let mut stdout = std::io::stdout().lock();
+                writeln!(stdout, "{identity}")?;
+                // Continue linking
+            }
+            args::VersionMode::None => {
+                // Don't print version
+            }
+        }
+
+        match args {
+            Args::Elf(elf_args) => Elf::link_for_arch(self, elf_args),
+            Args::MachO(macho_args) => MachO::link_for_arch(self, macho_args),
+            Args::Wasm(wasm_args) => crate::wasm::Wasm::link_for_arch(self, wasm_args),
+        }
+    }
+
+    fn link_for_arch<'data, P: Platform, A: Arch<Platform = P>>(
+        &'data self,
+        args: &'data P::Args,
+    ) -> error::Result<LinkerOutput<'data>> {
+        let mut file_loader = input_data::FileLoader::new(&self.inputs_arena);
+
+        // Note, we propagate errors from `link_with_input_data` after we've checked if any files
+        // changed. We want inputs-changed errors to take precedence over all other errors.
+        let result = self.load_inputs_and_link::<P, A>(&mut file_loader, args);
+
+        file_loader.verify_inputs_unchanged()?;
+
+        // Write the dependency file and inputs trace after successful linking.
+        if result.is_ok() {
+            if let Some(dep_file_path) = &args.dependency_file()
+                && !file_loader.loaded_files.is_empty()
+            {
+                write_dependency_file(dep_file_path, args.output(), &file_loader.loaded_files)
+                    .with_context(|| {
+                        format!(
+                            "Failed to write dependency file `{}`",
+                            dep_file_path.display()
+                        )
+                    })?;
+            }
+            if args.should_write_trace_file() && !file_loader.loaded_files.is_empty() {
+                let mut buf = BufWriter::new(std::io::stdout());
+                for input in &file_loader.loaded_files {
+                    writeln!(buf, "{}", input.filename.display())?;
+                }
+            }
+        }
+
+        result
+    }
+
+    fn load_inputs_and_link<'data, P: Platform, A: Arch<Platform = P>>(
+        &'data self,
+        file_loader: &mut FileLoader<'data>,
+        args: &'data P::Args,
+    ) -> error::Result<LinkerOutput<'data>> {
+        if incremental::maybe_reuse_output_before_loading(args)? {
+            return Ok(LinkerOutput { layout: None });
+        }
+
+        let mut plugin = P::maybe_init_linker_plugin(args, &self.linker_plugin_arena, &self.herd)?;
+
+        let loaded = file_loader.load_inputs::<P>(&args.common().inputs, args, &mut plugin);
+
+        args.common().save_dir.finish(file_loader, args)?;
+
+        let loaded = loaded?;
+
+        let incremental_state = incremental::maybe_prepare(args, file_loader)?;
+        if incremental_state.can_reuse_output() {
+            finish_incremental_update_after_input_check(
+                || file_loader.verify_inputs_unchanged(),
+                || {
+                    incremental_state.begin_update()?;
+                    incremental_state.finish(args, file_loader)
+                },
+            )?;
+            return Ok(LinkerOutput { layout: None });
+        }
+
+        let output_kind = OutputKind::new(args, file_loader);
+
+        let mut output = file_writer::Output::new(args, output_kind);
+
+        let mut output_sections =
+            OutputSections::with_base_address(P::start_memory_address(output_kind));
+
+        let mut layout_rules_builder = LayoutRulesBuilder::default();
+
+        let auxiliary = input_data::AuxiliaryFiles::new(args, &self.inputs_arena)?;
+
+        let mut symbol_db = symbol_db::SymbolDb::new(args, output_kind, &auxiliary, &self.herd)?;
+        let mut per_symbol_flags = PerSymbolFlags::new();
+
+        symbol_db.add_inputs(
+            &mut per_symbol_flags,
+            &mut output_sections,
+            &mut layout_rules_builder,
+            loaded,
+        )?;
+
+        // TODO: Doing this here means that we can't wrap symbols produced by the linker plugin.
+        // Moving it earlier or later however requires some rethought as to how this works.
+        symbol_db.apply_wrapped_symbol_overrides();
+
+        let mut resolver = resolution::Resolver::default();
+
+        resolver
+            .resolve_symbols_and_select_archive_entries(&mut symbol_db, &mut per_symbol_flags)?;
+
+        // Now that we know which archive entries are being loaded, we can resolve alternative
+        // symbol definitions.
+        crate::symbol_db::resolve_alternative_symbol_definitions(
+            &mut symbol_db,
+            &mut per_symbol_flags,
+            &resolver.resolved_groups,
+        )?;
+
+        if let Some(plugin) = plugin.as_mut()
+            && plugin.is_initialised()
+        {
+            P::plugin_all_symbols_read(
+                plugin,
+                &mut symbol_db,
+                &mut resolver,
+                file_loader,
+                &mut per_symbol_flags,
+                &mut output_sections,
+                &mut layout_rules_builder,
+            )?;
+        }
+
+        // If it's a rust version script, apply the global symbol visibility now.
+        // We previously downgraded all symbols to local visibility.
+        if let VersionScript::Rust(rust_vscript) = &symbol_db.version_script {
+            symbol_db.handle_rust_version_script(rust_vscript, &mut per_symbol_flags);
+        }
+
+        let layout_rules = layout_rules_builder.build::<P>(args);
+
+        let resolved = resolver.resolve_sections_and_canonicalise_undefined(
+            &mut symbol_db,
+            &mut per_symbol_flags,
+            &mut output_sections,
+            &layout_rules,
+        )?;
+
+        let layout = layout::compute::<P, A>(
+            symbol_db,
+            per_symbol_flags,
+            resolved,
+            output_sections,
+            &mut output,
+        )?;
+
+        incremental_state.begin_update()?;
+        P::write_output_file::<A>(&output, &layout, &incremental_state)?;
+        diff::maybe_diff()?;
+        finish_incremental_update_after_input_check(
+            || file_loader.verify_inputs_unchanged(),
+            || incremental_state.finish(args, file_loader),
+        )?;
+
+        // We've finished linking. We consider everything from this point onwards as shutdown.
+        let (g1, g2) = timing_guard!("Shutdown");
+        self.shutdown_scope.store(vec![Box::new(g1), Box::new(g2)]);
+
+        Ok(LinkerOutput {
+            layout: Some(Box::new(layout)),
+        })
+    }
+}
+
+#[inline]
+fn finish_incremental_update_after_input_check(
+    verify_inputs_unchanged: impl FnOnce() -> error::Result<()>,
+    finish_incremental_update: impl FnOnce() -> error::Result<()>,
+) -> error::Result<()> {
+    verify_inputs_unchanged()?;
+    finish_incremental_update()
+}
+
+impl Default for Linker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn incremental_update_is_not_finalised_when_input_check_fails() {
+        let finished = Cell::new(false);
+
+        let result = finish_incremental_update_after_input_check(
+            || Err(crate::error!("input changed")),
+            || {
+                finished.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(!finished.get());
+    }
+}
+
+impl Drop for Linker {
+    fn drop(&mut self) {
+        timing_phase!("Drop inputs");
+        self.inputs_arena = Arena::new();
+        self.herd = Default::default();
+    }
+}
+
+impl Drop for LinkerOutput<'_> {
+    fn drop(&mut self) {
+        timing_phase!("Drop layout");
+        self.layout.take();
+    }
+}
+
+/// Writes a dependency file in Makefile format.
+fn write_dependency_file(
+    dep_file_path: &Path,
+    output_path: &Path,
+    loaded_files: &[&InputFile],
+) -> std::io::Result<()> {
+    timing_phase!("Write dependency file");
+
+    let file = std::fs::File::create(dep_file_path)?;
+    let mut writer = BufWriter::new(file);
+
+    // Collect unique dependency paths
+    let mut seen = HashSet::new();
+    let mut deps = Vec::new();
+    for input_file in loaded_files {
+        // Skip temporary files. e.g. those generated by linker plugins.
+        if input_file.modifiers.temporary {
+            continue;
+        }
+
+        let path_str = input_file.filename.display().to_string();
+        if seen.insert(path_str.clone()) {
+            deps.push(path_str);
+        }
+    }
+
+    write!(writer, "{}:", output_path.display())?;
+
+    for dep in &deps {
+        write!(writer, " {dep}")?;
+    }
+
+    writeln!(writer)?;
+
+    for dep in &deps {
+        writeln!(writer, "\n{dep}:")?;
+    }
+
+    Ok(())
+}
+
+/// Possibly initialise timing if a timing-related environment variable is active and it was enabled
+/// in the build, otherwise, do nothing. See `BENCHMARKING.md` for details.
+pub fn init_timing() -> Result {
+    timing::setup()
+}
+
+pub fn should_fork(args: &Args) -> bool {
+    args.common().should_fork()
+}
+
+pub fn activate_thread_pool(args: &mut Args) -> Result<crate::args::ThreadPool> {
+    args.common_mut().activate_thread_pool()
+}

@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: ['main']
+  pull_request:
+    branches: ['**']
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  check-fmt:
+    uses: ./.github/workflows/check-fmt.yml
+
+  check-lint:
+    uses: ./.github/workflows/check-lint.yml
+
+  check-minimal-versions:
+    uses: ./.github/workflows/check-minimal-versions.yml
+
+  check-nix:
+    uses: ./.github/workflows/check-nix.yml
+
+  check-pinact:
+    uses: ./.github/workflows/check-pinact.yml
+
+  check-zizmor:
+    uses: ./.github/workflows/check-zizmor.yml
+    permissions:
+      contents: read
+      security-events: write
+
+  build-dev-binaries:
+    uses: ./.github/workflows/build-dev-binaries.yml
+
+  test:
+    uses: ./.github/workflows/test.yml
+
+  test-external:
+    uses: ./.github/workflows/test-external.yml
