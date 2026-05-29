@@ -28,6 +28,8 @@ use cargo_test_support::{Execs, basic_manifest, paths, project, str};
 enum Step {
     /// Exits with success with no messages.
     SuccessNoOutput = b'0',
+    /// Delegates to the real rustc.
+    RealRustc = b'r',
     /// Emits one suggested fix.
     ///
     /// The suggested fix involves updating the number of the first line
@@ -122,6 +124,12 @@ fn main() {
     }
     match seq.as_bytes()[successful_count] {
         b'0' => return,
+        b'r' => {
+            let r = std::process::Command::new("rustc")
+                .args(std::env::args_os().skip(1))
+                .status();
+            std::process::exit(r.unwrap().code().unwrap_or(2));
+        }
         b'1' => {
             output_suggestion(successful_count + 1);
         }
@@ -389,6 +397,57 @@ fn fix_no_suggestions() {
 "#]],
         "// fix-count 0",
     );
+}
+
+#[cargo_test]
+fn fix_is_fresh_after_prior_fix_but_not_after_check() {
+    let rustc = rustc_for_cargo_fix();
+    let p = project().file("src/lib.rs", "// fix-count 0").build();
+    let real_rustc_sequence = String::from_utf8(vec![Step::RealRustc as u8]).unwrap();
+
+    p.cargo("check --lib").run();
+
+    p.cargo("fix --allow-no-vcs --lib --verbose")
+        .env("RUSTC", &rustc)
+        .env("RUSTC_FIX_SHIM_SEQUENCE", &real_rustc_sequence)
+        .with_stderr_contains("[CHECKING] foo v0.0.1 ([ROOT]/foo)")
+        .run();
+    assert_eq!("1", p.read_file("rustc-fix-shim-count"));
+
+    p.cargo("fix --allow-no-vcs --lib --verbose")
+        .env("RUSTC", &rustc)
+        .env("RUSTC_FIX_SHIM_SEQUENCE", &real_rustc_sequence)
+        .with_stderr_contains("[FRESH] foo v0.0.1 ([ROOT]/foo)")
+        .run();
+    assert_eq!("1", p.read_file("rustc-fix-shim-count"));
+}
+
+#[cargo_test]
+fn fix_is_fresh_after_prior_fix_but_not_after_clippy_artifacts() {
+    let rustc = rustc_for_cargo_fix();
+    let clippy_driver = tools::wrapped_clippy_driver();
+    let p = project().file("src/lib.rs", "// fix-count 0").build();
+    let real_rustc_sequence = String::from_utf8(vec![Step::RealRustc as u8]).unwrap();
+
+    p.cargo("check --lib")
+        .env("RUSTC_WORKSPACE_WRAPPER", &clippy_driver)
+        .run();
+
+    p.cargo("fix --allow-no-vcs --lib --verbose")
+        .env("RUSTC", &rustc)
+        .env("RUSTC_WORKSPACE_WRAPPER", &clippy_driver)
+        .env("RUSTC_FIX_SHIM_SEQUENCE", &real_rustc_sequence)
+        .with_stderr_contains("[CHECKING] foo v0.0.1 ([ROOT]/foo)")
+        .run();
+    assert_eq!("1", p.read_file("rustc-fix-shim-count"));
+
+    p.cargo("fix --allow-no-vcs --lib --verbose")
+        .env("RUSTC", &rustc)
+        .env("RUSTC_WORKSPACE_WRAPPER", &clippy_driver)
+        .env("RUSTC_FIX_SHIM_SEQUENCE", &real_rustc_sequence)
+        .with_stderr_contains("[FRESH] foo v0.0.1 ([ROOT]/foo)")
+        .run();
+    assert_eq!("1", p.read_file("rustc-fix-shim-count"));
 }
 
 #[cargo_test]
