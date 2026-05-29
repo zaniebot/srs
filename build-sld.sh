@@ -2,7 +2,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-sld_dir="${SRS_SLD_DIR:-$root/repos/sld}"
+sld_dir="${SRS_SLD_DIR:-$root/sld}"
 toolchain="${SRS_TOOLCHAIN:-srs}"
 target_dir="${SRS_SLD_TARGET_DIR:-$root/target/sld}"
 cargo_home="${SRS_CARGO_HOME:-$root/cargo-home}"

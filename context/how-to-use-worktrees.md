@@ -2,86 +2,21 @@
 
 ## Purpose
 
-SRS is an integration repository: its gitlinks record the exact Rust, nested
-Cargo, Cranelift, and `sld` revisions that form a toolchain. Concurrent work
-should therefore have two kinds of isolation:
+SRS is a downstream monorepo. Its `rust/`, `cranelift/`, and `sld/` source
+trees are ordinary tracked content. Cargo and Clippy are ordinary tracked
+content under `rust/src/tools/cargo/` and `rust/src/tools/clippy/`.
 
-- one SRS superproject worktree for the integration branch and its build
-  outputs;
-- one linked worktree for each component repository used by that task.
+Use one SRS worktree per task. A task worktree isolates its branch, source
+edits, Rust bootstrap output, SRS build output, and Cargo home while keeping
+all downstream changes in one reviewable SRS commit history.
 
-Use the materialized repositories in the canonical SRS checkout as object
-stores and branch coordinators. Do not routinely initialize independent
-submodule repositories inside every task worktree. Linked component worktrees
-share the existing object databases, show up in `git worktree list`, prevent
-two agents from checking out the same component branch concurrently, still
-appear to SRS as normal gitlink checkouts, and can be removed cleanly when the
-task is finished.
-
-SRS tracks `repos/scargo` as an alias for `repos/rust/src/tools/cargo`. Rust
-owns the nested gitlink because bootstrap requires Cargo at that path. Use the
-SRS-level alias for ordinary Cargo navigation after the nested checkout is
-materialized; keep nested submodule operations pointed at `src/tools/cargo`.
-
-## Important Trap
-
-A new SRS worktree initially contains uninitialized gitlink paths. Before a
-component is materialized, this command does **not** inspect Cranelift:
-
-```bash
-git -C "$WT/repos/cranelift" status
-```
-
-Git walks upward and reports the SRS superproject instead. A leading `-` in
-`git submodule status` is a warning that the submodule is not registered or
-materialized. A directly linked component worktree must also be registered
-with `git submodule init` so status is informative. Do not branch, edit,
-build, or commit in a component path until its `--show-toplevel` check resolves
-to that component path.
-
-## Bootstrap The Store
-
-Designate one clean checkout as the persistent object store:
-
-```bash
-SRS=/Users/zanie/code/rust-toolchain/srs
-
-git -C "$SRS" status --short --branch
-git -C "$SRS" submodule init repos/rust repos/cranelift repos/sld
-git -C "$SRS" submodule status repos/rust repos/cranelift repos/sld
-```
-
-`git submodule init` registers URLs but does not checkout source or replace
-edits. If each component's `git rev-parse --show-toplevel` resolves to its
-component path, inspect the existing checkout before changing it:
-
-```bash
-git -C "$SRS/repos/rust" status --short --branch
-git -C "$SRS/repos/cranelift" status --short --branch
-git -C "$SRS/repos/sld" status --short --branch
-git -C "$SRS/repos/rust" submodule init src/tools/cargo
-git -C "$SRS/repos/rust" submodule status src/tools/cargo
-```
-
-Once nested Cargo is materialized at its own path, the tracked `repos/scargo`
-alias resolves to it. Inspect it with
-`git -C "$SRS/repos/scargo" status --short --branch` as well.
-
-If a component's `--show-toplevel` instead resolves to SRS itself, that
-component is not materialized. Only if its empty path is intentionally safe to
-populate, materialize the pinned repositories once in the canonical checkout:
-
-```bash
-git -C "$SRS" submodule update --init repos/rust repos/cranelift repos/sld
-git -C "$SRS/repos/rust" submodule update --init src/tools/cargo
-```
-
-Do not run these update commands over unrelated local component edits. Make a
-separate store checkout instead if the canonical component trees are in use.
+The remaining git submodules are nested external dependencies such as LLVM,
+documentation repositories, test suites, and linker fixtures. They are not
+the downstream source trees where ordinary SRS changes should be committed.
 
 ## Create A Task Worktree
 
-Use a unique SRS branch, directory, and eventual rustup toolchain name per
+Use a unique branch, directory, and eventual rustup toolchain name per
 concurrent task:
 
 ```bash
@@ -91,60 +26,44 @@ BRANCH=zb/<task-slug>
 BASE=main
 
 git -C "$SRS" worktree add -b "$BRANCH" "$WT" "$BASE"
-git -C "$WT" submodule init repos/rust repos/cranelift repos/sld
-
-rust_sha="$(git -C "$WT" rev-parse HEAD:repos/rust)"
-cranelift_sha="$(git -C "$WT" rev-parse HEAD:repos/cranelift)"
-sld_sha="$(git -C "$WT" rev-parse HEAD:repos/sld)"
-
-git -C "$SRS/repos/rust" worktree add --detach "$WT/repos/rust" "$rust_sha"
-git -C "$SRS/repos/cranelift" worktree add --detach "$WT/repos/cranelift" "$cranelift_sha"
-git -C "$SRS/repos/sld" worktree add --detach "$WT/repos/sld" "$sld_sha"
-
-git -C "$WT/repos/rust" submodule init src/tools/cargo
-cargo_sha="$(git -C "$WT/repos/rust" rev-parse HEAD:src/tools/cargo)"
-git -C "$SRS/repos/scargo" worktree add --detach \
-    "$WT/repos/rust/src/tools/cargo" "$cargo_sha"
+git -C "$WT" submodule update --init --recursive
+git -C "$WT" status --short --branch
 ```
 
-If `git worktree add` says the component object store does not contain a
-pinned commit, fetch that component in the canonical store or initialize a
-fresh store first. Do not silently substitute a nearby component revision.
+If external dependency initialization is not needed for a narrow edit, it may
+be deferred until the first build or test that needs those dependencies. Run
+the recursive update before treating a missing nested dependency as a source
+checkout problem.
 
-Verify the completed layout before doing any work:
+Verify the ordinary downstream trees before editing:
 
 ```bash
-test "$(git -C "$WT/repos/rust" rev-parse --show-toplevel)" = "$WT/repos/rust"
-test "$(git -C "$WT/repos/cranelift" rev-parse --show-toplevel)" = "$WT/repos/cranelift"
-test "$(git -C "$WT/repos/sld" rev-parse --show-toplevel)" = "$WT/repos/sld"
-test "$(git -C "$WT/repos/scargo" rev-parse --show-toplevel)" = \
-    "$WT/repos/rust/src/tools/cargo"
-
-git -C "$WT" submodule status repos/rust repos/cranelift repos/sld
-git -C "$WT/repos/rust" submodule status src/tools/cargo
+test "$(git -C "$WT" rev-parse --show-toplevel)" = "$WT"
+test -f "$WT/rust/x"
+test -f "$WT/rust/src/tools/cargo/Cargo.toml"
+test -f "$WT/rust/src/tools/clippy/Cargo.toml"
+test -f "$WT/cranelift/Cargo.toml"
+test -f "$WT/sld/Cargo.toml"
 ```
 
-The four status lines must not start with `-`. Before edits, the top-level
-three SHAs should match the SRS gitlinks exactly.
+## Work In The Monorepo
 
-## Work In Components
-
-Leave an untouched component detached at its SRS pin. Create branches only in
-the repositories that the task changes:
+Edit the task worktree directly:
 
 ```bash
-git -C "$WT/repos/cranelift" switch -c "$BRANCH"
-git -C "$WT/repos/sld" switch -c "$BRANCH"
-git -C "$WT/repos/rust" switch -c "$BRANCH"
-git -C "$WT/repos/scargo" switch -c "$BRANCH"
+cd "$WT"
+$EDITOR rust/compiler/rustc_codegen_cranelift/src/lib.rs
+$EDITOR rust/src/tools/cargo/src/cargo/core/compiler/mod.rs
+$EDITOR cranelift/cranelift/codegen/src/lib.rs
+$EDITOR sld/sld/src/main.rs
 ```
 
-Use only the applicable lines. The same branch label may be used across these
-separate repositories, but a distinct task must use a distinct label.
+Use only the applicable paths. Cargo and Clippy are edited at their bootstrap
+paths under `rust/src/tools/`; there is no SRS-level Cargo alias.
 
 Keep builds rooted in the task worktree. Running SRS scripts from `$WT` places
 SRS `target/` and `cargo-home/` there, while Rust bootstrap writes under
-`$WT/repos/rust/build/`:
+`$WT/rust/build/`:
 
 ```bash
 cd "$WT"
@@ -173,9 +92,9 @@ SRS_SLD_BIN="$WT/target/sld-stable/opt/sld" \
 ```
 
 Do not assume unqualified `./build-sld.sh` is a usable linker-proof setup: by
-default it builds `sld` with `+srs`, which is itself useful for backend
-coverage but may fail if the current Cranelift toolchain cannot compile an
-intrinsic used by the linker.
+default it builds `sld` with `+srs`, which is useful for backend coverage but
+may fail if the current Cranelift toolchain cannot compile an intrinsic used
+by the linker.
 
 Put throwaway smoke crates and logs under ignored task-local output paths such
 as `$WT/target/fixtures/` or an experiment-owned artifact directory. Do not
@@ -185,123 +104,85 @@ Build success is setup evidence, not a behavioral result. Run and record the
 relevant workload, test, or reproducer before claiming a toolchain change
 works.
 
-## Commit The Stack
+## Commit Downstream Changes
 
-Commit leaf repositories first, then commit the gitlinks that consume them.
-For a task touching every layer, the dependency order is:
+Stage only the files changed for the task, inspect the staged diff, and commit
+once the relevant validation is complete:
 
 ```bash
-git -C "$WT/repos/scargo" commit
-git -C "$WT/repos/rust" add src/tools/cargo
-git -C "$WT/repos/rust" commit
-
-git -C "$WT/repos/cranelift" commit
-git -C "$WT/repos/sld" commit
-
-git -C "$WT" add repos/rust repos/cranelift repos/sld
-git -C "$WT" diff --cached --submodule=short
+git -C "$WT" status --short
+git -C "$WT" add -- <changed-paths>
+git -C "$WT" diff --cached --stat
+git -C "$WT" diff --cached
 git -C "$WT" commit
 ```
 
-Skip untouched repositories and stage only the pins the task changed. The SRS
-commit is the integration record; it should not point at uncommitted component
-work.
+Changes under `rust/`, `rust/src/tools/cargo/`, `rust/src/tools/clippy/`,
+`cranelift/`, and `sld/` are committed together in SRS as ordinary files.
 
-## Share The Stack
+## Pull Upstream Updates
 
-Local linked-worktree commits are sufficient for local builds, but another
-machine cannot check out an SRS pin until its referenced component commit is
-available from that component's configured remote. If the user explicitly asks
-to publish a task, first verify that `origin` is the intended remote for each
-repository, then push in dependency order:
+Use the repository-owned import script for upstream updates:
 
 ```bash
-git -C "$WT/repos/scargo" push -u origin "$BRANCH"
-git -C "$WT/repos/rust" push -u origin "$BRANCH"
-git -C "$WT/repos/cranelift" push -u origin "$BRANCH"
-git -C "$WT/repos/sld" push -u origin "$BRANCH"
+cd "$WT"
+git status --short
+before="$(git rev-parse HEAD)"
+./scripts/pull-upstream.sh rust
+git log --oneline "$before"..HEAD
+git diff --stat "$before"..HEAD
+git diff "$before"..HEAD
+```
+
+Pass one of `rust`, `cargo`, `cranelift`, or `sld`, plus an optional upstream
+ref. Start from a clean worktree: the script creates reviewable subtree import
+and metadata commits. Inspect the full commit range, initialize any newly
+introduced external dependency submodules, and run the relevant validation
+before sharing the update:
+
+```bash
+git submodule update --init --recursive
+```
+
+## Share Work
+
+A local SRS commit is sufficient for local builds. Never push a branch or open
+a pull request unless the user explicitly asks for that public action. When the
+user does ask to publish, inspect the configured SRS remote and push only the
+SRS task branch:
+
+```bash
+git -C "$WT" remote -v
 git -C "$WT" push -u origin "$BRANCH"
 ```
 
-The Rust push must come after Cargo if Rust advances the nested Cargo gitlink.
-The SRS push must come last after every changed component pin is remotely
-reachable. Never push or open pull requests unless the user asks for that
-public action.
-
 ## Inspect Concurrent Work
 
-The canonical stores provide a single view of component worktrees:
+The canonical SRS checkout provides one view of active task worktrees:
 
 ```bash
 git -C "$SRS" worktree list
-git -C "$SRS/repos/rust" worktree list
-git -C "$SRS/repos/scargo" worktree list
-git -C "$SRS/repos/cranelift" worktree list
-git -C "$SRS/repos/sld" worktree list
 ```
 
-Before rebasing or replacing a shared base branch, use these lists to find
-active work. Never reuse another task's build output directory or rustup
-toolchain name as a shortcut.
+Before rebasing or replacing a shared base branch, use this list to find active
+work. Never reuse another task's build output directory or rustup toolchain
+name as a shortcut.
 
 ## Clean Up
 
-First verify that intended changes have been committed or otherwise preserved:
+First verify that intended changes and results have been committed or otherwise
+preserved:
 
 ```bash
 git -C "$WT" status --short --branch
-git -C "$WT/repos/rust" status --short --branch
-git -C "$WT/repos/scargo" status --short --branch
-git -C "$WT/repos/cranelift" status --short --branch
-git -C "$WT/repos/sld" status --short --branch
 ```
 
-Remove a completed task from the leaves upward:
+Then remove the completed task worktree from the canonical checkout:
 
 ```bash
-git -C "$SRS/repos/scargo" worktree remove "$WT/repos/rust/src/tools/cargo"
-mkdir -p "$WT/repos/rust/src/tools/cargo"
-git -C "$SRS/repos/rust" worktree remove "$WT/repos/rust"
-git -C "$SRS/repos/cranelift" worktree remove "$WT/repos/cranelift"
-git -C "$SRS/repos/sld" worktree remove "$WT/repos/sld"
-mkdir -p "$WT/repos/rust" "$WT/repos/cranelift" "$WT/repos/sld"
 git -C "$SRS" worktree remove "$WT"
+git -C "$SRS" worktree prune
 ```
 
-The empty `mkdir` placeholders keep the parent gitlink worktree clean after
-its child worktree is removed. Do not use force removal on a task worktree
-containing unpreserved results.
-
-## Workflow Proof
-
-This layout was exercised from a disposable SRS worktree on macOS:
-
-- A new superproject worktree reported all top-level gitlinks with a leading
-  `-`, and `git -C repos/cranelift rev-parse --show-toplevel` resolved to the
-  superproject, confirming the initialization trap.
-- After registering the gitlinks with `git submodule init`, linked worktrees
-  for pinned `repos/rust`, nested `src/tools/cargo`, `repos/cranelift`, and
-  `repos/sld` all resolved to their own paths and made `git submodule status`
-  report initialized pins.
-- The populated task checkout occupied about `504M`; it did not inherit the
-  canonical Rust checkout's existing `26G` `build/` directory.
-- A disposable commit made only in the task's Cranelift worktree appeared as a
-  stageable `repos/cranelift` gitlink change in SRS, while the canonical
-  Cranelift worktree stayed at its original pin.
-- A comparison worktree initialized through `git submodule update` remained
-  ineligible for ordinary `git worktree remove` even after its component was
-  deinitialized; Git required forced removal. The linked-component layout was
-  removed cleanly after recreating empty gitlink placeholders.
-- In a subagent-owned edit-path smoke, committed disposable markers in nested
-  Cargo, Cranelift, and `sld` promoted cleanly through a Rust gitlink commit
-  and then an SRS gitlink commit. The canonical component stores remained
-  clean at their original revisions throughout.
-- In a subagent-owned experiment `226` smoke, unqualified `./build-sld.sh`
-  produced an `sld` linked with `+srs` that failed while linking a tiny Darwin
-  executable because Cranelift reported unsupported
-  `llvm.aarch64.crypto.sha256h`. Rebuilding only `sld` with
-  `SRS_TOOLCHAIN=stable` and linking an ignored-path `cargo +srs` smoke
-  succeeded with runtime output `sld-smoke-guided-ok:10`.
-
-This proves the isolation and gitlink-promotion workflow. Each actual compiler,
-backend, or linker change still needs its own build and workload-level proof.
+Do not use force removal on a task worktree containing unpreserved changes or
+results.

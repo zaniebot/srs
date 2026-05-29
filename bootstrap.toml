@@ -3,7 +3,7 @@ profile = "compiler"
 
 [build]
 extended = true
-tools = ["cargo"]
+tools = ["cargo", "clippy"]
 
 [llvm]
 download-ci-llvm = true

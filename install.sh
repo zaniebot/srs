@@ -3,7 +3,7 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 name="${1:-srs}"
-rust_dir="${SRS_RUST_DIR:-$root/repos/rust}"
+rust_dir="${SRS_RUST_DIR:-$root/rust}"
 toolchain_dir="${2:-}"
 cargo_bin="${3:-}"
 sld_bin="${SRS_SLD_BIN:-$root/target/sld/opt/sld}"

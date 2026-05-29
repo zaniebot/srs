@@ -204,6 +204,8 @@ pub const LLVM_INVALIDATION_PATHS: &[&str] = &[
 pub(crate) fn detect_llvm_freshness(config: &Config, is_git: bool) -> PathFreshness {
     if is_git {
         config.check_path_modifications(LLVM_INVALIDATION_PATHS)
+    } else if let Ok(commit) = fs::read_to_string(config.src.join("ci-llvm-commit")) {
+        PathFreshness::LastModifiedUpstream { upstream: commit.trim().to_owned() }
     } else if let Some(info) = crate::utils::channel::read_commit_info_file(&config.src) {
         PathFreshness::LastModifiedUpstream { upstream: info.sha.trim().to_owned() }
     } else {

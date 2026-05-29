@@ -1,24 +1,25 @@
 # SRS
 
-SRS is the slop Rust stack: a forked Rust toolchain that carries the patched
-Cranelift backend needed to compile Astral workloads on macOS arm64.
+SRS is the slop Rust stack: a downstream Rust toolchain repository that carries
+the patched Cranelift backend needed to compile Astral workloads on macOS arm64.
 
 ## Layout
 
-- `repos/rust/`: the Rust fork that builds the toolchain and owns the
-  `compiler/rustc_codegen_cranelift` integration. Its `src/tools/cargo/`
-  submodule points at the SRS Cargo fork.
-- `repos/scargo/`: an SRS-level alias for `repos/rust/src/tools/cargo/`.
-  Rust owns the nested Cargo gitlink because bootstrap requires that path;
-  the alias keeps every SRS component visible under `repos/`.
-- `repos/cranelift/`: the patched Wasmtime/Cranelift checkout consumed by the
-  backend in the Rust fork.
-- `repos/sld/`: the pinned `zanieb/sld` linker checkout.
+- `rust/`: the downstream Rust source tree that builds the toolchain and owns
+  the `compiler/rustc_codegen_cranelift` integration.
+- `rust/src/tools/cargo/`: Cargo, tracked as ordinary SRS content because
+  bootstrap requires it at this path.
+- `rust/src/tools/clippy/`: Clippy, also tracked as ordinary SRS content.
+- `cranelift/`: the patched Wasmtime/Cranelift source tree consumed by the
+  backend in `rust/`.
+- `sld/`: the downstream `sld` linker source tree.
 - `bootstrap.toml`: Rust bootstrap configuration for the SRS toolchain build.
 - `build.sh`: builds `sld`, then a stage 2 Rust toolchain with LLVM and
-  Cranelift backends, plus Cargo from the Rust tree's Cargo submodule.
+  Cranelift backends, plus Cargo from the Rust tree.
 - `build-sld.sh`: builds the `sld` binary, using the linked SRS toolchain by
   default when called directly.
+- `scripts/pull-upstream.sh`: refreshes the imported downstream source trees
+  from their upstream repositories for review.
 - `scripts/build-apple-containers.sh`: builds the Linux x86_64 SRS lane from
   macOS through Apple containers.
 - `install.sh`: links the built stage 2 toolchain into rustup under a custom
@@ -29,8 +30,8 @@ Cranelift backend needed to compile Astral workloads on macOS arm64.
   through SRS's built `sld` binary.
 
 The bootstrap config keeps LLVM first in `rust.codegen-backends` and forces the
-bootstrap build back through LLVM. The Rust fork makes the installed macOS
-arm64 and Linux x86_64 compilers prefer Cranelift for normal SRS target
+bootstrap build back through LLVM. The Rust source tree makes the installed
+macOS arm64 and Linux x86_64 compilers prefer Cranelift for normal SRS target
 artifacts. The installed Cargo wrapper keeps build scripts, proc macros, and
 their host-side dependencies on LLVM because those helpers run during the
 build and can exercise host intrinsics that Cranelift does not support yet.
@@ -39,12 +40,16 @@ SRS bakes `sld` in as rustc's default linker.
 
 ## Quick Start
 
-Initialize the pinned component source trees after cloning SRS:
+Initialize the remaining external dependency submodules after cloning SRS:
 
 ```bash
-git submodule update --init repos/rust repos/cranelift repos/sld
-git -C repos/rust submodule update --init src/tools/cargo
+git submodule update --init --recursive
 ```
+
+The top-level `rust/`, `cranelift/`, and `sld/` trees are already present in the
+SRS checkout. Cargo and Clippy are already present under `rust/src/tools/`.
+Submodules are reserved for nested external dependencies such as LLVM,
+documentation repositories, test suites, and linker fixtures.
 
 Build a stage 2 toolchain and link it into rustup as `srs`:
 
@@ -60,9 +65,9 @@ rustc +srs -Vv
 cargo +srs -Vv
 ```
 
-`./build.sh` is the slow step. Re-run it after changing Rust, cg_clif,
-Cranelift, or the linker default. It builds `sld` with `stable` first so the
-installer can attach the pinned binary. Rust bootstrap stays on the system
+`./build.sh` is the slow step. Re-run it after changing Rust, Cargo, Clippy,
+cg_clif, Cranelift, or the linker default. It builds `sld` with `stable` first so the
+installer can attach the built binary. Rust bootstrap stays on the system
 compiler driver while the installed SRS compiler defaults to `sld`; set
 `SRS_SLD_BOOTSTRAP_TOOLCHAIN` to choose another existing rustup toolchain for
 that step. `./install.sh` relinks the resulting stage 2 sysroot; it does not
@@ -130,29 +135,33 @@ Set `SRS_SLD_BIN=/path/to/sld` when installing an alternate `sld` binary.
 
 ## Development
 
-Development happens inside each component checkout. `repos/scargo/` is an alias
-for the Cargo checkout nested under Rust because bootstrap expects
-`src/tools/cargo`: commit Cargo changes through the alias, stage its new
-submodule pin in Rust, commit Rust, then stage the updated Rust, Cranelift, and
-sld pins in SRS.
+All downstream source changes are ordinary SRS changes. Create one SRS
+worktree per task, edit `rust/`, `cranelift/`, `sld/`, or
+`rust/src/tools/{cargo,clippy}/` directly, and commit the resulting files in
+SRS. The SRS branch is the only branch needed for downstream development.
+
+Read [`context/how-to-use-worktrees.md`](context/how-to-use-worktrees.md) before
+starting concurrent work.
+
+Refresh imported source trees through the reviewable upstream-update script:
 
 ```bash
-git -C repos/scargo commit
-git -C repos/rust add src/tools/cargo
-git -C repos/cranelift commit
-git -C repos/rust commit
-git -C repos/sld commit
-git add repos/cranelift repos/rust repos/sld
-git commit
+before="$(git rev-parse HEAD)"
+./scripts/pull-upstream.sh rust
+git log --oneline "$before"..HEAD
+git diff --stat "$before"..HEAD
+git diff "$before"..HEAD
 ```
 
-After pulling an SRS change that advances any source pin, update the
-submodules before rebuilding:
+Pass one of `rust`, `cargo`, `cranelift`, or `sld`, plus an optional upstream
+ref. The script creates reviewable import and metadata commits. Review those
+commits and run appropriate validation before sharing them.
+After pulling an SRS change that advances a nested external dependency pin,
+initialize or refresh those external dependencies before rebuilding:
 
 ```bash
-git submodule update --init repos/rust repos/cranelift repos/sld
-git -C repos/rust submodule update --init src/tools/cargo
+git submodule update --init --recursive
 ```
 
-Fresh clones need the configured submodule remotes to contain the pinned SRS
-Rust, Cargo, Cranelift, and sld commits.
+Never push branches or open pull requests unless the user explicitly asks for
+that public action.

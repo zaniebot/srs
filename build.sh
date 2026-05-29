@@ -2,7 +2,7 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-rust_dir="${SRS_RUST_DIR:-$root/repos/rust}"
+rust_dir="${SRS_RUST_DIR:-$root/rust}"
 sld_target_dir="${SRS_SLD_TARGET_DIR:-$root/target/sld}"
 sld_bin="$sld_target_dir/opt/sld"
 
@@ -29,4 +29,5 @@ exec ./x build \
     compiler/rustc \
     rustc_codegen_cranelift \
     library/std \
-    src/tools/cargo
+    src/tools/cargo \
+    src/tools/clippy
