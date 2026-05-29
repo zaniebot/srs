@@ -1,0 +1,176 @@
+use crate::alignment::Alignment;
+use crate::alignment::NUM_ALIGNMENTS;
+use crate::output_section_id::EH_FRAME as EH_FRAME_SECTION;
+use crate::output_section_id::FINI;
+use crate::output_section_id::INIT;
+use crate::output_section_id::OutputSectionId;
+use crate::output_section_id::OutputSections;
+use crate::platform;
+use crate::platform::Platform;
+use std::fmt::Debug;
+
+/// An ID for a part of an output section. Parts IDs are ordered with generated
+/// single-part-per-section parts first, followed by parts that belong to multi-part sections,
+/// followed by sections that are partitioned by alignment and lastly custom sections, which are
+/// also partitioned by alignment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct PartId(u32);
+
+// Part ID for stuff that isn't directly mapped to an output part. Discarded sections will be placed
+// here. GCed sections won't - they'll have the part ID they would have been placed in had they not
+// been GCed. This is also used for various sections that we don't just copy, e.g. eh_frame.
+pub(crate) const UNMAPPED: PartId = PartId(0);
+// Sections that we generate ourselves rather than copying directly from input objects.
+pub(crate) const FILE_HEADER: PartId = PartId(1);
+pub(crate) const PROGRAM_HEADERS: PartId = PartId(2);
+pub(crate) const SECTION_HEADERS: PartId = PartId(3);
+pub(crate) const SHSTRTAB: PartId = PartId(4);
+pub(crate) const STRTAB: PartId = PartId(5);
+pub(crate) const GOT: PartId = PartId(6);
+pub(crate) const PLT_GOT: PartId = PartId(7);
+pub(crate) const RELA_PLT: PartId = PartId(8);
+pub(crate) const EH_FRAME: PartId = PartId(9);
+pub(crate) const EH_FRAME_HDR: PartId = PartId(10);
+pub(crate) const SFRAME: PartId = PartId(11);
+pub(crate) const DYNAMIC: PartId = PartId(12);
+pub(crate) const SYSV_HASH: PartId = PartId(13);
+pub(crate) const GNU_HASH: PartId = PartId(14);
+pub(crate) const DYNSYM: PartId = PartId(15);
+pub(crate) const DYNSTR: PartId = PartId(16);
+pub(crate) const INTERP: PartId = PartId(17);
+pub(crate) const GNU_VERSION: PartId = PartId(18);
+pub(crate) const GNU_VERSION_D: PartId = PartId(19);
+pub(crate) const GNU_VERSION_R: PartId = PartId(20);
+pub(crate) const NOTE_GNU_PROPERTY: PartId = PartId(21);
+pub(crate) const NOTE_GNU_BUILD_ID: PartId = PartId(22);
+pub(crate) const SYMTAB_LOCAL: PartId = PartId(23);
+pub(crate) const SYMTAB_GLOBAL: PartId = PartId(24);
+pub(crate) const RELA_DYN_RELATIVE: PartId = PartId(25);
+pub(crate) const RELA_DYN_GENERAL: PartId = PartId(26);
+pub(crate) const RISCV_ATTRIBUTES: PartId = PartId(27);
+pub(crate) const RELRO_PADDING: PartId = PartId(28);
+pub(crate) const RELR_DYN: PartId = PartId(29);
+pub(crate) const SYMTAB_SHNDX_LOCAL: PartId = PartId(30);
+pub(crate) const SYMTAB_SHNDX_GLOBAL: PartId = PartId(31);
+// Mach-O specific sections
+pub(crate) const PAGEZERO_SEGMENT: PartId = PartId(32);
+pub(crate) const TEXT_SEGMENT: PartId = PartId(33);
+pub(crate) const DATA_SEGMENT: PartId = PartId(34);
+pub(crate) const LINK_EDIT_SEGMENT: PartId = PartId(35);
+pub(crate) const ENTRY_POINT: PartId = PartId(36);
+pub(crate) const BUILD_VERSION: PartId = PartId(37);
+pub(crate) const DYLD_CHAINED_FIXUPS: PartId = PartId(38);
+pub(crate) const CHAINED_FIXUP_TABLE: PartId = PartId(39);
+pub(crate) const SYMTAB_COMMAND: PartId = PartId(40);
+pub(crate) const UUID_COMMAND: PartId = PartId(41);
+pub(crate) const LIBSYSTEM: PartId = PartId(42);
+pub(crate) const ID_DYLIB: PartId = PartId(43);
+pub(crate) const MACHO_UNWIND_INFO: PartId = PartId(44);
+pub(crate) const CODE_SIGNATURE_COMMAND: PartId = PartId(45);
+pub(crate) const CODE_SIGNATURE: PartId = PartId(46);
+
+pub(crate) const NUM_SINGLE_PART_SECTIONS: u32 = 47;
+
+#[cfg(test)]
+pub(crate) const NUM_BUILT_IN_PARTS: usize = NUM_SINGLE_PART_SECTIONS as usize
+    + crate::output_section_id::NUM_BUILT_IN_REGULAR_SECTIONS * crate::alignment::NUM_ALIGNMENTS;
+
+/// A placeholder used for custom sections before we know their actual PartId.
+pub(crate) const CUSTOM_PLACEHOLDER: PartId = PartId(u32::MAX);
+
+/// Returns whether the supplied section meets our criteria for section merging. Section merging is
+/// optional, so there are cases where we might be able to merge, but don't currently. For example
+/// if alignment is > 1.
+pub(crate) fn should_merge_sections(
+    section_header: &impl platform::SectionHeader,
+    section_alignment: u64,
+    args: &impl platform::Args,
+) -> bool {
+    if !args.should_merge_sections() {
+        return false;
+    }
+    section_header.is_merge_section() && section_alignment <= 1
+}
+
+impl PartId {
+    pub(crate) const fn output_section_id(self) -> OutputSectionId {
+        if self.0 < NUM_SINGLE_PART_SECTIONS {
+            OutputSectionId::from_u32(self.0)
+        } else {
+            OutputSectionId::from_u32(
+                (self.0 - NUM_SINGLE_PART_SECTIONS) / (NUM_ALIGNMENTS as u32)
+                    + NUM_SINGLE_PART_SECTIONS,
+            )
+        }
+    }
+
+    pub(crate) fn from_usize(raw: usize) -> Self {
+        PartId(u32::try_from(raw).expect("Part IDs overflowed 32 bits"))
+    }
+
+    pub(crate) fn as_usize(self) -> usize {
+        self.0 as usize
+    }
+
+    pub(crate) fn offset(self, offset: usize) -> PartId {
+        PartId(self.0 + offset as u32)
+    }
+
+    pub(crate) const fn from_u32(value: u32) -> PartId {
+        PartId(value)
+    }
+
+    pub(crate) fn alignment<P: Platform>(
+        self,
+        output_sections: &OutputSections<'_, P>,
+    ) -> Alignment {
+        if let Some(offset) = self.0.checked_sub(NUM_SINGLE_PART_SECTIONS) {
+            Alignment {
+                exponent: NUM_ALIGNMENTS as u8 - 1 - (offset % NUM_ALIGNMENTS as u32) as u8,
+            }
+        } else {
+            self.output_section_id().min_alignment(output_sections)
+        }
+    }
+}
+
+impl PartId {
+    /// Returns whether we should skip adding padding after this section. The `.init` section
+    /// `crti.o` contains the start of a function and `crtn.o` contains the end of that function. If
+    /// `.init` has say alignment = 4 and we add padding after it to bring it up to a multiple of 4
+    /// bytes, then we'll break the function, since the padding bytes won't be valid instructions.
+    /// `.eh_frame` is also a contiguous frame stream where padding can look like a terminator.
+    pub(crate) fn should_pack(self) -> bool {
+        let section_id = self.output_section_id();
+        section_id == EH_FRAME_SECTION || section_id == INIT || section_id == FINI
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn built_in_part_ids()
+-> impl ExactSizeIterator<Item = PartId> + DoubleEndedIterator<Item = PartId> {
+    (0..NUM_BUILT_IN_PARTS).map(|n| PartId(n as u32))
+}
+
+impl std::fmt::Display for PartId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.as_usize(), f)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_conversion_consistency() {
+        let output_sections = OutputSections::<crate::elf::Elf>::for_testing();
+        for i in NUM_SINGLE_PART_SECTIONS..NUM_SINGLE_PART_SECTIONS + 40 {
+            let part_id = PartId::from_u32(i);
+            let section_id = part_id.output_section_id();
+            let alignment = part_id.alignment(&output_sections);
+            let part_id2 = section_id.part_id_with_alignment(alignment);
+            assert_eq!(part_id, part_id2);
+        }
+    }
+}

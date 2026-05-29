@@ -1,0 +1,78 @@
+name = "ryzen-9955hx"
+
+[bench.bevy-dylib]
+skip_linkers = ["bfd"]
+
+[bench.c-hello-world]
+
+[bench.chrome]
+min_sld_version = "0.6.0"
+skip_linkers = ["bfd"]
+
+[bench.chrome-crel]
+min_sld_version = "0.8.0"
+skip_linkers = ["bfd"]
+
+[bench.clang-debug]
+skip_linkers = ["bfd"]
+
+[bench.clang-release]
+skip_linkers = ["bfd"]
+
+[bench.mold-crel]
+min_sld_version = "0.8.0"
+skip_linkers = ["bfd"]
+
+[bench.ripgrep]
+
+[bench.rust-analyzer]
+skip_linkers = ["bfd"]
+
+[bench.rust-analyzer-incremental]
+save = "rust-analyzer"
+skip_linkers = ["bfd", "lld", "mold"]
+sld_extra_flags = ["--incremental"]
+expect_sld_log = ["reused existing output before loading inputs"]
+
+[bench.rust-analyzer-riscv]
+skip_linkers = ["bfd"]
+min_sld_version = "0.6.0"
+
+[bench.rust-hello-world]
+
+[bench.rustc]
+# Too short to be interesting and we have other short benchmarks.
+skip = true
+skip_linkers = ["bfd"]
+
+[bench.librustc-driver]
+skip_linkers = ["bfd"]
+
+[bench.trivial]
+# Too short to be interesting
+skip = true
+
+[bench.sld]
+skip_linkers = ["bfd"]
+
+[bench.sld-incremental]
+save = "sld"
+skip_linkers = ["bfd", "lld", "mold"]
+sld_extra_flags = ["--incremental"]
+expect_sld_log = ["reused existing output before loading inputs"]
+
+[bench.sld-lto]
+min_sld_version = "0.9.0"
+
+[bench.sld-riscv]
+min_sld_version = "0.6.0"
+skip_linkers = ["bfd"]
+
+[bench.zed]
+skip_linkers = ["bfd"]
+
+[bench.zed-release]
+skip_linkers = ["bfd"]
+
+[bench.clang-debug-strip]
+skip_linkers = ["bfd"]

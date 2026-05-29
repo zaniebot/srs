@@ -1,0 +1,26 @@
+/target
+/target2
+sample-link*
+*.strace
+flamegraph.svg
+profile.json
+cachegrind.out*
+perf.data*
+dhat.out.*
+heaptrack*.zst
+.vscode/launch.json
+.idea
+.cargo/config.toml
+dhat-heap.json
+test-config.toml
+result
+# These are generated when running mold tests.
+fakes-debug/out
+fakes-debug/-
+/sld/out/test
+fakes-debug/sde-cet-checker-out.txt
+##
+*.pftrace
+*.bench-results
+.DS_Store
+*.rcgu.o

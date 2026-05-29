@@ -1,0 +1,50 @@
+//#AbstractConfig:default
+//#LinkerDriver:gcc
+//#LinkArgs:-Wl,-z,now
+//#DiffIgnore:section.rodata
+//#DiffIgnore:section.data
+//#DiffIgnore:section.data.alignment
+//#ExpectSym:main
+
+//#Config:gcc:default
+
+//#Config:gcc-static:default
+//#LinkArgs:-static -Wl,--gc-sections
+//#DiffIgnore:section.rela.plt.link
+//#DiffIgnore:section.sdata
+// TODO: RISC-V BFD linker keeps the symbol in .dynsym section
+//#DiffIgnore:section.rela.dyn
+//#DiffIgnore:rel.extra-got-plt-got
+
+//#Config:gcc-static-pie-no-relax:default
+//#CompArgs:-fPIE
+//#LinkArgs:-static-pie -Wl,--gc-sections -Wl,--no-relax
+//#DiffEnabled:false
+//#SkipLinker:ld
+// TODO: #874
+//#SkipArch: riscv64
+
+//#Config:clang-static:default
+//#Compiler:clang
+//#LinkArgs:-static
+//#DiffIgnore:section.rela.plt.link
+//#DiffIgnore:section.sdata
+//#DiffIgnore:rel.extra-got-plt-got
+
+//#Config:clang-static-pie-no-relax:default
+//#Compiler:clang
+//#CompArgs:-fPIE
+//#LinkArgs:-static-pie -Wl,--gc-sections -Wl,--no-relax
+//#DiffEnabled:false
+//#SkipLinker:ld
+// For some reason, both linkers cannot find: `rcrt1.o`
+//#SkipArch: riscv64
+
+//#Config:clang:default
+//#Compiler: clang
+
+//#Config:gcc-indirect-external:default
+//#CompArgs:-fPIE -mno-direct-extern-access
+//#RequiresCompilerFlags:-mno-direct-extern-access
+
+int main() { return 42; }
