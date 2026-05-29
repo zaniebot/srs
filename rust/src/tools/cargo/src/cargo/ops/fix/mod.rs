@@ -53,8 +53,7 @@ use tracing::{debug, trace, warn};
 
 pub use self::fix_edition::fix_edition;
 use crate::core::PackageIdSpecQuery as _;
-use crate::core::compiler::CompileKind;
-use crate::core::compiler::RustcTargetData;
+use crate::core::compiler::{CompileKind, PrimaryUnitRustc, RustcTargetData};
 use crate::core::resolver::features::{DiffMap, FeatureOpts, FeatureResolver, FeaturesFor};
 use crate::core::resolver::{HasDevUnits, Resolve, ResolveBehavior};
 use crate::core::{Edition, MaybePackage, Package, PackageId, Workspace};
@@ -83,6 +82,11 @@ const EDITION_ENV_INTERNAL: &str = "__CARGO_FIX_EDITION";
 /// **Internal only.**
 /// For passing [`FixOptions::idioms`] through to cargo running in proxy mode.
 const IDIOMS_ENV_INTERNAL: &str = "__CARGO_FIX_IDIOMS";
+/// **Internal only.**
+/// Applies suggestions with any applicability in cargo running in proxy mode.
+const YOLO_ENV_INTERNAL: &str = "__CARGO_FIX_YOLO";
+/// The maximum number of rustfix iterations for suggestions that overlap.
+const MAX_RETRIES_ENV: &str = "CARGO_FIX_MAX_RETRIES";
 /// **Internal only.**
 /// The sysroot path.
 ///
@@ -171,8 +175,6 @@ pub fn fix(
     wrapper.env(FIX_ENV_INTERNAL, lock_server.addr().to_string());
     let _started = lock_server.start()?;
 
-    opts.compile_opts.build_config.force_rebuild = true;
-
     if opts.broken_code {
         wrapper.env(BROKEN_CODE_ENV_INTERNAL, "1");
     }
@@ -211,12 +213,53 @@ pub fn fix(
     // The argfile handling are located at `FixArgs::from_args`.
     wrapper.retry_with_argfile(true);
 
-    // primary crates are compiled using a cargo subprocess to do extra work of applying fixes and
-    // repeating build until there are no more changes to be applied
-    opts.compile_opts.build_config.primary_unit_rustc = Some(wrapper);
+    // Primary crates are compiled using a Cargo subprocess to apply fixes and
+    // repeat the build until there are no more changes. Keep a stable identity
+    // for the proxy semantics so equivalent no-op runs can reuse artifacts
+    // without reusing artifacts from a behaviorally different fix mode.
+    opts.compile_opts.build_config.primary_unit_rustc = Some(PrimaryUnitRustc {
+        process: wrapper,
+        metadata: fix_proxy_metadata(gctx, opts),
+    });
 
     ops::compile(&ws, &opts.compile_opts)?;
     Ok(())
+}
+
+/// Returns the stable artifact identity for the Cargo-as-rustc fix proxy.
+///
+/// Do not derive this from the proxy process itself. The process contains
+/// per-invocation socket addresses, while these options are the settings that
+/// can change how the proxy applies suggestions.
+fn fix_proxy_metadata(gctx: &GlobalContext, opts: &FixOptions) -> String {
+    format_fix_proxy_metadata(
+        opts.edition.as_ref(),
+        opts.idioms,
+        opts.broken_code,
+        gctx.get_env_os(YOLO_ENV_INTERNAL).is_some(),
+        max_iterations(gctx),
+    )
+}
+
+fn format_fix_proxy_metadata(
+    edition: Option<&EditionFixMode>,
+    idioms: bool,
+    broken_code: bool,
+    yolo: bool,
+    max_retries: usize,
+) -> String {
+    let edition = edition.map(EditionFixMode::to_string).unwrap_or_default();
+    format!(
+        "cargo-fix:edition={edition}:idioms={}:broken-code={}:yolo={}:max-retries={}",
+        idioms, broken_code, yolo, max_retries,
+    )
+}
+
+fn max_iterations(gctx: &GlobalContext) -> usize {
+    gctx.get_env(MAX_RETRIES_ENV)
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(4)
 }
 
 fn check_version_control(gctx: &GlobalContext, opts: &FixOptions) -> CargoResult<()> {
@@ -930,11 +973,7 @@ fn rustfix_crate(
     //   Detect this when a fix fails to get applied *and* no suggestions
     //   successfully applied to the same file. In that case looks like we
     //   definitely can't make progress, so bail out.
-    let max_iterations = gctx
-        .get_env("CARGO_FIX_MAX_RETRIES")
-        .ok()
-        .and_then(|n| n.parse().ok())
-        .unwrap_or(4);
+    let max_iterations = max_iterations(gctx);
     let mut last_output;
     let mut last_made_changes;
     let mut first_output = None;
@@ -1027,7 +1066,7 @@ fn rustfix_and_fix(
     }
 
     let fix_mode = gctx
-        .get_env_os("__CARGO_FIX_YOLO")
+        .get_env_os(YOLO_ENV_INTERNAL)
         .map(|_| rustfix::Filter::Everything)
         .unwrap_or(rustfix::Filter::MachineApplicableOnly);
 
@@ -1410,10 +1449,35 @@ impl FixArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::FixArgs;
+    use super::{EditionFixMode, FixArgs, format_fix_proxy_metadata};
+    use crate::core::Edition;
     use std::ffi::OsString;
     use std::io::Write as _;
     use std::path::PathBuf;
+
+    #[test]
+    fn fix_proxy_metadata_distinguishes_behavioral_modes() {
+        let plain = format_fix_proxy_metadata(None, false, false, false, 4);
+        let variants = [
+            format_fix_proxy_metadata(Some(&EditionFixMode::NextRelative), false, false, false, 4),
+            format_fix_proxy_metadata(None, true, false, false, 4),
+            format_fix_proxy_metadata(Some(&EditionFixMode::NextRelative), true, false, false, 4),
+            format_fix_proxy_metadata(
+                Some(&EditionFixMode::OverrideSpecific(Edition::Edition2024)),
+                false,
+                false,
+                false,
+                4,
+            ),
+            format_fix_proxy_metadata(None, false, true, false, 4),
+            format_fix_proxy_metadata(None, false, false, true, 4),
+            format_fix_proxy_metadata(None, false, false, false, 5),
+        ];
+
+        for variant in variants {
+            assert_ne!(plain, variant);
+        }
+    }
 
     #[test]
     fn get_fix_args_from_argfile() {
