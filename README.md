@@ -8,6 +8,9 @@ Cranelift backend needed to compile Astral workloads on macOS arm64.
 - `repos/rust/`: the Rust fork that builds the toolchain and owns the
   `compiler/rustc_codegen_cranelift` integration. Its `src/tools/cargo/`
   submodule points at the SRS Cargo fork.
+- `repos/scargo/`: an SRS-level alias for `repos/rust/src/tools/cargo/`.
+  Rust owns the nested Cargo gitlink because bootstrap requires that path;
+  the alias keeps every SRS component visible under `repos/`.
 - `repos/cranelift/`: the patched Wasmtime/Cranelift checkout consumed by the
   backend in the Rust fork.
 - `repos/sld/`: the pinned `zanieb/sld` linker checkout.
@@ -36,10 +39,11 @@ SRS bakes `sld` in as rustc's default linker.
 
 ## Quick Start
 
-Initialize the pinned Rust, Cranelift, and sld source trees after cloning SRS:
+Initialize the pinned component source trees after cloning SRS:
 
 ```bash
 git submodule update --init repos/rust repos/cranelift repos/sld
+git -C repos/rust submodule update --init src/tools/cargo
 ```
 
 Build a stage 2 toolchain and link it into rustup as `srs`:
@@ -126,13 +130,14 @@ Set `SRS_SLD_BIN=/path/to/sld` when installing an alternate `sld` binary.
 
 ## Development
 
-Development happens inside each submodule. Cargo is nested under Rust because
-Rust bootstrap expects `src/tools/cargo`: commit Cargo changes in that checkout,
-stage its new submodule pin in Rust, commit Rust, then stage the updated Rust,
-Cranelift, and sld pins in SRS.
+Development happens inside each component checkout. `repos/scargo/` is an alias
+for the Cargo checkout nested under Rust because bootstrap expects
+`src/tools/cargo`: commit Cargo changes through the alias, stage its new
+submodule pin in Rust, commit Rust, then stage the updated Rust, Cranelift, and
+sld pins in SRS.
 
 ```bash
-git -C repos/rust/src/tools/cargo commit
+git -C repos/scargo commit
 git -C repos/rust add src/tools/cargo
 git -C repos/cranelift commit
 git -C repos/rust commit
@@ -141,11 +146,12 @@ git add repos/cranelift repos/rust repos/sld
 git commit
 ```
 
-After pulling an SRS change that advances either source pin, update the
+After pulling an SRS change that advances any source pin, update the
 submodules before rebuilding:
 
 ```bash
 git submodule update --init repos/rust repos/cranelift repos/sld
+git -C repos/rust submodule update --init src/tools/cargo
 ```
 
 Fresh clones need the configured submodule remotes to contain the pinned SRS

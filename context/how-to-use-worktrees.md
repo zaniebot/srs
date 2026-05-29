@@ -18,6 +18,11 @@ two agents from checking out the same component branch concurrently, still
 appear to SRS as normal gitlink checkouts, and can be removed cleanly when the
 task is finished.
 
+SRS tracks `repos/scargo` as an alias for `repos/rust/src/tools/cargo`. Rust
+owns the nested gitlink because bootstrap requires Cargo at that path. Use the
+SRS-level alias for ordinary Cargo navigation after the nested checkout is
+materialized; keep nested submodule operations pointed at `src/tools/cargo`.
+
 ## Important Trap
 
 A new SRS worktree initially contains uninitialized gitlink paths. Before a
@@ -58,8 +63,9 @@ git -C "$SRS/repos/rust" submodule init src/tools/cargo
 git -C "$SRS/repos/rust" submodule status src/tools/cargo
 ```
 
-Once nested Cargo is materialized at its own path, inspect it with
-`git -C "$SRS/repos/rust/src/tools/cargo" status --short --branch` as well.
+Once nested Cargo is materialized at its own path, the tracked `repos/scargo`
+alias resolves to it. Inspect it with
+`git -C "$SRS/repos/scargo" status --short --branch` as well.
 
 If a component's `--show-toplevel` instead resolves to SRS itself, that
 component is not materialized. Only if its empty path is intentionally safe to
@@ -97,7 +103,7 @@ git -C "$SRS/repos/sld" worktree add --detach "$WT/repos/sld" "$sld_sha"
 
 git -C "$WT/repos/rust" submodule init src/tools/cargo
 cargo_sha="$(git -C "$WT/repos/rust" rev-parse HEAD:src/tools/cargo)"
-git -C "$SRS/repos/rust/src/tools/cargo" worktree add --detach \
+git -C "$SRS/repos/scargo" worktree add --detach \
     "$WT/repos/rust/src/tools/cargo" "$cargo_sha"
 ```
 
@@ -111,7 +117,7 @@ Verify the completed layout before doing any work:
 test "$(git -C "$WT/repos/rust" rev-parse --show-toplevel)" = "$WT/repos/rust"
 test "$(git -C "$WT/repos/cranelift" rev-parse --show-toplevel)" = "$WT/repos/cranelift"
 test "$(git -C "$WT/repos/sld" rev-parse --show-toplevel)" = "$WT/repos/sld"
-test "$(git -C "$WT/repos/rust/src/tools/cargo" rev-parse --show-toplevel)" = \
+test "$(git -C "$WT/repos/scargo" rev-parse --show-toplevel)" = \
     "$WT/repos/rust/src/tools/cargo"
 
 git -C "$WT" submodule status repos/rust repos/cranelift repos/sld
@@ -130,7 +136,7 @@ the repositories that the task changes:
 git -C "$WT/repos/cranelift" switch -c "$BRANCH"
 git -C "$WT/repos/sld" switch -c "$BRANCH"
 git -C "$WT/repos/rust" switch -c "$BRANCH"
-git -C "$WT/repos/rust/src/tools/cargo" switch -c "$BRANCH"
+git -C "$WT/repos/scargo" switch -c "$BRANCH"
 ```
 
 Use only the applicable lines. The same branch label may be used across these
@@ -185,7 +191,7 @@ Commit leaf repositories first, then commit the gitlinks that consume them.
 For a task touching every layer, the dependency order is:
 
 ```bash
-git -C "$WT/repos/rust/src/tools/cargo" commit
+git -C "$WT/repos/scargo" commit
 git -C "$WT/repos/rust" add src/tools/cargo
 git -C "$WT/repos/rust" commit
 
@@ -210,7 +216,7 @@ to publish a task, first verify that `origin` is the intended remote for each
 repository, then push in dependency order:
 
 ```bash
-git -C "$WT/repos/rust/src/tools/cargo" push -u origin "$BRANCH"
+git -C "$WT/repos/scargo" push -u origin "$BRANCH"
 git -C "$WT/repos/rust" push -u origin "$BRANCH"
 git -C "$WT/repos/cranelift" push -u origin "$BRANCH"
 git -C "$WT/repos/sld" push -u origin "$BRANCH"
@@ -229,7 +235,7 @@ The canonical stores provide a single view of component worktrees:
 ```bash
 git -C "$SRS" worktree list
 git -C "$SRS/repos/rust" worktree list
-git -C "$SRS/repos/rust/src/tools/cargo" worktree list
+git -C "$SRS/repos/scargo" worktree list
 git -C "$SRS/repos/cranelift" worktree list
 git -C "$SRS/repos/sld" worktree list
 ```
@@ -245,7 +251,7 @@ First verify that intended changes have been committed or otherwise preserved:
 ```bash
 git -C "$WT" status --short --branch
 git -C "$WT/repos/rust" status --short --branch
-git -C "$WT/repos/rust/src/tools/cargo" status --short --branch
+git -C "$WT/repos/scargo" status --short --branch
 git -C "$WT/repos/cranelift" status --short --branch
 git -C "$WT/repos/sld" status --short --branch
 ```
@@ -253,7 +259,7 @@ git -C "$WT/repos/sld" status --short --branch
 Remove a completed task from the leaves upward:
 
 ```bash
-git -C "$SRS/repos/rust/src/tools/cargo" worktree remove "$WT/repos/rust/src/tools/cargo"
+git -C "$SRS/repos/scargo" worktree remove "$WT/repos/rust/src/tools/cargo"
 mkdir -p "$WT/repos/rust/src/tools/cargo"
 git -C "$SRS/repos/rust" worktree remove "$WT/repos/rust"
 git -C "$SRS/repos/cranelift" worktree remove "$WT/repos/cranelift"
