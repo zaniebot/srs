@@ -35,6 +35,9 @@ enum Step {
     /// The suggested fix involves updating the number of the first line
     /// comment which starts as `// fix-count 0`.
     OneFix = b'1',
+    /// Waits for two workspace packages to reach rustc together, then emits
+    /// one suggested fix.
+    BarrierOneFix = b'b',
     /// Emits two suggested fixes which overlap, which rustfix can only apply
     /// one of them, and fails for the other.
     ///
@@ -112,10 +115,18 @@ fn main() {
     }
 
     // Keep track of which step in the sequence that needs to run.
-    let successful_count = std::fs::read_to_string("rustc-fix-shim-count")
+    let count_file = if std::env::var_os("RUSTC_FIX_SHIM_PER_PACKAGE_COUNT").is_some() {
+        format!(
+            "rustc-fix-shim-count-{}",
+            std::env::var("CARGO_PKG_NAME").unwrap()
+        )
+    } else {
+        "rustc-fix-shim-count".to_string()
+    };
+    let successful_count = std::fs::read_to_string(&count_file)
         .map(|c| c.parse().unwrap())
         .unwrap_or(0);
-    std::fs::write("rustc-fix-shim-count", format!("{}", successful_count + 1)).unwrap();
+    std::fs::write(&count_file, format!("{}", successful_count + 1)).unwrap();
     // The sequence tells us which behavior we should have.
     let seq = std::env::var("RUSTC_FIX_SHIM_SEQUENCE").unwrap();
     if successful_count >= seq.len() {
@@ -132,6 +143,25 @@ fn main() {
         }
         b'1' => {
             output_suggestion(successful_count + 1);
+        }
+        b'b' => {
+            let barrier =
+                std::path::PathBuf::from(std::env::var_os("RUSTC_FIX_SHIM_BARRIER_DIR").unwrap());
+            let package = std::env::var("CARGO_PKG_NAME").unwrap();
+            std::fs::write(barrier.join(&package), "").unwrap();
+
+            let started = std::time::Instant::now();
+            while std::fs::read_dir(&barrier).unwrap().count() < 2 {
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(30),
+                    "timed out waiting for overlapping preflights"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            output_suggestion_for_file(
+                successful_count + 1,
+                &format!("{package}/src/lib.rs"),
+            );
         }
         b'2' => {
             output_suggestion(successful_count + 1);
@@ -157,6 +187,10 @@ fn main() {
 }
 
 fn output_suggestion(count: usize) {
+    output_suggestion_for_file(count, "src/lib.rs");
+}
+
+fn output_suggestion_for_file(count: usize, file_name: &str) {
     let json = format!(
         r#"{{
             "$message_type": "diagnostic",
@@ -166,7 +200,7 @@ fn output_suggestion(count: usize) {
             "spans":
             [
                 {{
-                    "file_name": "src/lib.rs",
+                    "file_name": "{file_name}",
                     "byte_start": 13,
                     "byte_end": 14,
                     "line_start": 1,
@@ -197,7 +231,7 @@ fn output_suggestion(count: usize) {
                     "spans":
                     [
                         {{
-                            "file_name": "src/lib.rs",
+                            "file_name": "{file_name}",
                             "byte_start": 13,
                             "byte_end": 14,
                             "line_start": 1,
@@ -464,6 +498,54 @@ fn fix_one_suggestion() {
 "#]],
         "// fix-count 1",
     );
+}
+
+#[cargo_test]
+fn stale_preflight_is_rechecked_after_an_intervening_writer() {
+    let rustc = rustc_for_cargo_fix();
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [workspace]
+                members = ["a", "b"]
+                resolver = "3"
+            "#,
+        )
+        .file("a/Cargo.toml", &basic_manifest("a", "0.1.0"))
+        .file("a/src/lib.rs", "// fix-count 0")
+        .file("b/Cargo.toml", &basic_manifest("b", "0.1.0"))
+        .file("b/src/lib.rs", "// fix-count 0")
+        .build();
+    let barrier = p.root().join("preflight-barrier");
+    std::fs::create_dir(&barrier).unwrap();
+    let sequence =
+        String::from_utf8(vec![Step::BarrierOneFix as u8, Step::SuccessNoOutput as u8]).unwrap();
+
+    p.cargo("fix --workspace --allow-no-vcs --lib -j 2")
+        .env("RUSTC", &rustc)
+        .env("RUSTC_FIX_SHIM_SEQUENCE", sequence)
+        .env("RUSTC_FIX_SHIM_BARRIER_DIR", &barrier)
+        .env("RUSTC_FIX_SHIM_PER_PACKAGE_COUNT", "1")
+        .run();
+
+    let sources = [p.read_file("a/src/lib.rs"), p.read_file("b/src/lib.rs")];
+    assert_eq!(
+        1,
+        sources
+            .iter()
+            .filter(|source| source.as_str() == "// fix-count 1")
+            .count()
+    );
+    assert_eq!(
+        1,
+        sources
+            .iter()
+            .filter(|source| source.as_str() == "// fix-count 0")
+            .count()
+    );
+    assert_eq!("2", p.read_file("rustc-fix-shim-count-a"));
+    assert_eq!("2", p.read_file("rustc-fix-shim-count-b"));
 }
 
 #[cargo_test]

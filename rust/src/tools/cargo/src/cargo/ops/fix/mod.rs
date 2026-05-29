@@ -892,6 +892,9 @@ struct FixedCrate {
     /// This will be displayed to the user to show any remaining diagnostics
     /// or errors.
     last_output: Output,
+    /// Keep exclusive ownership through final diagnostic handling and any
+    /// rollback after a failed verification pass.
+    _write_lock: Option<LockServerClient>,
 }
 
 #[derive(Debug)]
@@ -912,16 +915,17 @@ fn rustfix_crate(
     args: &FixArgs,
     gctx: &GlobalContext,
 ) -> CargoResult<FixedCrate> {
-    // First up, we want to make sure that each crate is only checked by one
-    // process at a time. If two invocations concurrently check a crate then
-    // it's likely to corrupt it.
+    // Start with a shared lock so read-only compiler passes can run in
+    // parallel. Any pass that discovers suggestions will release this lock and
+    // take the exclusive lock before writing. Its diagnostics can be reused if
+    // no writer ran in between and its replacement sources are unchanged;
+    // otherwise, rerun the compiler under the exclusive lock first.
     //
     // Historically this used per-source-file locking, then per-package
     // locking. It now uses a single, global lock as some users do things like
-    // #[path] or include!() of shared files between packages. Serializing
-    // makes it slower, but is the only safe way to prevent concurrent
-    // modification.
-    let _lock = LockServerClient::lock(&lock_addr.parse()?, "global")?;
+    // #[path] or include!() of shared files between packages.
+    let lock_addr = lock_addr.parse()?;
+    let read_lock = LockServerClient::lock_shared(&lock_addr, "global")?;
 
     // Map of files that have been modified.
     let mut files = HashMap::new();
@@ -936,9 +940,37 @@ fn rustfix_crate(
             files,
             first_output: last_output.clone(),
             last_output,
+            _write_lock: None,
         };
         return Ok(fixes);
     }
+
+    debug!("preflighting rustfix suggestions for {filename:?}: {rustc}");
+    let preflight = rustc.output()?;
+    let preflight_suggestions = collect_file_suggestions(&preflight, filename, args, gctx)?;
+    if preflight_suggestions.is_empty() {
+        return Ok(FixedCrate {
+            files,
+            first_output: preflight.clone(),
+            last_output: preflight,
+            _write_lock: None,
+        });
+    }
+    let source_snapshots = snapshot_sources(&preflight_suggestions);
+    let preflight_generation = read_lock.generation();
+
+    drop(read_lock);
+    let write_lock = LockServerClient::lock_exclusive(&lock_addr, "global")?;
+    // A writer may have changed a shared source file while this process waited
+    // to acquire the exclusive lock. Reuse the preflight diagnostics only when
+    // no Cargo fix writer ran in between and every file they could modify still
+    // matches the source rustc inspected. Otherwise, fall back to collecting
+    // fresh suggestions under the writer lock before applying anything.
+    let mut preflight = (preflight_generation == write_lock.generation())
+        .then_some(source_snapshots)
+        .flatten()
+        .filter(|snapshots| sources_match(snapshots))
+        .map(|_| (preflight, preflight_suggestions));
 
     // Next up, this is a bit suspicious, but we *iteratively* execute rustc and
     // collect suggestions to feed to rustfix. Once we hit our limit of times to
@@ -983,8 +1015,11 @@ fn rustfix_crate(
             // We'll generate new errors below.
             file.errors_applying_fixes.clear();
         }
-        (last_output, last_made_changes) =
-            rustfix_and_fix(&mut files, rustc, filename, args, gctx)?;
+        (last_output, last_made_changes) = if let Some((output, suggestions)) = preflight.take() {
+            apply_suggestions(&mut files, output, suggestions)?
+        } else {
+            rustfix_and_fix(&mut files, rustc, filename, args, gctx)?
+        };
         if current_iteration == 0 {
             first_output = Some(last_output.clone());
         }
@@ -1030,27 +1065,16 @@ fn rustfix_crate(
         files,
         first_output: first_output.expect("at least one iteration"),
         last_output,
+        _write_lock: Some(write_lock),
     })
 }
 
-/// Executes `rustc` to apply one round of suggestions to the crate in question.
-///
-/// This will fill in the `fixes` map with original code, suggestions applied,
-/// and any errors encountered while fixing files.
-fn rustfix_and_fix(
-    files: &mut HashMap<String, FixedFile>,
-    rustc: &ProcessBuilder,
+fn collect_file_suggestions(
+    output: &Output,
     filename: &Path,
     args: &FixArgs,
     gctx: &GlobalContext,
-) -> CargoResult<(Output, bool)> {
-    // If not empty, filter by these lints.
-    // TODO: implement a way to specify this.
-    let only = HashSet::new();
-
-    debug!("calling rustc to collect suggestions and validate previous fixes: {rustc}");
-    let output = rustc.output()?;
-
+) -> CargoResult<HashMap<String, Vec<rustfix::Suggestion>>> {
     // If rustc didn't succeed for whatever reasons then we're very likely to be
     // looking at otherwise broken code. Let's not make things accidentally
     // worse by applying fixes where a bug could cause *more* broken code.
@@ -1062,16 +1086,16 @@ fn rustfix_and_fix(
             filename,
             output.status.code()
         );
-        return Ok((output, false));
+        return Ok(HashMap::new());
     }
 
     let fix_mode = gctx
         .get_env_os(YOLO_ENV_INTERNAL)
         .map(|_| rustfix::Filter::Everything)
         .unwrap_or(rustfix::Filter::MachineApplicableOnly);
-
-    // Sift through the output of the compiler to look for JSON messages.
-    // indicating fixes that we can apply.
+    // If not empty, filter by these lints.
+    // TODO: implement a way to specify this.
+    let only = HashSet::new();
     let stderr = str::from_utf8(&output.stderr).context("failed to parse rustc stderr as UTF-8")?;
 
     let suggestions = stderr
@@ -1136,7 +1160,46 @@ fn rustfix_and_fix(
         num_suggestion,
         filename.display(),
     );
+    Ok(file_map)
+}
 
+fn snapshot_sources(
+    file_map: &HashMap<String, Vec<rustfix::Suggestion>>,
+) -> Option<HashMap<String, String>> {
+    file_map
+        .keys()
+        .map(|file| Some((file.clone(), paths::read(file.as_ref()).ok()?)))
+        .collect()
+}
+
+fn sources_match(snapshots: &HashMap<String, String>) -> bool {
+    snapshots
+        .iter()
+        .all(|(file, expected)| paths::read(file.as_ref()).is_ok_and(|source| source == *expected))
+}
+
+/// Executes `rustc` to apply one round of suggestions to the crate in question.
+///
+/// This will fill in the `fixes` map with original code, suggestions applied,
+/// and any errors encountered while fixing files.
+fn rustfix_and_fix(
+    files: &mut HashMap<String, FixedFile>,
+    rustc: &ProcessBuilder,
+    filename: &Path,
+    args: &FixArgs,
+    gctx: &GlobalContext,
+) -> CargoResult<(Output, bool)> {
+    debug!("calling rustc to collect suggestions and validate previous fixes: {rustc}");
+    let output = rustc.output()?;
+    let suggestions = collect_file_suggestions(&output, filename, args, gctx)?;
+    apply_suggestions(files, output, suggestions)
+}
+
+fn apply_suggestions(
+    files: &mut HashMap<String, FixedFile>,
+    output: Output,
+    file_map: HashMap<String, Vec<rustfix::Suggestion>>,
+) -> CargoResult<(Output, bool)> {
     let mut made_changes = false;
     for (file, suggestions) in file_map {
         // Attempt to read the source code for this file. If this fails then
