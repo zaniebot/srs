@@ -1805,6 +1805,7 @@ fn patch_changed_inputs(
     let mut rustc_link_content_digest_unchanged_input_count = 0;
     let mut rustc_link_content_digest_unchanged_input_indices = HashSet::new();
     let mut deferred_loaded_input_content_hashes = Vec::new();
+    let mut hashless_atomic_replacement_snapshot_count = 0;
     let mut patched_input_count = 0;
     let mut patched_section_count = 0;
     let mut previous_output = LazyOutputBytes::new(|| read_output_bytes(args.output()));
@@ -1940,9 +1941,19 @@ fn patch_changed_inputs(
             NormalizedRustArchivePatchState::MatchedButNotUnchanged(matched) => Some(matched),
             NormalizedRustArchivePatchState::Unknown => None,
         };
-        let defer_loaded_input_content_hash =
-            normalized_rust_archive_matched_sections.is_some() && input_content.hash.is_empty();
-        if !defer_loaded_input_content_hash {
+        let retain_hashless_atomic_replacement_snapshot =
+            can_retain_hashless_atomic_replacement_snapshot(
+                path,
+                normalized_rust_archive_matched_sections.is_some(),
+                trust_rustc_link_content_digests,
+            ) && input_content.hash.is_empty();
+        if retain_hashless_atomic_replacement_snapshot {
+            hashless_atomic_replacement_snapshot_count += 1;
+        }
+        let defer_loaded_input_content_hash = normalized_rust_archive_matched_sections.is_some()
+            && input_content.hash.is_empty()
+            && !retain_hashless_atomic_replacement_snapshot;
+        if !defer_loaded_input_content_hash && !retain_hashless_atomic_replacement_snapshot {
             ensure_loaded_input_content_hash(&bytes, &mut input_content);
         }
         let expected_changed_input_index = expected_changed_inputs.len();
@@ -2999,6 +3010,19 @@ fn patch_changed_inputs(
             ),
         )?;
     }
+    if hashless_atomic_replacement_snapshot_count > 0 {
+        append_log(
+            state_dir,
+            &format!(
+                "retained {hashless_atomic_replacement_snapshot_count} hashless atomic-replacement input snapshot{} before loading inputs",
+                if hashless_atomic_replacement_snapshot_count == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ),
+        )?;
+    }
     append_log(
         state_dir,
         &format!("patched {patched_section_count} changed input sections before loading inputs"),
@@ -3026,6 +3050,16 @@ fn can_normalize_rust_archive_patch(
             .input_files
             .get(input_index)
             .is_some_and(|input| !input_has_records_requiring_previous_bytes(previous, input))
+}
+
+fn can_retain_hashless_atomic_replacement_snapshot(
+    path: &Path,
+    normalized_rust_archive_matched_sections: bool,
+    trust_rustc_link_content_digests: bool,
+) -> bool {
+    normalized_rust_archive_matched_sections
+        && trust_rustc_link_content_digests
+        && is_atomic_replacement_rust_input(path)
 }
 
 fn input_has_records_requiring_previous_bytes(
@@ -13577,10 +13611,42 @@ fn read_verified_input_snapshot(
         }
         Err(error) => return Err(error.into()),
     };
-    if !snapshot_bytes_match_previous_content(previous_input, &bytes) {
+    if !snapshot_bytes_match_previous_content(previous_input, &bytes)
+        && !snapshot_identity_matches_previous_atomic_replacement_input(
+            previous_input,
+            &snapshot,
+            rustc_work_product_provenance_enabled(),
+        )
+    {
         return Ok(None);
     }
     Ok(Some(bytes))
+}
+
+fn snapshot_identity_matches_previous_atomic_replacement_input(
+    previous_input: &FileState,
+    snapshot: &Path,
+    trust_rustc_work_product_provenance: bool,
+) -> bool {
+    if !trust_rustc_work_product_provenance {
+        return false;
+    }
+    let Ok(path) = decode_path(&previous_input.path) else {
+        return false;
+    };
+    if !is_atomic_replacement_rust_input(&path) {
+        return false;
+    }
+    // rustc publishes these inputs by rename. A retained same-data inode therefore keeps the
+    // immutable bytes used by the prior patch without needing a second full-file hash.
+    previous_input
+        .snapshot_identity
+        .as_ref()
+        .zip(previous_input.content.identity.as_ref())
+        .zip(FileIdentity::from_path(snapshot).ok().flatten().as_ref())
+        .is_some_and(|((expected, input), current)| {
+            expected == current && expected.matches_same_data_ignoring_change_time(input)
+        })
 }
 
 fn snapshot_bytes_match_previous_content(previous_input: &FileState, bytes: &[u8]) -> bool {
@@ -15765,6 +15831,30 @@ mod tests {
         assert!(!is_atomic_replacement_rust_input(Path::new("member.o")));
     }
 
+    #[test]
+    fn hashless_atomic_replacement_snapshots_require_matched_trusted_inputs() {
+        assert!(can_retain_hashless_atomic_replacement_snapshot(
+            Path::new("libcrate.rlib"),
+            true,
+            true,
+        ));
+        assert!(!can_retain_hashless_atomic_replacement_snapshot(
+            Path::new("libcrate.rlib"),
+            false,
+            true,
+        ));
+        assert!(!can_retain_hashless_atomic_replacement_snapshot(
+            Path::new("libcrate.rlib"),
+            true,
+            false,
+        ));
+        assert!(!can_retain_hashless_atomic_replacement_snapshot(
+            Path::new("libcrate.a"),
+            true,
+            true,
+        ));
+    }
+
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
     fn rust_hardlink_snapshot_survives_atomic_replacement() {
@@ -16132,6 +16222,56 @@ mod tests {
         assert_eq!(
             read_verified_input_snapshot(&state_dir, &previous).unwrap(),
             None
+        );
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn trusted_hashless_atomic_replacement_snapshot_requires_unchanged_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("app.incr");
+        let input = dir.path().join("libcrate.rlib");
+        std::fs::write(&input, b"object").unwrap();
+        snapshot_input_paths(&state_dir, [input.as_path()]).unwrap();
+        let snapshot = input_snapshot_path(&state_dir, &input);
+        let previous = FileState {
+            path: encode_path(&input),
+            content: FileContentState {
+                len: 6,
+                hash: String::new(),
+                identity: FileIdentity::from_path(&input).unwrap(),
+            },
+            snapshot_identity: FileIdentity::from_path(&snapshot).unwrap(),
+            patch: None,
+        };
+
+        assert!(
+            !snapshot_identity_matches_previous_atomic_replacement_input(
+                &previous, &snapshot, false,
+            )
+        );
+        assert!(snapshot_identity_matches_previous_atomic_replacement_input(
+            &previous, &snapshot, true,
+        ));
+
+        let copied_snapshot = state_dir.join("copied");
+        std::fs::write(&copied_snapshot, b"object").unwrap();
+        let mut copied_previous = previous.clone();
+        copied_previous.snapshot_identity = FileIdentity::from_path(&copied_snapshot).unwrap();
+        assert!(
+            !snapshot_identity_matches_previous_atomic_replacement_input(
+                &copied_previous,
+                &copied_snapshot,
+                true,
+            )
+        );
+
+        std::fs::write(&snapshot, b"damage").unwrap();
+
+        assert!(
+            !snapshot_identity_matches_previous_atomic_replacement_input(
+                &previous, &snapshot, true,
+            )
         );
     }
 
