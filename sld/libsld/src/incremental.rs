@@ -1752,26 +1752,30 @@ fn patch_changed_inputs(
     let mut previous_output = LazyOutputBytes::new(|| read_output_bytes(args.output()));
     for (input_index, path) in changed_inputs {
         let mut loaded_input = None;
+        let can_normalize_rust_archive_patch =
+            can_normalize_rust_archive_patch(args, &previous, *input_index, path);
         if previous.input_files[*input_index].patch.is_some() {
             let Some((bytes, input_content)) = ({
                 timing_phase!("Read changed incremental input");
-                read_file_with_stable_identity(path).with_context(|| {
-                    format!(
-                        "Failed to read changed incremental input `{}`",
-                        path.display()
-                    )
-                })?
+                read_file_with_stable_identity_and_hashing(path, !can_normalize_rust_archive_patch)
+                    .with_context(|| {
+                        format!(
+                            "Failed to read changed incremental input `{}`",
+                            path.display()
+                        )
+                    })?
             }) else {
                 return Ok(ChangedInputPatchResult::Unsupported(format!(
                     "changed input changed while being read: {}",
                     path.display()
                 )));
             };
-            expected_changed_inputs.push(ExpectedInputContent::from_content(path, &input_content));
             if content_state_matches_previous(
                 &previous.input_files[*input_index].content,
                 &input_content,
             ) {
+                expected_changed_inputs
+                    .push(ExpectedInputContent::from_content(path, &input_content));
                 previous.input_files[*input_index].content = input_content;
                 previous.input_files[*input_index].snapshot_identity = None;
                 rewritten_input_count += 1;
@@ -1804,7 +1808,7 @@ fn patch_changed_inputs(
                 Err(reason) => return Ok(ChangedInputPatchResult::Unsupported(reason)),
             }
         };
-        let (bytes, input_content) = if let Some(loaded_input) = loaded_input {
+        let (bytes, mut input_content) = if let Some(loaded_input) = loaded_input {
             loaded_input
         } else {
             let Some(loaded_input) = ({
@@ -1821,23 +1825,18 @@ fn patch_changed_inputs(
                     path.display()
                 )));
             };
-            expected_changed_inputs.push(ExpectedInputContent::from_content(path, &loaded_input.1));
             loaded_input
         };
         let input = &previous.input_files[*input_index];
-        let normalized_rust_archive_patch_state = if args
-            .should_normalize_rust_archive_patch_inputs()
-            && path
-                .extension()
-                .is_some_and(|extension| extension == "rlib")
-            && !input_has_records_requiring_previous_bytes(&previous, input)
-        {
+        let normalized_rust_archive_patch_state = if can_normalize_rust_archive_patch {
             classify_normalized_rust_archive_patch_state(input, &bytes, &previous_patch)?
         } else {
             NormalizedRustArchivePatchState::Unknown
         };
         let normalized_rust_archive_matched_sections = match normalized_rust_archive_patch_state {
             NormalizedRustArchivePatchState::Unchanged(patch) => {
+                expected_changed_inputs
+                    .push(ExpectedInputContent::from_content(path, &input_content));
                 previous.input_files[*input_index].content = input_content;
                 previous.input_files[*input_index].snapshot_identity = None;
                 previous.input_files[*input_index].patch = Some(patch);
@@ -1847,6 +1846,8 @@ fn patch_changed_inputs(
             NormalizedRustArchivePatchState::MatchedButNotUnchanged(matched) => Some(matched),
             NormalizedRustArchivePatchState::Unknown => None,
         };
+        ensure_loaded_input_content_hash(&bytes, &mut input_content);
+        expected_changed_inputs.push(ExpectedInputContent::from_content(path, &input_content));
         patched_input_count += 1;
 
         let (
@@ -2813,6 +2814,22 @@ fn patch_changed_inputs(
 struct PreviousPatchState {
     fingerprint: String,
     sections: Vec<PatchSection>,
+}
+
+fn can_normalize_rust_archive_patch(
+    args: &impl platform::Args,
+    previous: &PersistedState,
+    input_index: usize,
+    path: &Path,
+) -> bool {
+    args.should_normalize_rust_archive_patch_inputs()
+        && path
+            .extension()
+            .is_some_and(|extension| extension == "rlib")
+        && previous
+            .input_files
+            .get(input_index)
+            .is_some_and(|input| !input_has_records_requiring_previous_bytes(previous, input))
 }
 
 fn input_has_records_requiring_previous_bytes(
@@ -5747,14 +5764,6 @@ impl FileContentState {
         Self {
             len: bytes.len() as u64,
             hash: hash_bytes(bytes),
-            identity: None,
-        }
-    }
-
-    fn from_loaded_input_bytes(bytes: &[u8]) -> Self {
-        Self {
-            len: bytes.len() as u64,
-            hash: hash_loaded_input_bytes(bytes),
             identity: None,
         }
     }
@@ -12770,6 +12779,13 @@ fn snapshot_bytes_match_previous_content(previous_input: &FileState, bytes: &[u8
 }
 
 fn read_file_with_stable_identity(path: &Path) -> Result<Option<(Vec<u8>, FileContentState)>> {
+    read_file_with_stable_identity_and_hashing(path, true)
+}
+
+fn read_file_with_stable_identity_and_hashing(
+    path: &Path,
+    should_hash: bool,
+) -> Result<Option<(Vec<u8>, FileContentState)>> {
     let before = FileIdentity::from_path(path)?;
     let bytes = {
         verbose_timing_phase!("Read stable input bytes");
@@ -12780,21 +12796,35 @@ fn read_file_with_stable_identity(path: &Path) -> Result<Option<(Vec<u8>, FileCo
         return Ok(None);
     }
     let Some(identity) = after else {
-        let content = {
-            verbose_timing_phase!("Hash stable input bytes");
-            FileContentState::from_loaded_input_bytes(&bytes)
+        let mut content = FileContentState {
+            len: bytes.len() as u64,
+            hash: String::new(),
+            identity: None,
         };
+        if should_hash {
+            ensure_loaded_input_content_hash(&bytes, &mut content);
+        }
         return Ok(Some((bytes, content)));
     };
     if bytes.len() as u64 != identity.len {
         return Ok(None);
     }
-    let mut content = {
-        verbose_timing_phase!("Hash stable input bytes");
-        FileContentState::from_loaded_input_bytes(&bytes)
+    let mut content = FileContentState {
+        len: identity.len,
+        hash: String::new(),
+        identity: Some(identity),
     };
-    content.identity = Some(identity);
+    if should_hash {
+        ensure_loaded_input_content_hash(&bytes, &mut content);
+    }
     Ok(Some((bytes, content)))
+}
+
+fn ensure_loaded_input_content_hash(bytes: &[u8], content: &mut FileContentState) {
+    if content.hash.is_empty() {
+        verbose_timing_phase!("Hash stable input bytes");
+        content.hash = hash_loaded_input_bytes(bytes);
+    }
 }
 
 fn input_content_mismatch_reason(
@@ -20451,6 +20481,26 @@ mod tests {
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
+    fn stable_identity_read_can_defer_content_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("libcrate.rlib");
+        std::fs::write(&path, b"abcd").unwrap();
+
+        let (bytes, mut content) = read_file_with_stable_identity_and_hashing(&path, false)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(bytes, b"abcd");
+        assert!(content.hash.is_empty());
+        assert_eq!(content.identity, FileIdentity::from_path(&path).unwrap());
+
+        ensure_loaded_input_content_hash(&bytes, &mut content);
+
+        assert_eq!(content, FileContentState::from_path(&path).unwrap());
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
     fn input_identity_mismatch_reason_rechecks_paths() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("input.o");
@@ -20509,6 +20559,27 @@ mod tests {
         std::fs::rename(&replacement, &path).unwrap();
 
         assert!(!expected.matches_unchanged_atomic_replacement_input());
+        let reason = input_content_mismatch_reason(&[expected], None).unwrap();
+        assert!(reason.contains("input file changed while incremental fast path was running"));
+        assert!(reason.contains("libcrate.rlib"));
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn hashless_changed_rust_input_skips_recheck_only_until_atomic_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("libcrate.rlib");
+        std::fs::write(&path, b"object").unwrap();
+        let content = FileContentState::from_path_identity_only(&path).unwrap();
+        let expected = ExpectedInputContent::from_content(&path, &content);
+
+        assert!(expected.hash.is_empty());
+        assert!(input_content_mismatch_reason(std::slice::from_ref(&expected), None).is_none());
+
+        let replacement = dir.path().join("replacement.rlib");
+        std::fs::write(&replacement, b"changed").unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+
         let reason = input_content_mismatch_reason(&[expected], None).unwrap();
         assert!(reason.contains("input file changed while incremental fast path was running"));
         assert!(reason.contains("libcrate.rlib"));
