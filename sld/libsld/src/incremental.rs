@@ -16266,7 +16266,9 @@ mod tests {
             )
         );
 
-        std::fs::write(&snapshot, b"damage").unwrap();
+        let damaged_snapshot = state_dir.join("damaged");
+        std::fs::write(&damaged_snapshot, b"damage").unwrap();
+        std::fs::rename(&damaged_snapshot, &snapshot).unwrap();
 
         assert!(
             !snapshot_identity_matches_previous_atomic_replacement_input(
