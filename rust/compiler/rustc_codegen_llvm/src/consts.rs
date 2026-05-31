@@ -267,7 +267,9 @@ impl<'ll> CodegenCx<'ll, '_> {
         align: Align,
         kind: Option<&str>,
     ) -> &'ll Value {
-        if let Some(&gv) = self.const_globals.borrow().get(&cv) {
+        let preserve_duplicate_constants =
+            self.tcx.sess.opts.unstable_opts.preserve_duplicate_constants;
+        if !preserve_duplicate_constants && let Some(&gv) = self.const_globals.borrow().get(&cv) {
             unsafe {
                 // Upgrade the alignment in cases where the same constant is used with different
                 // alignment requirements
@@ -281,7 +283,12 @@ impl<'ll> CodegenCx<'ll, '_> {
         let gv = self.static_addr_of_mut(cv, align, kind);
         llvm::set_global_constant(gv, true);
 
-        self.const_globals.borrow_mut().insert(cv, gv);
+        if preserve_duplicate_constants {
+            // Preserve address identity as well as the number of emitted globals.
+            llvm::set_unnamed_address(gv, llvm::UnnamedAddr::No);
+        } else {
+            self.const_globals.borrow_mut().insert(cv, gv);
+        }
         gv
     }
 

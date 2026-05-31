@@ -2543,6 +2543,8 @@ options! {
         "use a more precise version of drop elaboration for matches on enums (default: yes). \
         This results in better codegen, but has caused miscompilations on some tier 2 platforms. \
         See #77382 and #74551."),
+    preserve_duplicate_constants: bool = (false, parse_bool, [TRACKED],
+        "preserve duplicate LLVM globals emitted for constants (default: no)"),
     #[rustc_lint_opt_deny_field_access("use `Session::print_codegen_stats` instead of this field")]
     print_codegen_stats: bool = (false, parse_bool, [UNTRACKED],
         "print codegen statistics (default: no)"),

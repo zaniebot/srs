@@ -13,6 +13,11 @@ fi
 # while making incremental link reuse the normal SRS developer-loop behavior.
 export SLD_INCREMENTAL="${SLD_INCREMENTAL:-1}"
 
+append_target_rustflag() {
+    local rustflag="$1"
+    export SRS_ENCODED_TARGET_RUSTFLAGS="${SRS_ENCODED_TARGET_RUSTFLAGS:+${SRS_ENCODED_TARGET_RUSTFLAGS}$'\x1f'}${rustflag}"
+}
+
 # Reuse verified ordinary-library outputs across SRS worktrees. Hardlink
 # materialization avoids duplicating restored artifact allocation and Cargo
 # detaches links before rebuilding. Set SRS_CARGO_ARTIFACT_CACHE=0 to disable
@@ -31,22 +36,37 @@ else
 fi
 
 # Build scripts and proc macros execute on the build host. Keep those helpers
-# on LLVM while SRS target artifacts follow rustc's Cranelift default. On
-# Apple silicon, keep host-loadable artifacts off the experimental linker and
-# request root-only signed incremental links for normal target executables.
+# on LLVM. On Apple silicon, start the integrated incremental-link lane with
+# LLVM target artifacts too, keep host-loadable artifacts off the experimental
+# linker, and request root-only signed incremental links for normal target
+# executables. Cranelift remains available as an explicit follow-up lane.
 sld_native_incremental_args=()
 host_rustflags='["-Zcodegen-backend=llvm"]'
 if [[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "arm64" ]]; then
     host_rustflags='["-Zcodegen-backend=llvm","-C","linker=/usr/bin/clang"]'
+    export SRS_TARGET_CODEGEN_BACKEND="${SRS_TARGET_CODEGEN_BACKEND:-llvm}"
+    append_target_rustflag "-Zcodegen-backend=${SRS_TARGET_CODEGEN_BACKEND}"
+    export SRS_PRESERVE_DUPLICATE_LLVM_CONSTANTS="${SRS_PRESERVE_DUPLICATE_LLVM_CONSTANTS:-1}"
+    case "$SRS_PRESERVE_DUPLICATE_LLVM_CONSTANTS" in
+        0) append_target_rustflag "-Zpreserve-duplicate-constants=no" ;;
+        1) append_target_rustflag "-Zpreserve-duplicate-constants=yes" ;;
+        *)
+            printf 'invalid SRS_PRESERVE_DUPLICATE_LLVM_CONSTANTS: %s\n' \
+                "$SRS_PRESERVE_DUPLICATE_LLVM_CONSTANTS" >&2
+            exit 2
+            ;;
+    esac
     if [[ "$SLD_INCREMENTAL" != "0" ]]; then
         export SLD_INCREMENTAL_PADDING_PERCENT="${SLD_INCREMENTAL_PADDING_PERCENT:-1}"
         export SLD_STABILIZE_RUSTC_TRANSIENT_INPUTS="${SLD_STABILIZE_RUSTC_TRANSIENT_INPUTS:-1}"
+        export SLD_RUSTC_WORK_PRODUCT_PROVENANCE="${SLD_RUSTC_WORK_PRODUCT_PROVENANCE:-1}"
         sld_native_incremental_args=(-Z sld-native-incremental)
     fi
 fi
 
 if [[ "${#sld_native_incremental_args[@]}" -gt 0 ]]; then
     exec "$real_cargo" \
+        "${artifact_cache_args[@]}" \
         "${sld_native_incremental_args[@]}" \
         -Z host-config \
         -Z target-applies-to-host \
