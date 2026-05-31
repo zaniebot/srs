@@ -3453,6 +3453,11 @@ fn write_output_ranges(
         byte_count = ranges.iter().map(std::ops::Range::len).sum::<usize>()
     );
     for range in ranges {
+        verbose_timing_phase!(
+            "Write output generation range",
+            start = range.start,
+            byte_count = range.len()
+        );
         let Some(output_range) = output.get(range.clone()) else {
             return Err(crate::error!(
                 "Incrementally patched output range {range:?} is out of bounds for `{}`",
