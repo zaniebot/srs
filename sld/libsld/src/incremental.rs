@@ -100,6 +100,9 @@ const COMPRESSED_INPUT_SNAPSHOT_SUFFIX: &str = ".zstd";
 const INPUT_SNAPSHOT_COMPRESSION_LEVEL: i32 = 1;
 const STABLE_RUSTC_INPUT_DIR: &str = "stable-rustc-inputs";
 const STABILIZE_RUSTC_TRANSIENT_INPUTS_ENV: &str = "SLD_STABILIZE_RUSTC_TRANSIENT_INPUTS";
+const RUSTC_WORK_PRODUCT_PROVENANCE_ENV: &str = "SLD_RUSTC_WORK_PRODUCT_PROVENANCE";
+const RUSTC_WORK_PRODUCT_PROVENANCE_FILE_ENV: &str = "SLD_RUSTC_WORK_PRODUCT_PROVENANCE_FILE";
+const RUSTC_WORK_PRODUCT_PROVENANCE_VERSION: &str = "sld-rustc-work-product-provenance-v1";
 const BUILD_ID_HASH_FILE: &str = "build-id-hash";
 const UPDATE_MARKER_FILE: &str = "update-in-progress";
 const STATE_LOCK_FILE: &str = "state.lock";
@@ -1124,7 +1127,12 @@ pub(crate) fn stabilize_rustc_transient_inputs(args: &mut crate::args::Args) -> 
     let state_dir = state_dir_for_output(&output);
     timing_phase!("Stabilize rustc transient inputs");
     let stable_dir = state_dir.join(STABLE_RUSTC_INPUT_DIR);
+    let provenance = rustc_work_product_provenance_from_env();
+    let previous = provenance
+        .as_ref()
+        .and_then(|_| PersistedState::read_metadata(&state_dir).unwrap_or_default());
     let mut stabilized = 0;
+    let mut reused_isolated = 0;
     for input in &mut common.inputs {
         let InputSpec::File(source) = &input.spec else {
             continue;
@@ -1134,8 +1142,26 @@ pub(crate) fn stabilize_rustc_transient_inputs(args: &mut crate::args::Args) -> 
         };
         let source = source.to_path_buf();
         let target = stable_dir.join(stable_name);
+        let reused_producer_digest = provenance
+            .as_ref()
+            .and_then(|provenance| provenance.get(&source))
+            .is_some_and(|digest| {
+                stable_rustc_input_matches_previous_producer_digest(
+                    previous.as_ref(),
+                    &target,
+                    digest,
+                )
+            });
+        if reused_producer_digest {
+            reused_isolated += 1;
+        }
 
-        if !stable_rustc_input_already_names_source_data(&source, &target) {
+        let already_stable = if provenance.is_some() {
+            reused_producer_digest
+        } else {
+            stable_rustc_input_already_names_source_data(&source, &target)
+        };
+        if !already_stable {
             std::fs::create_dir_all(&stable_dir).with_context(|| {
                 format!(
                     "Failed to create stable rustc input directory `{}`",
@@ -1151,7 +1177,11 @@ pub(crate) fn stabilize_rustc_transient_inputs(args: &mut crate::args::Args) -> 
                 std::process::id()
             ));
             let _ = std::fs::remove_file(&tmp);
-            copy_snapshot_bytes(&source, &tmp)?;
+            if provenance.is_some() {
+                copy_isolated_snapshot_bytes(&source, &tmp)?;
+            } else {
+                copy_snapshot_bytes(&source, &tmp)?;
+            }
             let _ = std::fs::remove_file(&target);
             std::fs::rename(&tmp, &target).with_context(|| {
                 format!(
@@ -1173,7 +1203,87 @@ pub(crate) fn stabilize_rustc_transient_inputs(args: &mut crate::args::Args) -> 
             ),
         )?;
     }
+    if reused_isolated > 0 {
+        append_log(
+            &state_dir,
+            &format!(
+                "reused {reused_isolated} isolated rustc work-product input{} by producer digest",
+                if reused_isolated == 1 { "" } else { "s" }
+            ),
+        )?;
+    }
     Ok(())
+}
+
+fn rustc_work_product_provenance_from_env() -> Option<HashMap<PathBuf, String>> {
+    let requested =
+        std::env::var_os(RUSTC_WORK_PRODUCT_PROVENANCE_ENV).as_deref() == Some("1".as_ref());
+    let path = std::env::var_os(RUSTC_WORK_PRODUCT_PROVENANCE_FILE_ENV);
+    let contents = path
+        .as_ref()
+        .and_then(|path| std::fs::read_to_string(path).ok());
+    rustc_work_product_provenance(contents.as_deref(), requested || path.is_some())
+}
+
+fn rustc_work_product_provenance(
+    contents: Option<&str>,
+    requested: bool,
+) -> Option<HashMap<PathBuf, String>> {
+    if !requested {
+        return None;
+    }
+    Some(
+        contents
+            .and_then(parse_rustc_work_product_provenance)
+            .unwrap_or_default(),
+    )
+}
+
+fn parse_rustc_work_product_provenance(contents: &str) -> Option<HashMap<PathBuf, String>> {
+    let mut lines = contents.lines();
+    if lines.next()? != RUSTC_WORK_PRODUCT_PROVENANCE_VERSION {
+        return None;
+    }
+    let mut provenance = HashMap::new();
+    for line in lines {
+        let (digest, path) = line.split_once('\t')?;
+        if !is_blake3_hex_digest(digest) || path.contains('\t') {
+            return None;
+        }
+        if provenance
+            .insert(decode_path(path).ok()?, digest.to_owned())
+            .is_some()
+        {
+            return None;
+        }
+    }
+    Some(provenance)
+}
+
+fn is_blake3_hex_digest(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn stable_rustc_input_matches_previous_producer_digest(
+    previous: Option<&PersistedState>,
+    target: &Path,
+    digest: &str,
+) -> bool {
+    let encoded_target = encode_path(target);
+    previous
+        .and_then(|previous| {
+            previous
+                .input_files
+                .iter()
+                .find(|input| input.path == encoded_target)
+        })
+        .is_some_and(|input| {
+            input.content.hash == digest
+                && input.content.identity_matches_path(target).unwrap_or(false)
+        })
 }
 
 fn stable_rustc_input_already_names_source_data(source: &Path, target: &Path) -> bool {
@@ -12897,7 +13007,17 @@ fn copy_snapshot_bytes(source: &Path, target: &Path) -> Result {
     if hardlink_rust_snapshot_bytes(source, target) || clone_snapshot_bytes(source, target) {
         return Ok(());
     }
+    copy_file_bytes(source, target)
+}
 
+fn copy_isolated_snapshot_bytes(source: &Path, target: &Path) -> Result {
+    if clone_snapshot_bytes(source, target) {
+        return Ok(());
+    }
+    copy_file_bytes(source, target)
+}
+
+fn copy_file_bytes(source: &Path, target: &Path) -> Result {
     let mut input = std::fs::File::open(source)
         .with_context(|| format!("Failed to read incremental input `{}`", source.display()))?;
     let mut output = std::fs::File::create(target).with_context(|| {
@@ -13540,6 +13660,87 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn rustc_work_product_provenance_parser_requires_versioned_unique_digests() {
+        let input = Path::new("/target/debug/deps/uv-abc123.cgu7.session.rcgu.o");
+        let digest = "a".repeat(64);
+        let record = format!(
+            "{RUSTC_WORK_PRODUCT_PROVENANCE_VERSION}\n{digest}\t{}\n",
+            encode_path(input)
+        );
+        assert_eq!(
+            parse_rustc_work_product_provenance(&record),
+            Some(HashMap::from([(input.to_path_buf(), digest.clone())]))
+        );
+        assert!(
+            parse_rustc_work_product_provenance(&format!(
+                "wrong-version\n{digest}\t{}\n",
+                encode_path(input)
+            ))
+            .is_none()
+        );
+        assert!(
+            parse_rustc_work_product_provenance(&format!(
+                "{RUSTC_WORK_PRODUCT_PROVENANCE_VERSION}\ninvalid\t{}\n",
+                encode_path(input)
+            ))
+            .is_none()
+        );
+        assert!(
+            parse_rustc_work_product_provenance(&format!(
+                "{record}{digest}\t{}\n",
+                encode_path(input)
+            ))
+            .is_none()
+        );
+        assert_eq!(rustc_work_product_provenance(None, false), None);
+        assert_eq!(
+            rustc_work_product_provenance(None, true),
+            Some(HashMap::new())
+        );
+        assert_eq!(
+            rustc_work_product_provenance(Some("malformed"), true),
+            Some(HashMap::new())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn isolated_stable_rustc_input_reuses_only_matching_prior_producer_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("uv-abc123.cgu7.session.rcgu.o");
+        let target = dir.path().join("stable").join("uv-abc123.cgu7.rcgu.o");
+        std::fs::write(&source, b"codegen").unwrap();
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        copy_isolated_snapshot_bytes(&source, &target).unwrap();
+
+        let source_identity = FileIdentity::from_path(&source).unwrap().unwrap();
+        let target_identity = FileIdentity::from_path(&target).unwrap().unwrap();
+        assert_ne!(source_identity.ino, target_identity.ino);
+
+        let mut previous = state("args", b"output", &[("input", b"codegen")]);
+        previous.input_files[0].path = encode_path(&target);
+        previous.input_files[0].content = FileContentState::from_path(&target).unwrap();
+        let digest = hash_bytes(b"codegen");
+        assert!(stable_rustc_input_matches_previous_producer_digest(
+            Some(&previous),
+            &target,
+            &digest
+        ));
+        assert!(!stable_rustc_input_matches_previous_producer_digest(
+            Some(&previous),
+            &target,
+            &hash_bytes(b"different")
+        ));
+
+        std::fs::write(&target, b"changed").unwrap();
+        assert!(!stable_rustc_input_matches_previous_producer_digest(
+            Some(&previous),
+            &target,
+            &digest
+        ));
     }
 
     fn state(args_hash: &str, output: &[u8], inputs: &[(&str, &[u8])]) -> PersistedState {
