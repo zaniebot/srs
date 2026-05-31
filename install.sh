@@ -12,7 +12,7 @@ snapshot_dir="$install_root/$name"
 rustup_bin="${SRS_RUSTUP_BIN:-rustup}"
 replace="${SRS_INSTALL_REPLACE:-0}"
 
-if [[ -z "$name" || "$name" == */* || "$name" == *\\* || "$name" == "." || "$name" == ".." ]]; then
+if [[ -z "$name" || "$name" == -* || "$name" == */* || "$name" == *\\* || "$name" == "." || "$name" == ".." ]]; then
     printf 'invalid SRS toolchain name %s: use a single path component\n' "$name" >&2
     exit 2
 fi
@@ -121,7 +121,7 @@ trap cleanup EXIT
 if [[ "$(uname -s)" == "Darwin" ]]; then
     cp -cR "$toolchain_dir/." "$staging_dir" 2>/dev/null || cp -pR "$toolchain_dir/." "$staging_dir"
 elif [[ "$(uname -s)" == "Linux" ]]; then
-    cp --reflink=auto -a "$toolchain_dir/." "$staging_dir"
+    cp --reflink=auto -a "$toolchain_dir/." "$staging_dir" 2>/dev/null || cp -pR "$toolchain_dir/." "$staging_dir"
 else
     cp -pR "$toolchain_dir/." "$staging_dir"
 fi
@@ -151,6 +151,18 @@ while IFS= read -r -d '' symlink; do
     target="$(readlink "$symlink")"
     if [[ "$target" == /* ]]; then
         printf 'refusing absolute symlink in SRS toolchain snapshot: %s -> %s\n' "$symlink" "$target" >&2
+        external_symlink_found=1
+        continue
+    fi
+    symlink_dir="$(cd -P "$(dirname "$symlink")" && pwd)"
+    if ! target_parent="$(cd -P "$symlink_dir/$(dirname "$target")" && pwd)"; then
+        printf 'refusing unresolved symlink in SRS toolchain snapshot: %s -> %s\n' "$symlink" "$target" >&2
+        external_symlink_found=1
+        continue
+    fi
+    resolved_target="$target_parent/$(basename "$target")"
+    if [[ "$resolved_target" != "$staging_dir" && "$resolved_target" != "$staging_dir/"* ]]; then
+        printf 'refusing external relative symlink in SRS toolchain snapshot: %s -> %s\n' "$symlink" "$target" >&2
         external_symlink_found=1
     fi
 done < <(find "$staging_dir" -type l -print0)
