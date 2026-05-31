@@ -99,6 +99,11 @@ const LOG_INCREMENTAL_LINK_OPTIONS_ENV: &str = "SLD_LOG_INCREMENTAL_LINK_OPTIONS
 const LOG_INCREMENTAL_EXACT_ARGS_ENV: &str = "SLD_LOG_INCREMENTAL_EXACT_ARGS";
 const INPUT_SNAPSHOT_DIR: &str = "input-files";
 const OUTPUT_SNAPSHOT_FILE: &str = "output";
+const DIRECT_PATCH_STANDBY_FILE: &str = "direct-patch-standby";
+const DIRECT_PATCH_STANDBY_STATE_FILE: &str = "direct-patch-standby-state";
+const DIRECT_PATCH_STANDBY_STATE_VERSION: &str = "sld-direct-patch-standby-v1";
+const DIRECT_PATCH_STANDBY_STATE_MAX_LEN: u64 = 1024 * 1024;
+const DIRECT_PATCH_STANDBY_MAX_RANGES: usize = 4096;
 const COMPRESSED_INPUT_SNAPSHOT_SUFFIX: &str = ".zstd";
 const INPUT_SNAPSHOT_COMPRESSION_LEVEL: i32 = 1;
 const STABLE_RUSTC_INPUT_DIR: &str = "stable-rustc-inputs";
@@ -2649,9 +2654,11 @@ fn patch_changed_inputs(
         return Ok(ChangedInputPatchResult::Unsupported(reason));
     }
 
-    let Some(mut directly_patched_output) =
-        DirectlyPatchedOutput::new(args.output(), args.should_replace_directly_patched_output())
-    else {
+    let Some(mut directly_patched_output) = DirectlyPatchedOutput::new(
+        args.output(),
+        state_dir,
+        args.should_replace_directly_patched_output(),
+    ) else {
         return Ok(ChangedInputPatchResult::Unsupported(
             "could not clone directly patched output generation".to_owned(),
         ));
@@ -2875,7 +2882,7 @@ fn patch_changed_inputs(
     }
     drop(output);
     drop(file);
-    directly_patched_output.install()?;
+    directly_patched_output.install(&flush_ranges)?;
 
     let output = if args.should_hash_directly_patched_output() {
         FileContentState::from_path(args.output())
@@ -3398,22 +3405,33 @@ fn materialize_deferred_relocation_patch(
 struct DirectlyPatchedOutput {
     path: PathBuf,
     published_path: Option<PathBuf>,
+    standby_state_path: Option<PathBuf>,
 }
 
 impl DirectlyPatchedOutput {
-    fn new(output: &Path, should_replace: bool) -> Option<Self> {
+    fn new(output: &Path, state_dir: &Path, should_replace: bool) -> Option<Self> {
         if !should_replace {
             return Some(Self {
                 path: output.to_path_buf(),
                 published_path: None,
+                standby_state_path: None,
             });
         }
 
-        let mut generation = output.as_os_str().to_os_string();
-        generation.push(format!(".{}.sld-direct-patch.tmp", std::process::id()));
-        let generation = PathBuf::from(generation);
-        let _ = std::fs::remove_file(&generation);
-        {
+        let generation = directly_patched_output_standby_path(state_dir);
+        let standby_state_path = directly_patched_output_standby_state_path(state_dir);
+        let reused_standby =
+            read_directly_patched_output_standby_ranges(output, &generation, &standby_state_path)
+                .is_some_and(|ranges| {
+                    verbose_timing_phase!(
+                        "Catch up directly patched output generation",
+                        range_count = ranges.len(),
+                        byte_count = ranges.iter().map(std::ops::Range::len).sum::<usize>()
+                    );
+                    copy_output_ranges(output, &generation, &ranges).is_ok()
+                });
+        if !reused_standby {
+            let _ = std::fs::remove_file(&generation);
             verbose_timing_phase!("Clone directly patched output generation");
             if !clone_snapshot_bytes(output, &generation) {
                 return None;
@@ -3422,6 +3440,7 @@ impl DirectlyPatchedOutput {
         Some(Self {
             path: generation,
             published_path: Some(output.to_path_buf()),
+            standby_state_path: Some(standby_state_path),
         })
     }
 
@@ -3437,18 +3456,23 @@ impl DirectlyPatchedOutput {
         !self.is_generation()
     }
 
-    fn install(&mut self) -> Result {
+    fn install(&mut self, ranges: &[std::ops::Range<usize>]) -> Result {
         let Some(published_path) = self.published_path.as_ref() else {
             return Ok(());
         };
         verbose_timing_phase!("Install directly patched output generation");
-        std::fs::rename(&self.path, published_path).with_context(|| {
-            format!(
-                "Failed to install directly patched output generation `{}` as `{}`",
-                self.path.display(),
-                published_path.display()
+        install_directly_patched_output_generation(&self.path, published_path)?;
+        if let Some(standby_state_path) = self.standby_state_path.as_ref()
+            && write_directly_patched_output_standby_state(
+                standby_state_path,
+                published_path,
+                &self.path,
+                ranges,
             )
-        })?;
+            .is_err()
+        {
+            let _ = std::fs::remove_file(standby_state_path);
+        }
         self.published_path = None;
         Ok(())
     }
@@ -3460,6 +3484,166 @@ impl Drop for DirectlyPatchedOutput {
             let _ = std::fs::remove_file(&self.path);
         }
     }
+}
+
+fn directly_patched_output_standby_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(DIRECT_PATCH_STANDBY_FILE)
+}
+
+fn directly_patched_output_standby_state_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(DIRECT_PATCH_STANDBY_STATE_FILE)
+}
+
+fn read_directly_patched_output_standby_ranges(
+    output: &Path,
+    standby: &Path,
+    state_path: &Path,
+) -> Option<Vec<std::ops::Range<usize>>> {
+    if std::fs::metadata(state_path).ok()?.len() > DIRECT_PATCH_STANDBY_STATE_MAX_LEN {
+        return None;
+    }
+    let contents = std::fs::read_to_string(state_path).ok()?;
+    let mut lines = contents.lines();
+    if lines.next()? != DIRECT_PATCH_STANDBY_STATE_VERSION {
+        return None;
+    }
+    let expected_output = FileIdentity::parse(lines.next()?).ok().flatten()?;
+    let expected_standby = FileIdentity::parse(lines.next()?).ok().flatten()?;
+    let output_identity = FileIdentity::from_path(output).ok().flatten()?;
+    let standby_identity = FileIdentity::from_path(standby).ok().flatten()?;
+    if expected_output != output_identity || expected_standby != standby_identity {
+        return None;
+    }
+
+    let range_count = lines.next()?.parse().ok()?;
+    if range_count > DIRECT_PATCH_STANDBY_MAX_RANGES {
+        return None;
+    }
+    let mut ranges = Vec::with_capacity(range_count);
+    for line in lines.by_ref().take(range_count) {
+        let (start, end) = line.split_once(':')?;
+        let start = start.parse().ok()?;
+        let end = end.parse().ok()?;
+        if start > end || end > output_identity.len.try_into().ok()? {
+            return None;
+        }
+        ranges.push(start..end);
+    }
+    if ranges.len() != range_count || lines.next().is_some() {
+        return None;
+    }
+    Some(merged_output_ranges(&ranges))
+}
+
+fn write_directly_patched_output_standby_state(
+    state_path: &Path,
+    output: &Path,
+    standby: &Path,
+    ranges: &[std::ops::Range<usize>],
+) -> Result {
+    let ranges = merged_output_ranges(ranges);
+    if ranges.len() > DIRECT_PATCH_STANDBY_MAX_RANGES {
+        let _ = std::fs::remove_file(state_path);
+        return Ok(());
+    }
+    let output_identity = FileIdentity::from_path(output)?
+        .context("Missing directly patched output generation identity")?;
+    let standby_identity = FileIdentity::from_path(standby)?
+        .context("Missing directly patched output standby identity")?;
+    let mut contents = format!(
+        "{DIRECT_PATCH_STANDBY_STATE_VERSION}\n{}\n{}\n{}\n",
+        output_identity.render(),
+        standby_identity.render(),
+        ranges.len(),
+    );
+    for range in ranges {
+        writeln!(&mut contents, "{}:{}", range.start, range.end)?;
+    }
+    let tmp_path = append_suffix(state_path, ".tmp");
+    std::fs::write(&tmp_path, contents).with_context(|| {
+        format!(
+            "Failed to write directly patched output standby state `{}`",
+            tmp_path.display()
+        )
+    })?;
+    std::fs::rename(&tmp_path, state_path).with_context(|| {
+        format!(
+            "Failed to install directly patched output standby state `{}`",
+            state_path.display()
+        )
+    })
+}
+
+fn copy_output_ranges(
+    source_path: &Path,
+    target_path: &Path,
+    ranges: &[std::ops::Range<usize>],
+) -> Result {
+    let mut source = std::fs::File::open(source_path).with_context(|| {
+        format!(
+            "Failed to open directly patched output source `{}`",
+            source_path.display()
+        )
+    })?;
+    let mut target = OpenOptions::new()
+        .write(true)
+        .open(target_path)
+        .with_context(|| {
+            format!(
+                "Failed to open directly patched output standby `{}`",
+                target_path.display()
+            )
+        })?;
+    let mut buffer = [0; 64 * 1024];
+    for range in merged_output_ranges(ranges) {
+        source.seek(SeekFrom::Start(range.start as u64))?;
+        target.seek(SeekFrom::Start(range.start as u64))?;
+        let mut remaining = range.len();
+        while remaining > 0 {
+            let len = remaining.min(buffer.len());
+            source.read_exact(&mut buffer[..len])?;
+            target.write_all(&buffer[..len])?;
+            remaining -= len;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_vendor = "apple")]
+fn install_directly_patched_output_generation(generation: &Path, output: &Path) -> Result {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let generation_cstring = CString::new(generation.as_os_str().as_bytes())
+        .context("Directly patched output generation path contains a NUL byte")?;
+    let output_cstring = CString::new(output.as_os_str().as_bytes())
+        .context("Directly patched output path contains a NUL byte")?;
+    // SAFETY: Both paths are valid NUL-terminated strings for the duration of the call.
+    if unsafe {
+        libc::renamex_np(
+            generation_cstring.as_ptr(),
+            output_cstring.as_ptr(),
+            libc::RENAME_SWAP,
+        )
+    } == 0
+    {
+        return Ok(());
+    }
+    // Some Apple filesystems may support clones without swap publication. Retain the previous
+    // atomic-replacement behavior there; the absent standby disables reuse on the next link.
+    std::fs::rename(generation, output)
+        .context("Failed to install directly patched output generation")
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn install_directly_patched_output_generation(generation: &Path, output: &Path) -> Result {
+    std::fs::rename(generation, output).with_context(|| {
+        format!(
+            "Failed to install directly patched output generation `{}` as `{}`",
+            generation.display(),
+            output.display()
+        )
+    })
 }
 
 fn flush_output_ranges(
@@ -15403,16 +15587,18 @@ mod tests {
     fn directly_patched_output_generation_installs_atomically() {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("app");
+        let state_dir = dir.path().join("app.incr");
+        std::fs::create_dir(&state_dir).unwrap();
         std::fs::write(&output, b"original").unwrap();
         let original_identity = FileIdentity::from_path(&output).unwrap().unwrap();
 
-        let in_place = DirectlyPatchedOutput::new(&output, false).unwrap();
+        let in_place = DirectlyPatchedOutput::new(&output, &state_dir, false).unwrap();
         assert_eq!(in_place.path(), output);
         assert!(!in_place.is_generation());
         assert!(in_place.should_invalidate_code_signature_cache());
         drop(in_place);
 
-        let aborted = DirectlyPatchedOutput::new(&output, true).unwrap();
+        let aborted = DirectlyPatchedOutput::new(&output, &state_dir, true).unwrap();
         let aborted_path = aborted.path().to_path_buf();
         assert_ne!(aborted.path(), output);
         assert!(aborted.is_generation());
@@ -15422,19 +15608,73 @@ mod tests {
         assert_eq!(std::fs::read(&output).unwrap(), b"original");
         assert!(!aborted_path.exists());
 
-        let mut installed = DirectlyPatchedOutput::new(&output, true).unwrap();
+        let mut installed = DirectlyPatchedOutput::new(&output, &state_dir, true).unwrap();
         let installed_path = installed.path().to_path_buf();
-        std::fs::write(installed.path(), b"changed").unwrap();
+        std::fs::write(installed.path(), b"changed!").unwrap();
         let installed_identity = FileIdentity::from_path(&installed_path).unwrap().unwrap();
-        installed.install().unwrap();
+        installed.install(&[0..8]).unwrap();
         assert!(!installed.is_generation());
         drop(installed);
 
-        assert_eq!(std::fs::read(&output).unwrap(), b"changed");
+        assert_eq!(std::fs::read(&output).unwrap(), b"changed!");
         let output_identity = FileIdentity::from_path(&output).unwrap().unwrap();
         assert_eq!(output_identity.ino, installed_identity.ino);
         assert_ne!(output_identity.ino, original_identity.ino);
-        assert!(!installed_path.exists());
+        #[cfg(target_vendor = "apple")]
+        {
+            assert_eq!(std::fs::read(&installed_path).unwrap(), b"original");
+            assert_eq!(
+                read_directly_patched_output_standby_ranges(
+                    &output,
+                    &installed_path,
+                    &directly_patched_output_standby_state_path(&state_dir),
+                )
+                .unwrap(),
+                vec![0..8],
+            );
+
+            let mut reused = DirectlyPatchedOutput::new(&output, &state_dir, true).unwrap();
+            assert_eq!(reused.path(), installed_path);
+            assert_eq!(std::fs::read(reused.path()).unwrap(), b"changed!");
+            std::fs::write(reused.path(), b"second!!").unwrap();
+            reused.install(&[0..8]).unwrap();
+            drop(reused);
+
+            assert_eq!(std::fs::read(&output).unwrap(), b"second!!");
+            assert_eq!(std::fs::read(&installed_path).unwrap(), b"changed!");
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            assert!(!installed_path.exists());
+            assert!(!directly_patched_output_standby_state_path(&state_dir).exists());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn directly_patched_output_generation_rejects_truncated_standby_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("app");
+        let state_dir = dir.path().join("app.incr");
+        std::fs::create_dir(&state_dir).unwrap();
+        std::fs::write(&output, b"original").unwrap();
+
+        let mut installed = DirectlyPatchedOutput::new(&output, &state_dir, true).unwrap();
+        std::fs::write(installed.path(), b"changed!").unwrap();
+        installed.install(&[0..8]).unwrap();
+        drop(installed);
+
+        let state_path = directly_patched_output_standby_state_path(&state_dir);
+        let truncated = std::fs::read_to_string(&state_path)
+            .unwrap()
+            .lines()
+            .take(4)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&state_path, format!("{truncated}\n")).unwrap();
+
+        let fallback = DirectlyPatchedOutput::new(&output, &state_dir, true).unwrap();
+        assert_eq!(std::fs::read(fallback.path()).unwrap(), b"changed!");
     }
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
