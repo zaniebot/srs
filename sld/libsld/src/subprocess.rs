@@ -41,11 +41,32 @@ fn subprocess_result(mut args: Args) -> Result<i32> {
             // Fork success in child - Run linker in this process.
 
             crate::setup_tracing(&args)?;
+            let invocation = crate::timing::structured_invocation_guard();
+            crate::incremental::stabilize_rustc_transient_inputs(&mut args)?;
             let thread_pool = args.common_mut().activate_thread_pool()?;
-            let linker = crate::Linker::new();
-            let _outputs = linker.run(&args, &thread_pool)?;
-            crate::timing::finalise_perfetto_trace()?;
-            inform_parent_done(&fds);
+            let linker = crate::Linker::new_with_deferred_incremental_state_persistence();
+            let mut outputs = linker.run(&args, &thread_pool)?;
+            if outputs.has_pending_incremental_state() {
+                outputs.publish_pending_incremental_reuse_metadata();
+                inform_parent_done(&fds);
+                // State publication is cache maintenance after output success. If it fails, the
+                // retained update marker makes the next incremental invocation recover safely.
+                outputs.publish_pending_incremental_state();
+                if crate::timing::timing_trace_requested() {
+                    drop(outputs);
+                    drop(linker);
+                }
+                drop(invocation);
+                crate::timing::finalise_traces()?;
+            } else {
+                if crate::timing::timing_trace_requested() {
+                    drop(outputs);
+                    drop(linker);
+                }
+                drop(invocation);
+                crate::timing::finalise_traces()?;
+                inform_parent_done(&fds);
+            }
             Ok(0)
         }
         -1 => {

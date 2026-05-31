@@ -39,6 +39,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use zerocopy::IntoBytes;
 
+const EXPERIMENT_PRIVATE_PERSISTENT_OUTPUT_ENV: &str = "SLD_EXPERIMENT_PRIVATE_PERSISTENT_OUTPUT";
+const EXPERIMENT_UNSIGNED_PERSISTENT_OUTPUT_ENV: &str = "SLD_EXPERIMENT_UNSIGNED_PERSISTENT_OUTPUT";
+
 #[derive(Debug)]
 pub struct MachOArgs {
     pub(crate) common: super::CommonArgs,
@@ -55,6 +58,8 @@ pub struct MachOArgs {
     pub(crate) should_output_executable: bool,
     pub(crate) is_dynamiclib: bool,
     pub(crate) should_adhoc_codesign: bool,
+    pub(crate) should_emit_code_signature: bool,
+    pub(crate) has_private_persistent_output_contract: bool,
     pub(crate) dead_strip: bool,
     pub(crate) platform_version: MachOPlatformVersion,
 }
@@ -92,7 +97,9 @@ impl Default for MachOArgs {
             install_name: None,
             sysroot: None,
             export_list_path: None,
-            should_adhoc_codesign: cfg!(target_os = "macos"),
+            should_adhoc_codesign: false,
+            should_emit_code_signature: true,
+            has_private_persistent_output_contract: false,
             dead_strip: false,
             platform_version: MachOPlatformVersion {
                 platform: object::macho::PLATFORM_MACOS,
@@ -125,6 +132,14 @@ impl fmt::Debug for MachOIncrementalLinkOptions<'_> {
             .field("should_output_executable", &args.should_output_executable)
             .field("is_dynamiclib", &args.is_dynamiclib)
             .field("should_adhoc_codesign", &args.should_adhoc_codesign)
+            .field(
+                "should_emit_code_signature",
+                &args.should_emit_code_signature,
+            )
+            .field(
+                "has_private_persistent_output_contract",
+                &args.has_private_persistent_output_contract,
+            )
             .field("dead_strip", &args.dead_strip)
             .field("platform_version", &args.platform_version)
             .finish()
@@ -169,6 +184,15 @@ impl platform::Args for MachOArgs {
         &mut self.common
     }
 
+    fn should_mmap_output_file(&self, file_write_mode: FileWriteMode) -> bool {
+        // A replaced signed output has no bytes to reuse, so avoid mmap and its required
+        // macOS signature-cache invalidation after publication.
+        !(cfg!(target_os = "macos")
+            && self.should_emit_code_signature
+            && file_write_mode == FileWriteMode::UnlinkAndReplace)
+            && self.common.mmap_output_file
+    }
+
     fn incremental_link_options(&self) -> String {
         format!("{:?}", MachOIncrementalLinkOptions(self))
     }
@@ -208,6 +232,49 @@ impl platform::Args for MachOArgs {
 
     fn should_output_executable(&self) -> bool {
         self.should_output_executable && !self.is_dynamiclib
+    }
+
+    fn should_patch_changed_inputs_before_loading(&self) -> bool {
+        !self.should_emit_code_signature || self.has_private_persistent_output_contract
+    }
+
+    fn finalize_directly_patched_output(
+        &self,
+        output: &mut [u8],
+        flush_ranges: &mut Vec<std::ops::Range<usize>>,
+    ) -> Result {
+        if self.should_emit_code_signature && self.has_private_persistent_output_contract {
+            let code_signature_range =
+                crate::macho_writer::refresh_code_signature(output, flush_ranges)?;
+            flush_ranges.push(code_signature_range);
+        }
+        Ok(())
+    }
+
+    fn should_snapshot_changed_inputs_while_finalizing_direct_patches(&self) -> bool {
+        self.should_emit_code_signature && self.has_private_persistent_output_contract
+    }
+
+    fn should_hash_directly_patched_output(&self) -> bool {
+        !self.has_private_persistent_output_contract
+    }
+
+    fn should_trust_persistent_output_data_identity(&self) -> bool {
+        self.has_private_persistent_output_contract
+    }
+
+    fn should_validate_macho_cstring_patches(&self) -> bool {
+        true
+    }
+
+    fn should_normalize_rust_archive_patch_inputs(&self) -> bool {
+        true
+    }
+
+    fn should_publish_incremental_state_in_background(&self) -> bool {
+        // Signed changed-input relinks need complete prior section state; unsigned Mach-O
+        // incremental links are already the latency-sensitive patch path.
+        false
     }
 
     fn should_allow_object_undefined(&self, _output_kind: crate::output_kind::OutputKind) -> bool {
@@ -261,6 +328,12 @@ impl MachOArgs {
             }
             "z" => {
                 self.add_dylib_path(b"/usr/lib/libz.1.dylib".to_vec(), DylibLoadKind::Regular)?;
+            }
+            "bz2" => {
+                self.add_dylib_path(
+                    b"/usr/lib/libbz2.1.0.dylib".to_vec(),
+                    DylibLoadKind::Regular,
+                )?;
             }
             _ => {
                 self.warn_unsupported(&format!("-l{library}"))?;
@@ -320,7 +393,28 @@ pub(crate) fn parse<S: AsRef<str>, I: Iterator<Item = S>>(
         args.common.file_write_mode = Some(FileWriteMode::UnlinkAndReplace);
     }
 
+    // Cargo applies the private output environment only to its preserved root output link.
+    apply_experimental_persistent_output_policy(
+        args,
+        std::env::var_os(EXPERIMENT_PRIVATE_PERSISTENT_OUTPUT_ENV).is_some(),
+        std::env::var_os(EXPERIMENT_UNSIGNED_PERSISTENT_OUTPUT_ENV).is_some(),
+    );
+
     Ok(())
+}
+
+fn apply_experimental_persistent_output_policy(
+    args: &mut MachOArgs,
+    private_output: bool,
+    unsigned_output: bool,
+) {
+    args.has_private_persistent_output_contract = private_output || unsigned_output;
+    if args.has_private_persistent_output_contract {
+        args.should_adhoc_codesign = false;
+    }
+    if unsigned_output {
+        args.should_emit_code_signature = false;
+    }
 }
 
 fn setup_argument_parser() -> ArgumentParser<MachOArgs> {
@@ -989,6 +1083,17 @@ mod tests {
     }
 
     #[test]
+    fn linked_bz2_records_system_dylib_load_command() {
+        let mut args = MachOArgs::default();
+
+        parse(&mut args, ["-lbz2"].into_iter()).unwrap();
+
+        let commands = crate::macho::load_dylib_commands(&args).collect::<Vec<_>>();
+        assert_eq!(commands[1].path, b"/usr/lib/libbz2.1.0.dylib");
+        assert_eq!(commands[1].kind, DylibLoadKind::Regular);
+    }
+
+    #[test]
     fn non_incremental_links_unlink_existing_outputs_by_default() {
         let mut args = MachOArgs::default();
         args.common.incremental = false;
@@ -1089,6 +1194,18 @@ mod tests {
         assert_ne!(
             baseline,
             incremental_link_options_after(|args| {
+                args.should_emit_code_signature = !args.should_emit_code_signature;
+            })
+        );
+        assert_ne!(
+            baseline,
+            incremental_link_options_after(|args| {
+                args.has_private_persistent_output_contract = true;
+            })
+        );
+        assert_ne!(
+            baseline,
+            incremental_link_options_after(|args| {
                 args.dead_strip = true;
             })
         );
@@ -1098,6 +1215,89 @@ mod tests {
                 args.platform_version.minimum_os = encode_macho_version(13, 0, 0);
             })
         );
+    }
+
+    #[test]
+    fn default_macho_output_uses_linker_generated_signature() {
+        let args = MachOArgs::default();
+
+        assert!(args.should_emit_code_signature);
+        assert!(!args.should_adhoc_codesign);
+    }
+
+    #[test]
+    fn signed_macho_replaced_output_avoids_file_backed_mmap_on_macos() {
+        let args = MachOArgs::default();
+
+        assert_eq!(
+            args.should_mmap_output_file(FileWriteMode::UnlinkAndReplace),
+            !cfg!(target_os = "macos")
+        );
+        assert!(args.should_mmap_output_file(FileWriteMode::UpdateInPlaceWithFallback));
+    }
+
+    #[test]
+    fn macho_incremental_state_is_published_synchronously() {
+        let mut args = MachOArgs::default();
+        assert!(!args.should_patch_changed_inputs_before_loading());
+        assert!(!args.should_snapshot_changed_inputs_while_finalizing_direct_patches());
+        assert!(args.should_hash_directly_patched_output());
+        assert!(!args.should_trust_persistent_output_data_identity());
+        assert!(!args.should_retain_output_snapshot());
+        assert!(args.should_validate_macho_cstring_patches());
+        assert!(!args.should_validate_x86_64_elf_got_relaxation_contexts());
+        assert!(args.should_normalize_rust_archive_patch_inputs());
+        assert!(!args.should_publish_incremental_state_in_background());
+
+        args.should_emit_code_signature = false;
+        assert!(args.should_patch_changed_inputs_before_loading());
+        assert!(!args.should_snapshot_changed_inputs_while_finalizing_direct_patches());
+        assert!(args.should_hash_directly_patched_output());
+        assert!(!args.should_trust_persistent_output_data_identity());
+        assert!(!args.should_retain_output_snapshot());
+        assert!(args.should_validate_macho_cstring_patches());
+        assert!(!args.should_validate_x86_64_elf_got_relaxation_contexts());
+        assert!(args.should_normalize_rust_archive_patch_inputs());
+        assert!(!args.should_publish_incremental_state_in_background());
+    }
+
+    #[test]
+    fn experimental_signed_private_output_policy_retains_embedded_signing() {
+        let mut args = MachOArgs::default();
+        args.should_adhoc_codesign = true;
+        args.should_emit_code_signature = true;
+
+        apply_experimental_persistent_output_policy(&mut args, true, false);
+        assert!(!args.should_adhoc_codesign);
+        assert!(args.should_emit_code_signature);
+        assert_eq!(
+            args.should_mmap_output_file(FileWriteMode::UnlinkAndReplace),
+            !cfg!(target_os = "macos")
+        );
+        assert!(args.should_mmap_output_file(FileWriteMode::UpdateInPlaceWithFallback));
+        assert!(args.should_patch_changed_inputs_before_loading());
+        assert!(args.should_snapshot_changed_inputs_while_finalizing_direct_patches());
+        assert!(!args.should_hash_directly_patched_output());
+        assert!(args.should_trust_persistent_output_data_identity());
+        assert!(!args.should_retain_output_snapshot());
+        assert!(!args.should_publish_incremental_state_in_background());
+    }
+
+    #[test]
+    fn experimental_unsigned_persistent_output_policy_omits_signing() {
+        let mut args = MachOArgs::default();
+        args.should_adhoc_codesign = true;
+        args.should_emit_code_signature = true;
+
+        apply_experimental_persistent_output_policy(&mut args, false, true);
+        assert!(!args.should_adhoc_codesign);
+        assert!(!args.should_emit_code_signature);
+        assert!(args.should_mmap_output_file(FileWriteMode::UnlinkAndReplace));
+        assert!(!args.should_snapshot_changed_inputs_while_finalizing_direct_patches());
+        assert!(!args.should_hash_directly_patched_output());
+        assert!(args.should_trust_persistent_output_data_identity());
+        assert!(!args.should_retain_output_snapshot());
+        assert!(!args.should_publish_incremental_state_in_background());
     }
 
     #[test]

@@ -139,7 +139,7 @@ impl Output {
             config: OutputConfig {
                 file_write_mode,
                 should_write_trace: args.common().write_trace,
-                use_mmap: args.common().mmap_output_file,
+                use_mmap: args.should_mmap_output_file(file_write_mode),
             },
         }
     }

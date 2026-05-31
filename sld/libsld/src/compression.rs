@@ -265,8 +265,10 @@ fn build_regular_debug_section<A: Arch<Platform = Elf>>(
                                             object_layout,
                                             &mut group_buf[offset..end],
                                             section_index,
+                                            None,
                                             rela.iter().map(|r| Ok(*r)),
                                             layout,
+                                            None,
                                         )?;
                                     }
                                     elf::RelocationList::Crel(crel_iter) => {
@@ -274,8 +276,10 @@ fn build_regular_debug_section<A: Arch<Platform = Elf>>(
                                             object_layout,
                                             &mut group_buf[offset..end],
                                             section_index,
+                                            None,
                                             crel_iter,
                                             layout,
+                                            None,
                                         )?;
                                     }
                                 }

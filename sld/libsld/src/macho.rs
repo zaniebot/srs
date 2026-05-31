@@ -324,7 +324,9 @@ struct EhFrameEntryBounds {
 #[derive(Default)]
 pub(crate) struct ObjectLayoutStateExt {
     subsection_boundaries: Vec<Option<Vec<u64>>>,
-    live_subsections: Vec<BTreeSet<u64>>,
+    live_subsections: Vec<Vec<bool>>,
+    visited_subsection_symbols: Vec<bool>,
+    subsection_relocations: Vec<Option<HashMap<u64, Vec<Relocation>>>>,
     pub(crate) live_compact_unwind_entries: Vec<BTreeSet<u64>>,
     pub(crate) live_eh_frame_fdes: Vec<BTreeSet<u64>>,
     pub(crate) live_eh_frame_cies: Vec<BTreeSet<u64>>,
@@ -333,6 +335,21 @@ pub(crate) struct ObjectLayoutStateExt {
 }
 
 impl ObjectLayoutStateExt {
+    fn subsection_symbol_was_visited(&self, symbol_index: object::SymbolIndex) -> bool {
+        self.visited_subsection_symbols
+            .get(symbol_index.0)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    fn mark_subsection_symbol_visited(&mut self, symbol_index: object::SymbolIndex) {
+        if self.visited_subsection_symbols.len() <= symbol_index.0 {
+            self.visited_subsection_symbols
+                .resize(symbol_index.0 + 1, false);
+        }
+        self.visited_subsection_symbols[symbol_index.0] = true;
+    }
+
     fn ensure_section(&mut self, section_index: object::SectionIndex) {
         let required_len = section_index.0 + 1;
         if self.subsection_boundaries.len() < required_len {
@@ -340,8 +357,11 @@ impl ObjectLayoutStateExt {
                 .resize_with(required_len, || None);
         }
         if self.live_subsections.len() < required_len {
-            self.live_subsections
-                .resize_with(required_len, BTreeSet::new);
+            self.live_subsections.resize_with(required_len, Vec::new);
+        }
+        if self.subsection_relocations.len() < required_len {
+            self.subsection_relocations
+                .resize_with(required_len, || None);
         }
         if self.live_compact_unwind_entries.len() < required_len {
             self.live_compact_unwind_entries
@@ -374,10 +394,26 @@ impl ObjectLayoutStateExt {
                 let end = boundaries.get(index + 1).copied().unwrap_or(section_size);
                 (end > start
                     && live_subsections
-                        .is_some_and(|live_subsections| live_subsections.contains(&start)))
+                        .and_then(|live_subsections| live_subsections.get(index))
+                        .copied()
+                        .unwrap_or(false))
                 .then_some(start..end)
             })
             .collect()
+    }
+
+    fn subsection_is_live(&self, section_index: object::SectionIndex, start: u64) -> bool {
+        let Some(Some(boundaries)) = self.subsection_boundaries.get(section_index.0) else {
+            return false;
+        };
+        let Ok(boundary_index) = boundaries.binary_search(&start) else {
+            return false;
+        };
+        self.live_subsections
+            .get(section_index.0)
+            .and_then(|live_subsections| live_subsections.get(boundary_index))
+            .copied()
+            .unwrap_or(false)
     }
 }
 
@@ -1433,7 +1469,7 @@ impl platform::Platform for MachO {
     fn write_output_file<'data, A: platform::Arch<Platform = Self>>(
         output: &crate::file_writer::Output,
         layout: &crate::layout::Layout<'data, Self>,
-        incremental: &crate::incremental::PreparedState,
+        incremental: &crate::incremental::PreparedState<'data>,
     ) -> crate::error::Result {
         output.write(layout, |sized_output, layout| {
             macho_writer::write::<A>(sized_output, layout, incremental)
@@ -1990,10 +2026,12 @@ impl platform::Platform for MachO {
             size_of::<DyldChainedFixupsCommand>() as u64,
         );
         sizes.increment(part_id::SYMTAB_COMMAND, size_of::<SymtabCommand>() as u64);
-        sizes.increment(
-            part_id::CODE_SIGNATURE_COMMAND,
-            size_of::<CodeSignatureCommand>() as u64,
-        );
+        if args.should_emit_code_signature {
+            sizes.increment(
+                part_id::CODE_SIGNATURE_COMMAND,
+                size_of::<CodeSignatureCommand>() as u64,
+            );
+        }
     }
 
     fn finalise_sizes_for_symbol<'data>(
@@ -2079,7 +2117,9 @@ impl platform::Platform for MachO {
         }
         // Allocate one extra character as n_strx == 0 is treated as unnamed.
         common.allocate(part_id::STRTAB, 1);
-        common.allocate(part_id::CODE_SIGNATURE, CS_HEADERS_WITH_FILENAME_SIZE);
+        if symbol_db.args.should_emit_code_signature {
+            common.allocate(part_id::CODE_SIGNATURE, CS_HEADERS_WITH_FILENAME_SIZE);
+        }
         common.allocate(
             part_id::CHAINED_FIXUP_TABLE,
             chained_fixup_table_allocation_size(common, symbol_db),
@@ -2254,6 +2294,9 @@ impl platform::Platform for MachO {
         record: &OutputRecordLayout,
         last_part_id: part_id::PartId,
     ) -> Result<usize> {
+        if last_part_id == part_id::CODE_SIGNATURE && record.file_size == 0 {
+            return Ok(0);
+        }
         ensure!(
             last_part_id == part_id::CODE_SIGNATURE,
             "code signature must be last part_id"
@@ -2334,18 +2377,54 @@ fn load_macho_subsection_symbol<'data, 'scope, A: platform::Arch<Platform = Mach
     queue: &mut crate::layout::LocalWorkQueue,
     scope: &rayon::Scope<'scope>,
 ) -> Result<bool> {
+    if state
+        .format_specific
+        .subsection_symbol_was_visited(symbol_index)
+    {
+        return Ok(true);
+    }
     let Some((start, end, newly_live)) =
         mark_macho_subsection_live(state, symbol_index, section_index)?
     else {
         return Ok(false);
     };
+    state
+        .format_specific
+        .mark_subsection_symbol_visited(symbol_index);
 
     queue.send_section_request::<A>(state.file_id, section_index, resources, scope);
 
     if newly_live {
         let section_part_id =
             state.section_part_id(section_index, &resources.symbol_db.section_part_ids);
-        for rel in state.relocations(section_index)?.relocations {
+        if state.format_specific.subsection_relocations[section_index.0].is_none() {
+            let relocations_by_subsection = {
+                let boundaries = state.format_specific.subsection_boundaries[section_index.0]
+                    .as_ref()
+                    .context("Mach-O subsection boundaries are not initialized")?;
+                let mut relocations_by_subsection = HashMap::<u64, Vec<Relocation>>::new();
+                for rel in state.relocations(section_index)?.relocations {
+                    let rel_offset = u64::from(rel.info(LE).r_address);
+                    let boundary_index =
+                        boundaries.partition_point(|boundary| *boundary <= rel_offset);
+                    if boundary_index == 0 {
+                        continue;
+                    }
+                    relocations_by_subsection
+                        .entry(boundaries[boundary_index - 1])
+                        .or_default()
+                        .push(*rel);
+                }
+                relocations_by_subsection
+            };
+            state.format_specific.subsection_relocations[section_index.0] =
+                Some(relocations_by_subsection);
+        }
+        let relocations = state.format_specific.subsection_relocations[section_index.0]
+            .as_mut()
+            .and_then(|relocations| relocations.remove(&start))
+            .unwrap_or_default();
+        for rel in relocations {
             let rel_offset = u64::from(rel.info(LE).r_address);
             if rel_offset < start || rel_offset >= end {
                 continue;
@@ -2353,7 +2432,7 @@ fn load_macho_subsection_symbol<'data, 'scope, A: platform::Arch<Platform = Mach
             process_relocation::<A>(
                 state,
                 common,
-                rel,
+                &rel,
                 section_part_id,
                 resources,
                 queue,
@@ -2362,16 +2441,17 @@ fn load_macho_subsection_symbol<'data, 'scope, A: platform::Arch<Platform = Mach
                 scope,
             )?;
         }
-        if state.object.section(section_index)?.is_executable() {
-            load_macho_unwind_metadata_for_symbol::<A>(
-                state,
-                common,
-                symbol_index,
-                resources,
-                queue,
-                scope,
-            )?;
-        }
+    }
+
+    if state.object.section(section_index)?.is_executable() {
+        load_macho_unwind_metadata_for_symbol::<A>(
+            state,
+            common,
+            symbol_index,
+            resources,
+            queue,
+            scope,
+        )?;
     }
 
     Ok(true)
@@ -2588,6 +2668,50 @@ fn ensure_compact_unwind_lookup<'data>(
     let relocations = state.relocations(compact_section_index)?.relocations;
     let mut relocation_indices_by_entry: HashMap<u64, Vec<usize>> = HashMap::new();
     let mut entry_starts_by_symbol: HashMap<usize, Vec<u64>> = HashMap::new();
+    let mut symbols_by_section: HashMap<usize, Vec<(u64, usize, bool)>> = HashMap::new();
+    for (symbol_index, symbol) in state.object.enumerate_symbols() {
+        let Some(section_index) = state.object.symbol_section(symbol, symbol_index)? else {
+            continue;
+        };
+        let Ok(symbol_offset) = state.object.symbol_offset_in_section(symbol, section_index) else {
+            continue;
+        };
+        symbols_by_section
+            .entry(section_index.0)
+            .or_default()
+            .push((
+                symbol_offset,
+                symbol_index.0,
+                symbol.n_desc.get(LE) & N_ALT_ENTRY != 0,
+            ));
+    }
+    let mut subsection_boundaries_by_section: HashMap<usize, Vec<u64>> = HashMap::new();
+    let mut symbols_by_subsection: HashMap<(usize, u64), Vec<usize>> = HashMap::new();
+    for (section_index, symbols) in symbols_by_section {
+        let section_size = state
+            .object
+            .section_size(state.object.section(object::SectionIndex(section_index))?)?;
+        let mut boundaries = vec![0];
+        boundaries.extend(symbols.iter().filter_map(|(offset, _, is_alt)| {
+            (!*is_alt && *offset < section_size).then_some(*offset)
+        }));
+        boundaries.sort_unstable();
+        boundaries.dedup();
+
+        for (offset, symbol_index, _) in symbols {
+            let boundary_index = boundaries.partition_point(|boundary| *boundary <= offset);
+            if boundary_index == 0 {
+                continue;
+            }
+            let subsection_start = boundaries[boundary_index - 1];
+            symbols_by_subsection
+                .entry((section_index, subsection_start))
+                .or_default()
+                .push(symbol_index);
+        }
+
+        subsection_boundaries_by_section.insert(section_index, boundaries);
+    }
 
     for (relocation_index, rel) in relocations.iter().copied().enumerate() {
         let rel_info = rel.info(LE);
@@ -2617,6 +2741,32 @@ fn ensure_compact_unwind_lookup<'data>(
                 .entry(rel_info.r_symbolnum as usize)
                 .or_default()
                 .push(entry_start);
+        } else if field_offset == 0 && rel_info.r_symbolnum > 0 {
+            let section_index = rel_info.r_symbolnum as usize - 1;
+            ensure!(
+                section_index < state.sections.len(),
+                "Mach-O __compact_unwind relocation references invalid section ordinal {}",
+                rel_info.r_symbolnum
+            );
+            let symbol_offset = macho_read_u64(data, offset)?;
+            let Some(boundaries) = subsection_boundaries_by_section.get(&section_index) else {
+                continue;
+            };
+            let boundary_index = boundaries.partition_point(|boundary| *boundary <= symbol_offset);
+            if boundary_index == 0 {
+                continue;
+            }
+            let subsection_start = boundaries[boundary_index - 1];
+            if let Some(symbol_indices) =
+                symbols_by_subsection.get(&(section_index, subsection_start))
+            {
+                for symbol_index in symbol_indices {
+                    entry_starts_by_symbol
+                        .entry(*symbol_index)
+                        .or_default()
+                        .push(entry_start);
+                }
+            }
         }
     }
 
@@ -2801,6 +2951,16 @@ fn macho_read_u32(data: &[u8], offset: usize) -> Result<u32> {
     Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
 }
 
+fn macho_read_u64(data: &[u8], offset: usize) -> Result<u64> {
+    let end = offset
+        .checked_add(8)
+        .context("Mach-O 64-bit read offset overflow")?;
+    let bytes = data
+        .get(offset..end)
+        .with_context(|| format!("Mach-O 64-bit read at offset {offset:#x} is out of bounds"))?;
+    Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
+}
+
 pub(crate) fn macho_live_eh_frame_cies(
     data: &[u8],
     live_fdes: Option<&BTreeSet<u64>>,
@@ -2925,11 +3085,17 @@ fn mark_macho_subsection_live<'data>(
         .get(boundary_index + 1)
         .copied()
         .unwrap_or(section_size);
+    let num_boundaries = boundaries.len();
     if end <= start {
         return Ok(None);
     }
 
-    let newly_live = ext.live_subsections[section_index.0].insert(start);
+    let live_subsections = &mut ext.live_subsections[section_index.0];
+    if live_subsections.len() < num_boundaries {
+        live_subsections.resize(num_boundaries, false);
+    }
+    let newly_live = !live_subsections[boundary_index];
+    live_subsections[boundary_index] = true;
     Ok(Some((start, end, newly_live)))
 }
 
@@ -2964,9 +3130,7 @@ fn compact_dead_macho_subsections<'data>(
         };
         let explicitly_live = object
             .format_specific
-            .live_subsections
-            .get(section_index.0)
-            .is_some_and(|live_subsections| live_subsections.contains(&offset));
+            .subsection_is_live(section_index, offset);
         let keep = explicitly_live
             || flags.get().has_resolution()
             || symbol.n_desc.get(LE) & N_NO_DEAD_STRIP != 0;
@@ -3662,24 +3826,35 @@ fn process_relocation<'data, 'scope, A: platform::Arch<Platform = MachO>>(
         {
             let keeps_same_object_subsection =
                 local_symbol.is_local() || local_symbol.is_hidden() || symbol_id == local_symbol_id;
-            if keeps_same_object_subsection
-                && macho_subsection_gc_enabled(object, section_index, resources.symbol_db.args)?
-            {
-                load_macho_subsection_symbol::<A>(
-                    object,
-                    common,
-                    local_sym_index,
-                    section_index,
-                    resources,
-                    queue,
-                    scope,
-                )?;
-            } else if local_symbol.is_local() || local_symbol.is_hidden() {
-                // Local/private-extern Mach-O references may need this object's
-                // section address even when the canonical symbol request resolves
-                // elsewhere. Keep the local section materialised so writer-time
-                // relocation fallback has an address to use.
-                queue.send_section_request::<A>(object.file_id, section_index, resources, scope);
+            let keeps_visited_subsection = keeps_same_object_subsection
+                && object
+                    .format_specific
+                    .subsection_symbol_was_visited(local_sym_index);
+            if !keeps_visited_subsection {
+                if keeps_same_object_subsection
+                    && macho_subsection_gc_enabled(object, section_index, resources.symbol_db.args)?
+                {
+                    load_macho_subsection_symbol::<A>(
+                        object,
+                        common,
+                        local_sym_index,
+                        section_index,
+                        resources,
+                        queue,
+                        scope,
+                    )?;
+                } else if local_symbol.is_local() || local_symbol.is_hidden() {
+                    // Local/private-extern Mach-O references may need this object's
+                    // section address even when the canonical symbol request resolves
+                    // elsewhere. Keep the local section materialised so writer-time
+                    // relocation fallback has an address to use.
+                    queue.send_section_request::<A>(
+                        object.file_id,
+                        section_index,
+                        resources,
+                        scope,
+                    );
+                }
             }
         }
         let mut flags = resources.local_flags_for_symbol(symbol_id);

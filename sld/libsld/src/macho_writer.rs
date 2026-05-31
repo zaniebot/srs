@@ -11,6 +11,7 @@ use crate::file_writer::split_output_into_sections;
 use crate::incremental::PreparedState;
 use crate::layout::FileLayout;
 use crate::layout::HeaderInfo;
+use crate::layout::InternalSymbols;
 use crate::layout::Layout;
 use crate::layout::ObjectLayout;
 use crate::layout::OutputRecordLayout;
@@ -121,15 +122,18 @@ use object::macho::SEG_DATA;
 use object::macho::SEG_LINKEDIT;
 use object::macho::SEG_PAGEZERO;
 use object::macho::SEG_TEXT;
+use object::read::macho::MachHeader;
 use object::read::macho::Section as MachOSection;
 use object::slice_from_bytes_mut;
 use rayon::iter::IntoParallelIterator;
+use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::ParallelIterator;
 use rayon::slice::ParallelSlice;
 use sha2::Digest;
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::ops::BitAnd;
+use std::ops::Range;
 use tracing::debug_span;
 use zerocopy::FromBytes;
 use zerocopy::FromZeros;
@@ -173,6 +177,12 @@ struct ChainedImport {
     stub_address: Option<u64>,
 }
 
+#[derive(Debug, Default)]
+struct ChainedRebaseGroupScan {
+    slots: Vec<u64>,
+    bind_symbols: Vec<(u64, SymbolId)>,
+}
+
 impl ChainedRebases {
     fn collect<'data, A: Arch<Platform = MachO>>(layout: &MachOLayout<'data>) -> Result<Self> {
         let Some(data_segment) = get_segment_sections(layout, SegmentType::DataSections) else {
@@ -184,105 +194,127 @@ impl ChainedRebases {
         let mut bind_slots = Vec::new();
         let mut imports = Vec::new();
 
-        for group in &layout.group_layouts {
-            for file in &group.files {
-                let FileLayout::Object(object) = file else {
-                    continue;
-                };
-                for (section_index, section) in object.sections.iter().enumerate() {
-                    if !matches!(section, SectionSlot::Loaded(_)) {
-                        continue;
-                    }
-                    let section_index = object::SectionIndex(section_index);
-                    let relax_deltas = object.section_relax_deltas.get(section_index.0);
-                    let Some(section_address) =
-                        object.section_resolutions[section_index.0].address()
-                    else {
+        let group_scans = layout
+            .group_layouts
+            .par_iter()
+            .map(|group| {
+                let mut scan = ChainedRebaseGroupScan::default();
+                for file in &group.files {
+                    let FileLayout::Object(object) = file else {
                         continue;
                     };
-                    let live_unwind_ranges =
-                        macho_writer_live_unwind_relocation_ranges(object, layout, section_index)?;
-                    let live_subsection_ranges = macho_writer_live_subsection_relocation_ranges(
-                        object,
-                        layout,
-                        section_index,
-                    )?;
-                    let mut skip_subtractor_pair = false;
-                    for rel in object.relocations(section_index)?.relocations {
-                        let rel = rel.info(LE);
-                        let input_offset = rel.r_address as usize;
-                        if relax_deltas
-                            .is_some_and(|deltas| deltas.deletes_input_offset(input_offset as u64))
-                        {
-                            skip_subtractor_pair = false;
+                    for (section_index, section) in object.sections.iter().enumerate() {
+                        let SectionSlot::Loaded(section) = section else {
+                            continue;
+                        };
+                        let section_index = object::SectionIndex(section_index);
+                        let relax_deltas = object.section_relax_deltas.get(section_index.0);
+                        let Some(section_address) =
+                            object.section_resolutions[section_index.0].address()
+                        else {
+                            continue;
+                        };
+                        if !section_may_contain_data_fixup(
+                            section_address,
+                            section.size,
+                            data_start,
+                            data_end,
+                        ) {
                             continue;
                         }
-                        if live_unwind_ranges.as_ref().is_some_and(|ranges| {
-                            !ranges.iter().any(|range| range.contains(&input_offset))
-                        }) {
-                            skip_subtractor_pair = false;
-                            continue;
-                        }
-                        if live_subsection_ranges.as_ref().is_some_and(|ranges| {
-                            !ranges.iter().any(|range| range.contains(&input_offset))
-                        }) {
-                            skip_subtractor_pair = false;
-                            continue;
-                        }
-                        if rel.r_type == macho::ARM64_RELOC_ADDEND {
-                            continue;
-                        }
-                        if rel.r_type == macho::ARM64_RELOC_SUBTRACTOR {
-                            skip_subtractor_pair = true;
-                            continue;
-                        }
-                        if skip_subtractor_pair {
-                            ensure!(
-                                rel.r_type == macho::ARM64_RELOC_UNSIGNED,
-                                "Mach-O ARM64_RELOC_SUBTRACTOR must be followed by ARM64_RELOC_UNSIGNED"
-                            );
-                            skip_subtractor_pair = false;
-                            continue;
-                        }
-                        if is_tlv_init_relocation(object.object.section(section_index)?, rel) {
-                            continue;
-                        }
-                        let rel_info = A::relocation_from_raw(rel)?;
-                        if !is_chained_rebase_relocation(&rel_info) {
-                            continue;
-                        }
-                        let output_offset = relax_deltas.map_or(input_offset as u64, |deltas| {
-                            deltas.input_to_output_offset(input_offset as u64)
-                        });
-                        let place = section_address + output_offset;
-                        if place >= data_start && place + 8 <= data_end {
-                            let (resolution, local_symbol_id) =
-                                get_resolution(rel, object, layout)?;
-                            if is_import_relocation(layout, local_symbol_id, &resolution) {
-                                let import_index = push_import(
-                                    layout,
-                                    &mut imports,
-                                    local_symbol_id.context(
-                                        "Mach-O import relocation must reference a symbol",
-                                    )?,
-                                    None,
-                                    None,
-                                )?;
-                                bind_slots.push(ChainedBindSlot {
-                                    address: place,
-                                    import_index,
+                        let live_unwind_ranges = macho_writer_live_unwind_relocation_ranges(
+                            object,
+                            layout,
+                            section_index,
+                        )?;
+                        let live_subsection_ranges = macho_writer_live_subsection_relocation_ranges(
+                            object,
+                            layout,
+                            section_index,
+                        )?;
+                        let mut skip_subtractor_pair = false;
+                        for rel in object.relocations(section_index)?.relocations {
+                            let rel = rel.info(LE);
+                            let input_offset = rel.r_address as usize;
+                            if relax_deltas.is_some_and(|deltas| {
+                                deltas.deletes_input_offset(input_offset as u64)
+                            }) {
+                                skip_subtractor_pair = false;
+                                continue;
+                            }
+                            if live_unwind_ranges.as_ref().is_some_and(|ranges| {
+                                !sorted_ranges_contain(ranges, input_offset)
+                            }) {
+                                skip_subtractor_pair = false;
+                                continue;
+                            }
+                            if live_subsection_ranges.as_ref().is_some_and(|ranges| {
+                                !sorted_ranges_contain(ranges, input_offset)
+                            }) {
+                                skip_subtractor_pair = false;
+                                continue;
+                            }
+                            if rel.r_type == macho::ARM64_RELOC_ADDEND {
+                                continue;
+                            }
+                            if rel.r_type == macho::ARM64_RELOC_SUBTRACTOR {
+                                skip_subtractor_pair = true;
+                                continue;
+                            }
+                            if skip_subtractor_pair {
+                                ensure!(
+                                    rel.r_type == macho::ARM64_RELOC_UNSIGNED,
+                                    "Mach-O ARM64_RELOC_SUBTRACTOR must be followed by ARM64_RELOC_UNSIGNED"
+                                );
+                                skip_subtractor_pair = false;
+                                continue;
+                            }
+                            if is_tlv_init_relocation(object.object.section(section_index)?, rel) {
+                                continue;
+                            }
+                            let rel_info = A::relocation_from_raw(rel)?;
+                            if !is_chained_rebase_relocation(&rel_info) {
+                                continue;
+                            }
+                            let output_offset =
+                                relax_deltas.map_or(input_offset as u64, |deltas| {
+                                    deltas.input_to_output_offset(input_offset as u64)
                                 });
-                                slots.push(place);
-                            } else if resolution.raw_value >= MACHO_START_MEM_ADDRESS {
-                                slots.push(place);
+                            let place = section_address + output_offset;
+                            if place >= data_start && place + 8 <= data_end {
+                                let (resolution, local_symbol_id) =
+                                    get_resolution(rel, object, layout)?;
+                                if is_import_relocation(layout, local_symbol_id, &resolution) {
+                                    scan.bind_symbols.push((
+                                        place,
+                                        local_symbol_id.context(
+                                            "Mach-O import relocation must reference a symbol",
+                                        )?,
+                                    ));
+                                    scan.slots.push(place);
+                                } else if resolution.raw_value >= MACHO_START_MEM_ADDRESS {
+                                    scan.slots.push(place);
+                                }
                             }
                         }
+                        ensure!(
+                            !skip_subtractor_pair,
+                            "Mach-O ARM64_RELOC_SUBTRACTOR missing paired ARM64_RELOC_UNSIGNED"
+                        );
                     }
-                    ensure!(
-                        !skip_subtractor_pair,
-                        "Mach-O ARM64_RELOC_SUBTRACTOR missing paired ARM64_RELOC_UNSIGNED"
-                    );
                 }
+                Ok(scan)
+            })
+            .collect::<Vec<Result<ChainedRebaseGroupScan>>>();
+        for scan in group_scans {
+            let scan = scan?;
+            slots.extend(scan.slots);
+            for (address, symbol_id) in scan.bind_symbols {
+                let import_index = push_import(layout, &mut imports, symbol_id, None, None)?;
+                bind_slots.push(ChainedBindSlot {
+                    address,
+                    import_index,
+                });
             }
         }
 
@@ -558,6 +590,9 @@ fn import_library_name(name: &[u8]) -> Option<&'static [u8]> {
     if is_zlib_symbol(name) {
         return Some(b"libz");
     }
+    if name.starts_with(b"_BZ2_") {
+        return Some(b"libbz2");
+    }
     if name.starts_with(b"_iconv") || name.starts_with(b"_libiconv") {
         return Some(b"libiconv");
     }
@@ -683,8 +718,11 @@ fn path_matches_library(path: &[u8], library: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::compact_unwind_dwarf_offset_hint;
+    use super::compact_unwind_section_addend;
     use super::path_matches_library;
     use super::rewrite_compacted_macho_eh_frame_cie_pointers;
+    use super::section_may_contain_data_fixup;
+    use super::sorted_ranges_contain;
     use linker_utils::relaxation::SectionRelaxDeltas;
 
     #[test]
@@ -745,6 +783,46 @@ mod tests {
 
         assert_eq!(&out[12..16], &[12, 0, 0, 0]);
     }
+
+    #[test]
+    fn compact_unwind_section_addend_tracks_dead_strip_compaction() {
+        let deltas = SectionRelaxDeltas::new(vec![(0x1000, 0x2bb0)]);
+
+        assert_eq!(
+            compact_unwind_section_addend(Some(&deltas), 0x139d4),
+            0x10e24
+        );
+        assert_eq!(compact_unwind_section_addend(None, 0x139d4), 0x139d4);
+    }
+
+    #[test]
+    fn sorted_ranges_contain_checks_half_open_boundaries() {
+        let ranges = [0..4, 8..12, 20..24];
+
+        assert!(sorted_ranges_contain(&ranges, 0));
+        assert!(sorted_ranges_contain(&ranges, 11));
+        assert!(sorted_ranges_contain(&ranges, 23));
+        assert!(!sorted_ranges_contain(&ranges, 4));
+        assert!(!sorted_ranges_contain(&ranges, 12));
+        assert!(!sorted_ranges_contain(&ranges, 24));
+    }
+
+    #[test]
+    fn data_fixup_section_overlap_checks_half_open_boundaries() {
+        assert!(!section_may_contain_data_fixup(0, 8, 8, 16));
+        assert!(section_may_contain_data_fixup(7, 2, 8, 16));
+        assert!(section_may_contain_data_fixup(8, 8, 8, 16));
+        assert!(!section_may_contain_data_fixup(16, 8, 8, 16));
+    }
+}
+
+fn section_may_contain_data_fixup(
+    section_address: u64,
+    section_size: u64,
+    data_start: u64,
+    data_end: u64,
+) -> bool {
+    section_address < data_end && section_address.saturating_add(section_size) > data_start
 }
 
 fn is_chained_rebase_relocation(rel_info: &linker_utils::elf::RelocationKindInfo) -> bool {
@@ -766,6 +844,7 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
     timing_phase!("Write data to file");
     let existing_output_bytes_available = sized_output.existing_data_available();
     let chained_rebases = ChainedRebases::collect::<A>(layout)?;
+    let symbol_section_indices = macho_section_indices(layout);
     let (mut section_buffers, mut padding) =
         split_output_into_sections(layout, &mut sized_output.out);
     padding.fill_zero();
@@ -794,6 +873,7 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
 
             let mut symbol_writer = MachOSymbolTableWriter {
                 next_strtab_offset: group.strtab_start_offset,
+                section_indices: &symbol_section_indices,
             };
             for file in &group.files {
                 write_file::<A>(
@@ -810,11 +890,19 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
                 )
                 .with_context(|| format!("Failed copying from {file} to output file"))?;
             }
+            ensure!(
+                buffers.get(part_id::SYMTAB_GLOBAL).is_empty(),
+                "{} unwritten Mach-O symbol-table bytes remain after writing a group containing: {}",
+                buffers.get(part_id::SYMTAB_GLOBAL).len(),
+                group.files.iter().map(ToString::to_string).join(", ")
+            );
             Ok(())
         },
     )?;
 
-    write_code_signature(layout, sized_output)?;
+    if layout.args().should_emit_code_signature {
+        write_code_signature(layout, sized_output)?;
+    }
 
     Ok(())
 }
@@ -838,7 +926,7 @@ fn write_file<'data, A: Arch<Platform = MachO>>(
     buffers: &mut OutputSectionPartMap<&mut [u8]>,
     layout: &MachOLayout<'data>,
     _trace: &TraceOutput,
-    symbol_writer: &mut MachOSymbolTableWriter,
+    symbol_writer: &mut MachOSymbolTableWriter<'_>,
     chained_rebases: &ChainedRebases,
     incremental: &PreparedState,
     existing_output_bytes_available: bool,
@@ -862,9 +950,13 @@ fn write_file<'data, A: Arch<Platform = MachO>>(
         FileLayout::Prelude(s) => {
             write_prelude::<A>(s, buffers, layout, symbol_writer, chained_rebases)?;
         }
-        _ => {
-            // TODO
+        FileLayout::SyntheticSymbols(s) => {
+            write_internal_symbols(&s.internal_symbols, buffers, layout, symbol_writer)?;
         }
+        FileLayout::LinkerScript(s) => {
+            write_internal_symbols(&s.internal_symbols, buffers, layout, symbol_writer)?;
+        }
+        FileLayout::Dynamic(_) | FileLayout::Epilogue(_) | FileLayout::NotLoaded => {}
     }
     Ok(())
 }
@@ -873,7 +965,7 @@ fn write_prelude<'data, A: Arch<Platform = MachO>>(
     prelude: &PreludeLayout<MachO>,
     buffers: &mut OutputSectionPartMap<&mut [u8]>,
     layout: &MachOLayout<'data>,
-    symbol_writer: &mut MachOSymbolTableWriter,
+    symbol_writer: &mut MachOSymbolTableWriter<'_>,
     chained_rebases: &ChainedRebases,
 ) -> Result {
     verbose_timing_phase!("Write prelude");
@@ -930,18 +1022,20 @@ fn write_prelude<'data, A: Arch<Platform = MachO>>(
         .map_err(|_| error!("Invalid SYMTAB_COMMAND allocation"))?;
     write_symtab_command::<A>(layout, symtab_command);
 
-    let code_signature_command: &mut CodeSignatureCommand =
-        from_bytes_mut(buffers.get_mut(part_id::CODE_SIGNATURE_COMMAND))
-            .map_err(|_| error!("Invalid CODE_SIGNATURE_COMMAND allocation"))?
-            .0;
-    write_code_signature_command::<A>(layout, code_signature_command);
+    if layout.args().should_emit_code_signature {
+        let code_signature_command: &mut CodeSignatureCommand =
+            from_bytes_mut(buffers.get_mut(part_id::CODE_SIGNATURE_COMMAND))
+                .map_err(|_| error!("Invalid CODE_SIGNATURE_COMMAND allocation"))?
+                .0;
+        write_code_signature_command::<A>(layout, code_signature_command);
+    }
 
     let chained_fixup_table = buffers.get_mut(part_id::CHAINED_FIXUP_TABLE);
     write_chained_fixup_table(chained_fixup_table, layout, chained_rebases)?;
 
     // Fill up one extra character as n_strx == 0 is treated as unnamed.
     buffers.get_mut(part_id::STRTAB).fill(0);
-    write_internal_symbols(prelude, buffers, layout, symbol_writer)?;
+    write_internal_symbols(&prelude.internal_symbols, buffers, layout, symbol_writer)?;
 
     Ok(())
 }
@@ -1203,7 +1297,7 @@ fn write_object<'data, A: Arch<Platform = MachO>>(
     object: &ObjectLayout<'data, MachO>,
     buffers: &mut OutputSectionPartMap<&mut [u8]>,
     layout: &MachOLayout<'data>,
-    symbol_writer: &mut MachOSymbolTableWriter,
+    symbol_writer: &mut MachOSymbolTableWriter<'_>,
     chained_rebases: &ChainedRebases,
     incremental: &PreparedState,
     existing_output_bytes_available: bool,
@@ -1317,15 +1411,20 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
     group_file_sizes: &OutputSectionPartMap<usize>,
 ) -> Result {
     let relocations = object_layout.relocations(section_index)?;
-    let record_for_reuse = !layout.args().should_output_partial_object()
-        && relocations.num_relocations() == 0
+    let section_header = object_layout.object.section(section_index)?;
+    let recordable_section = !layout.args().should_output_partial_object()
         && object_layout
             .section_relax_deltas
             .get(section_index.0)
             .is_none()
         && !section.flags.needs_got()
         && !section.flags.needs_plt();
-    let can_reuse_existing_bytes = existing_output_bytes_available && record_for_reuse;
+    let can_reuse_section_bytes = recordable_section && relocations.num_relocations() == 0;
+    // A relocated __data section cannot reuse emitted bytes directly, but recording it allows
+    // the incremental patch validator to admit narrow changed-input cases.
+    let record_for_incremental_state = can_reuse_section_bytes
+        || (recordable_section && object_layout.object.section_name(section_header)? == b"__data");
+    let can_reuse_existing_bytes = existing_output_bytes_available && can_reuse_section_bytes;
 
     let written = write_section_raw(
         object_layout,
@@ -1334,7 +1433,7 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
         section_index,
         buffers,
         incremental,
-        record_for_reuse,
+        record_for_incremental_state,
         can_reuse_existing_bytes,
         group_file_offsets,
         group_file_sizes,
@@ -1352,7 +1451,6 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
     let relax_deltas = object_layout.section_relax_deltas.get(section_index.0);
     let mut paired_addend = 0;
     let mut paired_subtractor = None;
-    let section_header = object_layout.object.section(section_index)?;
     let is_eh_frame = object_layout.object.section_name(section_header)? == b"__eh_frame";
     let live_unwind_ranges =
         macho_writer_live_unwind_relocation_ranges(object_layout, layout, section_index)?;
@@ -1364,20 +1462,18 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
         if relax_deltas.is_some_and(|deltas| deltas.deletes_input_offset(input_offset)) {
             continue;
         }
-        if live_unwind_ranges.as_ref().is_some_and(|ranges| {
-            !ranges
-                .iter()
-                .any(|range| range.contains(&(input_offset as usize)))
-        }) {
+        if live_unwind_ranges
+            .as_ref()
+            .is_some_and(|ranges| !sorted_ranges_contain(ranges, input_offset as usize))
+        {
             paired_addend = 0;
             paired_subtractor = None;
             continue;
         }
-        if live_subsection_ranges.as_ref().is_some_and(|ranges| {
-            !ranges
-                .iter()
-                .any(|range| range.contains(&(input_offset as usize)))
-        }) {
+        if live_subsection_ranges
+            .as_ref()
+            .is_some_and(|ranges| !sorted_ranges_contain(ranges, input_offset as usize))
+        {
             paired_addend = 0;
             paired_subtractor = None;
             continue;
@@ -1647,15 +1743,17 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
         _ => raw_value,
     };
 
-    let target_name = local_symbol_id.map_or_else(
-        || format!("section ordinal {}", rel.r_symbolnum),
-        |symbol_id| {
-            layout
-                .symbol_db
-                .symbol_name_for_display(symbol_id)
-                .to_string()
-        },
-    );
+    let target_name = || {
+        local_symbol_id.map_or_else(
+            || format!("section ordinal {}", rel.r_symbolnum),
+            |symbol_id| {
+                layout
+                    .symbol_db
+                    .symbol_name_for_display(symbol_id)
+                    .to_string()
+            },
+        )
+    };
 
     let mask = get_page_mask(rel_info.mask);
     let mut value = match rel_info.kind {
@@ -1692,7 +1790,12 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
         value = encode_chained_bind(import_index, chained_rebases.next_stride(place)?)?;
     } else if chained_rebases.contains(place) {
         value = encode_chained_rebase(value, chained_rebases.next_stride(place)?).with_context(
-            || format!("Failed to encode Mach-O chained rebase at {place:#x} for {target_name}"),
+            || {
+                format!(
+                    "Failed to encode Mach-O chained rebase at {place:#x} for {}",
+                    target_name()
+                )
+            },
         )?;
     }
 
@@ -1707,15 +1810,17 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
             %rel_info.size,
             value,
             value_hex = %HexU64::new(value),
-            symbol_name = %target_name,
+            symbol_name = %target_name(),
             "relocation applied");
 
     rel_info
         .write_to_buffer(value, &mut out[offset_in_section as usize..])
         .with_context(|| {
             format!(
-                "failed to apply Mach-O relocation type {} at offset {:#x} against {target_name}",
-                rel.r_type, offset_in_section
+                "failed to apply Mach-O relocation type {} at offset {:#x} against {}",
+                rel.r_type,
+                offset_in_section,
+                target_name()
             )
         })?;
 
@@ -2147,91 +2252,107 @@ fn add_unwind_info_gap_entries(entries: &mut Vec<UnwindInfoEntry>, text_end: u32
 }
 
 fn collect_unwind_info_entries(layout: &MachOLayout<'_>) -> Result<Vec<UnwindInfoEntry>> {
+    let entries_by_group = layout
+        .group_layouts
+        .par_iter()
+        .map(|group| -> Result<Vec<UnwindInfoEntry>> {
+            let mut entries = Vec::new();
+            for file in &group.files {
+                let FileLayout::Object(object) = file else {
+                    continue;
+                };
+                entries.extend(collect_object_unwind_info_entries(object, layout)?);
+            }
+            Ok(entries)
+        })
+        .collect::<Vec<_>>();
+
     let mut entries = Vec::new();
-    for group in &layout.group_layouts {
-        for file in &group.files {
-            let FileLayout::Object(object) = file else {
+    for group_entries in entries_by_group {
+        entries.extend(group_entries?);
+    }
+    Ok(entries)
+}
+
+fn collect_object_unwind_info_entries<'data>(
+    object: &ObjectLayout<'data, MachO>,
+    layout: &MachOLayout<'data>,
+) -> Result<Vec<UnwindInfoEntry>> {
+    let fde_infos = eh_frame_fde_infos(object, layout)?;
+    let mut entries = Vec::new();
+
+    for (section_index, section) in object.sections.iter().enumerate() {
+        let SectionSlot::FrameData(_) = section else {
+            continue;
+        };
+        let section_index = object::SectionIndex(section_index);
+        let section_header = object.object.section(section_index)?;
+        if object.object.section_name(section_header)? != b"__compact_unwind" {
+            continue;
+        }
+
+        let compact_entries = read_compact_unwind_entries(object, layout, section_index)?;
+        for entry in compact_entries {
+            let Some(function_offset) = entry
+                .function_address
+                .checked_sub(MACHO_START_MEM_ADDRESS)
+                .and_then(|offset| u32::try_from(offset).ok())
+            else {
                 continue;
             };
 
-            let fde_infos = eh_frame_fde_infos(object, layout)?;
+            let mut encoding = entry.encoding;
+            let mut personality_offset = if entry.personality == 0 {
+                None
+            } else {
+                Some(macho_image_offset(entry.personality)?)
+            };
+            let mut lsda_offset = if entry.lsda == 0 {
+                None
+            } else {
+                Some(macho_image_offset(entry.lsda)?)
+            };
 
-            for (section_index, section) in object.sections.iter().enumerate() {
-                let SectionSlot::FrameData(_) = section else {
+            if encoding & UNWIND_ARM64_MODE_MASK == UNWIND_ARM64_MODE_DWARF {
+                let Some(fde_info) = fde_infos
+                    .as_ref()
+                    .and_then(|infos| infos.get(&entry.function_address))
+                    .copied()
+                else {
                     continue;
                 };
-                let section_index = object::SectionIndex(section_index);
-                let section_header = object.object.section(section_index)?;
-                if object.object.section_name(section_header)? != b"__compact_unwind" {
-                    continue;
-                }
-
-                let compact_entries = read_compact_unwind_entries(object, layout, section_index)?;
-                for entry in compact_entries {
-                    let Some(function_offset) = entry
-                        .function_address
-                        .checked_sub(MACHO_START_MEM_ADDRESS)
-                        .and_then(|offset| u32::try_from(offset).ok())
-                    else {
-                        continue;
-                    };
-
-                    let mut encoding = entry.encoding;
-                    let mut personality_offset = if entry.personality == 0 {
-                        None
-                    } else {
-                        Some(macho_image_offset(entry.personality)?)
-                    };
-                    let mut lsda_offset = if entry.lsda == 0 {
-                        None
-                    } else {
-                        Some(macho_image_offset(entry.lsda)?)
-                    };
-
-                    if encoding & UNWIND_ARM64_MODE_MASK == UNWIND_ARM64_MODE_DWARF {
-                        let Some(fde_info) = fde_infos
-                            .as_ref()
-                            .and_then(|infos| infos.get(&entry.function_address))
-                            .copied()
-                        else {
-                            continue;
-                        };
-                        let output_dwarf_offset =
-                            compact_unwind_dwarf_offset_hint(fde_info.output_offset);
-                        encoding = (encoding & !UNWIND_DWARF_OFFSET_MASK) | output_dwarf_offset;
-                        personality_offset = personality_offset.or(fde_info.personality_offset);
-                        lsda_offset = lsda_offset.or(fde_info.lsda_offset);
-                    }
-
-                    entries.push(UnwindInfoEntry {
-                        function_offset,
-                        length: entry.length,
-                        encoding,
-                        personality_offset,
-                        lsda_offset,
-                    });
-                }
+                let output_dwarf_offset = compact_unwind_dwarf_offset_hint(fde_info.output_offset);
+                encoding = (encoding & !UNWIND_DWARF_OFFSET_MASK) | output_dwarf_offset;
+                personality_offset = personality_offset.or(fde_info.personality_offset);
+                lsda_offset = lsda_offset.or(fde_info.lsda_offset);
             }
 
-            if let Some(fde_infos) = &fde_infos {
-                for (function_address, fde_info) in fde_infos {
-                    let Some(function_offset) = function_address
-                        .checked_sub(MACHO_START_MEM_ADDRESS)
-                        .and_then(|offset| u32::try_from(offset).ok())
-                    else {
-                        continue;
-                    };
-                    let output_dwarf_offset =
-                        compact_unwind_dwarf_offset_hint(fde_info.output_offset);
-                    entries.push(UnwindInfoEntry {
-                        function_offset,
-                        length: fde_info.length,
-                        encoding: UNWIND_ARM64_MODE_DWARF | output_dwarf_offset,
-                        personality_offset: fde_info.personality_offset,
-                        lsda_offset: fde_info.lsda_offset,
-                    });
-                }
-            }
+            entries.push(UnwindInfoEntry {
+                function_offset,
+                length: entry.length,
+                encoding,
+                personality_offset,
+                lsda_offset,
+            });
+        }
+    }
+
+    if let Some(fde_infos) = &fde_infos {
+        for (function_address, fde_info) in fde_infos {
+            let Some(function_offset) = function_address
+                .checked_sub(MACHO_START_MEM_ADDRESS)
+                .and_then(|offset| u32::try_from(offset).ok())
+            else {
+                continue;
+            };
+            let output_dwarf_offset = compact_unwind_dwarf_offset_hint(fde_info.output_offset);
+            entries.push(UnwindInfoEntry {
+                function_offset,
+                length: fde_info.length,
+                encoding: UNWIND_ARM64_MODE_DWARF | output_dwarf_offset,
+                personality_offset: fde_info.personality_offset,
+                lsda_offset: fde_info.lsda_offset,
+            });
         }
     }
 
@@ -2247,6 +2368,10 @@ fn compact_unwind_dwarf_offset_hint(output_offset: u64) -> u32 {
         // __eh_frame so it can scan from there.
         0
     }
+}
+
+fn compact_unwind_section_addend(relax_deltas: Option<&SectionRelaxDeltas>, addend: u64) -> u64 {
+    opt_input_to_output(relax_deltas, addend)
 }
 
 fn eh_frame_fde_infos<'data>(
@@ -2299,11 +2424,7 @@ fn eh_frame_fde_infos<'data>(
         if rel.r_type == macho::ARM64_RELOC_SUBTRACTOR {
             continue;
         }
-        if filter_live_unwind
-            && !live_ranges
-                .iter()
-                .any(|range| range.contains(&(rel.r_address as usize)))
-        {
+        if filter_live_unwind && !sorted_ranges_contain(&live_ranges, rel.r_address as usize) {
             paired_addend = 0;
             continue;
         }
@@ -2319,8 +2440,14 @@ fn eh_frame_fde_infos<'data>(
         );
         paired_addend = 0;
     }
+    let mut relocation_values_by_offset = relocation_values
+        .iter()
+        .map(|(relocation_offset, target_address)| (*relocation_offset, *target_address))
+        .collect::<Vec<_>>();
+    relocation_values_by_offset.sort_unstable_by_key(|(relocation_offset, _)| *relocation_offset);
 
     let mut fde_infos = HashMap::new();
+    let mut personality_offsets_by_cie = HashMap::new();
     let mut offset = 0usize;
     while offset + size_of::<u32>() <= data.len() {
         let length = read_u32(data, offset)? as usize;
@@ -2377,22 +2504,33 @@ fn eh_frame_fde_infos<'data>(
                     "Mach-O __eh_frame CIE at offset {cie_start:#x} extends past the section"
                 );
                 let cie_end = cie_start + size_of::<u32>() + cie_length;
-                let mut personality_offset = None;
-                for (relocation_offset, got_address) in &relocation_got_values {
-                    if *relocation_offset >= cie_start && *relocation_offset < cie_end {
-                        personality_offset = Some(macho_image_offset(*got_address)?);
-                        break;
-                    }
-                }
+                let personality_offset =
+                    if let Some(personality_offset) = personality_offsets_by_cie.get(&cie_start) {
+                        *personality_offset
+                    } else {
+                        let personality_offset = relocation_got_values.iter().find_map(
+                            |(relocation_offset, got_address)| {
+                                (*relocation_offset >= cie_start && *relocation_offset < cie_end)
+                                    .then_some(*got_address)
+                            },
+                        );
+                        let personality_offset =
+                            personality_offset.map(macho_image_offset).transpose()?;
+                        personality_offsets_by_cie.insert(cie_start, personality_offset);
+                        personality_offset
+                    };
 
                 let entry_end = offset + size_of::<u32>() + length;
                 let mut lsda_offset = None;
                 if gcc_except_table_start != gcc_except_table_end {
-                    for (relocation_offset, target_address) in &relocation_values {
-                        if *relocation_offset <= pc_begin_offset || *relocation_offset >= entry_end
-                        {
-                            continue;
-                        }
+                    let first_relocation_index =
+                        relocation_values_by_offset.partition_point(|(relocation_offset, _)| {
+                            *relocation_offset <= pc_begin_offset
+                        });
+                    for (_, target_address) in relocation_values_by_offset[first_relocation_index..]
+                        .iter()
+                        .take_while(|(relocation_offset, _)| *relocation_offset < entry_end)
+                    {
                         if *target_address >= gcc_except_table_start
                             && *target_address < gcc_except_table_end
                         {
@@ -2542,6 +2680,15 @@ fn read_compact_unwind_entries<'data>(
             0 | 16 | 24 => read_u64(data, offset)?,
             _ => 0,
         };
+        let field_addend = if rel.r_extern {
+            field_addend
+        } else {
+            let section_index = object::SectionIndex(rel.r_symbolnum as usize - 1);
+            compact_unwind_section_addend(
+                object.section_relax_deltas.get(section_index.0),
+                field_addend,
+            )
+        };
         let value = resolution
             .raw_value
             .wrapping_add(field_addend)
@@ -2653,6 +2800,11 @@ fn macho_writer_live_subsection_relocation_ranges(
     }
 
     Ok(Some(ranges))
+}
+
+fn sorted_ranges_contain(ranges: &[std::ops::Range<usize>], offset: usize) -> bool {
+    let boundary_index = ranges.partition_point(|range| range.start <= offset);
+    boundary_index > 0 && ranges[boundary_index - 1].contains(&offset)
 }
 
 fn live_eh_frame_ranges(
@@ -3359,29 +3511,168 @@ fn write_code_signature(layout: &MachOLayout, sized_output: &mut SizedOutput) ->
     identifier[CS_IDENTIFIER_STRING.len()..].fill(0);
     hashes.copy_from_slice(&calculated_hashes);
 
-    #[cfg(target_os = "macos")]
     if let crate::file_writer::OutputBuffer::Mmap(output) = &mut sized_output.out {
-        // Match lld's workaround for the macOS kernel caching signature-verification
-        // data before the final code signature has been written:
-        //
-        // https://openradar.appspot.com/FB8914231
-        unsafe {
-            libc::msync(
-                output.as_mut_ptr().cast(),
-                code_signature_section.file_offset + code_signature_section.file_size,
-                libc::MS_INVALIDATE,
-            );
-        }
+        invalidate_code_signature_cache(
+            output,
+            (code_signature_section.file_offset + code_signature_section.file_size) as usize,
+        );
     }
 
     Ok(())
 }
 
-struct MachOSymbolTableWriter {
-    next_strtab_offset: u32,
+pub(crate) fn refresh_code_signature(
+    output: &mut [u8],
+    changed_ranges: &[Range<usize>],
+) -> Result<Range<usize>> {
+    timing_phase!("Refresh Mach-O code signature");
+    let code_signature_range = {
+        let bytes: &[u8] = output;
+        let header = macho::MachHeader64::<Endianness>::parse(bytes, 0)?;
+        let mut commands = header.load_commands(LE, bytes, 0)?;
+        let mut code_signature_range = None;
+
+        while let Some(command) = commands.next()? {
+            if command.cmd() == LC_CODE_SIGNATURE {
+                ensure!(
+                    code_signature_range.is_none(),
+                    "At most one Mach-O code signature command expected"
+                );
+                let code_signature_command: &CodeSignatureCommand = command.data()?;
+                let start = code_signature_command.dataoff.get(LE) as usize;
+                let size = code_signature_command.datasize.get(LE) as usize;
+                let end = start
+                    .checked_add(size)
+                    .ok_or_else(|| error!("Mach-O code signature range overflow"))?;
+                ensure!(
+                    end <= bytes.len(),
+                    "Mach-O code signature range exceeds output size"
+                );
+                code_signature_range = Some(start..end);
+            }
+        }
+
+        code_signature_range.ok_or_else(|| error!("Missing Mach-O code signature command"))?
+    };
+
+    let mut changed_pages = Vec::new();
+    for range in changed_ranges {
+        ensure!(
+            range.start <= range.end && range.end <= code_signature_range.start,
+            "Mach-O patched range lies outside signed content"
+        );
+        if !range.is_empty() {
+            changed_pages.extend(range.start / CS_BLOCK_SIZE..range.end.div_ceil(CS_BLOCK_SIZE));
+        }
+    }
+    changed_pages.sort_unstable();
+    changed_pages.dedup();
+    let calculated_hashes = changed_pages
+        .iter()
+        .map(|page_index| {
+            let start = page_index * CS_BLOCK_SIZE;
+            let end = (start + CS_BLOCK_SIZE).min(code_signature_range.start);
+            (*page_index, Sha256::digest(&output[start..end]))
+        })
+        .collect::<Vec<_>>();
+    let code_signature = output
+        .get_mut(code_signature_range.clone())
+        .ok_or_else(|| error!("Invalid CODE_SIGNATURE range"))?;
+    let code_signature_size = code_signature.len();
+    let (super_blob, rest): (&mut CodeSignatureSuperBlob, &mut [u8]) =
+        CodeSignatureSuperBlob::mut_from_prefix(code_signature)
+            .map_err(|_| error!("Invalid CODE_SIGNATURE allocation"))?;
+    ensure!(
+        super_blob.magic.get() == CSMAGIC_EMBEDDED_SIGNATURE,
+        "Invalid Mach-O embedded signature magic"
+    );
+    ensure!(
+        super_blob.length.get() as usize == code_signature_size,
+        "Unexpected Mach-O embedded signature size"
+    );
+    ensure!(
+        super_blob.count.get() == 1,
+        "Unsupported Mach-O embedded signature blob count"
+    );
+    let (blob_indices, _) = <[CodeSignatureBlobIndex]>::mut_from_prefix_with_elems(rest, 1)
+        .map_err(|_| error!("Invalid CODE_SIGNATURE allocation"))?;
+    ensure!(
+        blob_indices[0].type_.get() == CSSLOT_CODEDIRECTORY,
+        "Unsupported Mach-O code signature blob type"
+    );
+    let code_directory_offset = blob_indices[0].offset.get() as usize;
+    let code_directory_bytes = code_signature
+        .get_mut(code_directory_offset..)
+        .ok_or_else(|| error!("Invalid Mach-O code directory offset"))?;
+    let (code_directories, _) =
+        <[CodeSignatureCodeDirectory]>::mut_from_prefix_with_elems(code_directory_bytes, 1)
+            .map_err(|_| error!("Invalid CODE_SIGNATURE allocation"))?;
+    let code_directory = &mut code_directories[0];
+    ensure!(
+        code_directory.magic.get() == CSMAGIC_CODEDIRECTORY,
+        "Invalid Mach-O code directory magic"
+    );
+    ensure!(
+        code_directory.hash_type == CS_HASHTYPE_SHA256
+            && code_directory.hash_size == CS_HASH_SIZE
+            && code_directory.page_size == CS_BLOCK_SIZE_EXP,
+        "Unsupported Mach-O code signature hash format"
+    );
+    ensure!(
+        code_directory.code_limit.get() as usize == code_signature_range.start
+            && code_directory.n_code_slots.get() as usize
+                == code_signature_range.start.div_ceil(CS_BLOCK_SIZE),
+        "Unexpected Mach-O signed content range"
+    );
+    let hashes_start = code_directory_offset
+        .checked_add(code_directory.hash_offset.get() as usize)
+        .ok_or_else(|| error!("Mach-O code signature hash range overflow"))?;
+    let hashes_length = code_signature_range
+        .start
+        .div_ceil(CS_BLOCK_SIZE)
+        .checked_mul(CS_HASH_SIZE as usize)
+        .ok_or_else(|| error!("Mach-O code signature hash range overflow"))?;
+    let hashes_end = hashes_start
+        .checked_add(hashes_length)
+        .ok_or_else(|| error!("Mach-O code signature hash range overflow"))?;
+    let hashes = code_signature
+        .get_mut(hashes_start..hashes_end)
+        .ok_or_else(|| error!("Invalid Mach-O code signature hash range"))?;
+    for (page_index, calculated_hash) in calculated_hashes {
+        let hash_start = page_index * CS_HASH_SIZE as usize;
+        let hash_end = hash_start + CS_HASH_SIZE as usize;
+        hashes[hash_start..hash_end].copy_from_slice(&calculated_hash);
+    }
+
+    invalidate_code_signature_cache(output, code_signature_range.end);
+    Ok(code_signature_range)
 }
 
-impl MachOSymbolTableWriter {
+#[cfg(target_os = "macos")]
+fn invalidate_code_signature_cache(output: &mut [u8], output_length: usize) {
+    // Match lld's workaround for the macOS kernel caching verification data before the final
+    // signature bytes have been written: https://openradar.appspot.com/FB8914231
+    //
+    // SAFETY: `output` points at the writable mapped output bytes and `output_length` has been
+    // validated to be within that mapping by the writer or `refresh_code_signature`.
+    unsafe {
+        libc::msync(
+            output.as_mut_ptr().cast(),
+            output_length,
+            libc::MS_INVALIDATE,
+        );
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn invalidate_code_signature_cache(_output: &mut [u8], _output_length: usize) {}
+
+struct MachOSymbolTableWriter<'layout> {
+    next_strtab_offset: u32,
+    section_indices: &'layout OutputSectionMap<Option<u32>>,
+}
+
+impl MachOSymbolTableWriter<'_> {
     fn write_str(&mut self, name: &[u8], buffers: &mut OutputSectionPartMap<&mut [u8]>) -> u32 {
         let len_with_terminator = name.len() + 1;
         let offset = self.next_strtab_offset;
@@ -3436,7 +3727,7 @@ fn write_symbols<'data>(
     object: &ObjectLayout<'data, MachO>,
     buffers: &mut OutputSectionPartMap<&mut [u8]>,
     layout: &MachOLayout<'data>,
-    symbol_writer: &mut MachOSymbolTableWriter,
+    symbol_writer: &mut MachOSymbolTableWriter<'_>,
 ) -> Result {
     for ((sym_index, sym), flags) in object
         .object
@@ -3471,13 +3762,14 @@ fn write_symbols<'data>(
                 };
                 let primary_id = layout.output_sections.primary_output_section(section_id);
                 let n_type = (sym.n_type & !object::macho::N_TYPE) | N_SECT;
-                let n_sect = macho_section_index(layout, primary_id).with_context(|| {
-                    format!(
-                        "No Mach-O section index for {} while writing {}",
-                        primary_id,
-                        layout.symbol_debug(symbol_id)
-                    )
-                })?;
+                let n_sect = macho_section_index(symbol_writer.section_indices, primary_id)
+                    .with_context(|| {
+                        format!(
+                            "No Mach-O section index for {} while writing {}",
+                            primary_id,
+                            layout.symbol_debug(symbol_id)
+                        )
+                    })?;
                 let n_desc = sym.n_desc.get(LE);
                 (n_sect, n_type, n_desc)
             } else if sym.is_absolute() {
@@ -3487,13 +3779,14 @@ fn write_symbols<'data>(
                 let primary_id = layout
                     .output_sections
                     .primary_output_section(common.part_id.output_section_id());
-                let n_sect = macho_section_index(layout, primary_id).with_context(|| {
-                    format!(
-                        "No Mach-O section index for {} while writing {}",
-                        primary_id,
-                        layout.symbol_debug(symbol_id)
-                    )
-                })?;
+                let n_sect = macho_section_index(symbol_writer.section_indices, primary_id)
+                    .with_context(|| {
+                        format!(
+                            "No Mach-O section index for {} while writing {}",
+                            primary_id,
+                            layout.symbol_debug(symbol_id)
+                        )
+                    })?;
                 let n_type = (sym.n_type & !object::macho::N_TYPE) | N_SECT;
                 (n_sect, n_type, 0)
             } else {
@@ -3511,21 +3804,13 @@ fn write_symbols<'data>(
 }
 
 fn write_internal_symbols<'data>(
-    prelude: &PreludeLayout<MachO>,
+    internal_symbols: &InternalSymbols<MachO>,
     buffers: &mut OutputSectionPartMap<&mut [u8]>,
     layout: &MachOLayout<'data>,
-    symbol_writer: &mut MachOSymbolTableWriter,
+    symbol_writer: &mut MachOSymbolTableWriter<'_>,
 ) -> Result {
-    for (local_index, def_info) in prelude
-        .internal_symbols
-        .symbol_definitions
-        .iter()
-        .enumerate()
-    {
-        let symbol_id = prelude
-            .internal_symbols
-            .start_symbol_id
-            .add_usize(local_index);
+    for (local_index, def_info) in internal_symbols.symbol_definitions.iter().enumerate() {
+        let symbol_id = internal_symbols.start_symbol_id.add_usize(local_index);
         if !layout.symbol_db.is_canonical(symbol_id) || symbol_id.is_undefined() {
             continue;
         }
@@ -3547,17 +3832,23 @@ fn write_internal_symbols<'data>(
             | crate::parsing::SymbolPlacement::SectionGroupStart(section_id)
             | crate::parsing::SymbolPlacement::SectionEnd(section_id)
             | crate::parsing::SymbolPlacement::SectionGroupEnd(section_id) => (
-                macho_section_index_for_internal_symbol(layout, section_id, symbol_id)?,
+                macho_section_index_for_internal_symbol(
+                    layout,
+                    symbol_writer.section_indices,
+                    section_id,
+                    symbol_id,
+                )?,
                 macho_internal_symbol_type(def_info, N_SECT),
             ),
             crate::parsing::SymbolPlacement::LoadBaseAddress
             | crate::parsing::SymbolPlacement::SegmentStart(_, _) => (
-                macho_section_index(layout, output_section_id::TEXT).with_context(|| {
-                    format!(
-                        "No Mach-O section index for __text while writing {}",
-                        layout.symbol_debug(symbol_id)
-                    )
-                })?,
+                macho_section_index(symbol_writer.section_indices, output_section_id::TEXT)
+                    .with_context(|| {
+                        format!(
+                            "No Mach-O section index for __text while writing {}",
+                            layout.symbol_debug(symbol_id)
+                        )
+                    })?,
                 macho_internal_symbol_type(def_info, N_SECT),
             ),
         };
@@ -3588,6 +3879,7 @@ fn macho_internal_symbol_type(
 
 fn macho_section_index_for_internal_symbol(
     layout: &MachOLayout<'_>,
+    section_indices: &OutputSectionMap<Option<u32>>,
     section_id: output_section_id::OutputSectionId,
     symbol_id: SymbolId,
 ) -> Result<u8> {
@@ -3596,7 +3888,7 @@ fn macho_section_index_for_internal_symbol(
     } else {
         layout.output_sections.primary_output_section(section_id)
     };
-    macho_section_index(layout, symtab_section_id).with_context(|| {
+    macho_section_index(section_indices, symtab_section_id).with_context(|| {
         format!(
             "No Mach-O section index for {} while writing {}",
             layout.output_sections.display_name(symtab_section_id),
@@ -3605,14 +3897,10 @@ fn macho_section_index_for_internal_symbol(
     })
 }
 
-// TODO: This is inefficient; simplify it once load commands use a table allocator instead of
-// being modeled as a section.
-fn macho_section_index(
-    layout: &MachOLayout<'_>,
-    section_id: output_section_id::OutputSectionId,
-) -> Result<u8> {
+fn macho_section_indices(layout: &MachOLayout<'_>) -> OutputSectionMap<Option<u32>> {
+    let mut section_indices = OutputSectionMap::with_size(layout.output_sections.num_sections());
     // The section index is one-based.
-    let mut section_idx = 1u8;
+    let mut section_idx = 1u32;
     let mut in_section_segment = false;
     for event in &layout.output_order {
         match event {
@@ -3634,16 +3922,25 @@ fn macho_section_index(
                 if !layout.output_sections.will_emit_section(current) {
                     continue;
                 }
-                if current == section_id {
-                    return Ok(section_idx);
-                }
-                section_idx = section_idx
-                    .checked_add(1)
-                    .ok_or(error!("Section index out of range (u8)"))?;
+                *section_indices.get_mut(current) = Some(section_idx);
+                section_idx += 1;
             }
             _ => {}
         }
     }
 
-    bail!("cannot find the output section")
+    section_indices
+}
+
+fn macho_section_index(
+    section_indices: &OutputSectionMap<Option<u32>>,
+    section_id: output_section_id::OutputSectionId,
+) -> Result<u8> {
+    let index = section_indices
+        .get(section_id)
+        .to_owned()
+        .ok_or_else(|| error!("cannot find the output section"))?;
+    index
+        .try_into()
+        .map_err(|_| error!("Section index out of range (u8)"))
 }

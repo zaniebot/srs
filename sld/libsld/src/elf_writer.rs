@@ -176,7 +176,7 @@ impl From<u16> for SymbolSection {
 pub(crate) fn write<'data, A: Arch<Platform = Elf>>(
     sized_output: &mut SizedOutput,
     layout: &ElfLayout<'data>,
-    incremental: &PreparedState,
+    incremental: &PreparedState<'data>,
 ) -> Result {
     write_file_contents::<A>(sized_output, layout, incremental)?;
     if layout.args().common().validate_output {
@@ -191,7 +191,7 @@ pub(crate) fn write<'data, A: Arch<Platform = Elf>>(
 
     write_sframe_section(section_buffers.get_mut(output_section_id::SFRAME), layout)?;
 
-    write_gnu_build_id_note(sized_output, &layout.args().build_id, layout)?;
+    write_gnu_build_id_note(sized_output, &layout.args().build_id, layout, incremental)?;
     Ok(())
 }
 
@@ -199,12 +199,13 @@ fn write_gnu_build_id_note(
     sized_output: &mut SizedOutput,
     build_id_option: &BuildIdOption,
     layout: &ElfLayout,
+    incremental: &PreparedState<'_>,
 ) -> Result {
     let hash_placeholder;
     let uuid_placeholder;
     let build_id = match build_id_option {
         BuildIdOption::Fast => {
-            hash_placeholder = compute_hash(sized_output);
+            hash_placeholder = compute_hash(sized_output, incremental)?;
             hash_placeholder.as_bytes()
         }
         BuildIdOption::Hex(hex) => hex.as_slice(),
@@ -232,17 +233,25 @@ fn write_gnu_build_id_note(
     Ok(())
 }
 
-fn compute_hash(sized_output: &SizedOutput) -> blake3::Hash {
+fn compute_hash(sized_output: &SizedOutput, incremental: &PreparedState) -> Result<blake3::Hash> {
     timing_phase!("Compute build ID");
-    blake3::Hasher::new()
-        .update_rayon(&sized_output.out)
-        .finalize()
+    Ok(
+        if let Some(hash) =
+            incremental.compute_fast_build_id_and_prepare_state(&sized_output.out)?
+        {
+            hash
+        } else {
+            blake3::Hasher::new()
+                .update_rayon(&sized_output.out)
+                .finalize()
+        },
+    )
 }
 
 fn write_file_contents<'data, A: Arch<Platform = Elf>>(
     sized_output: &mut SizedOutput,
     layout: &ElfLayout<'data>,
-    incremental: &PreparedState,
+    incremental: &PreparedState<'data>,
 ) -> Result {
     timing_phase!("Write data to file");
     let existing_output_bytes_available = sized_output.existing_data_available();
@@ -502,7 +511,7 @@ fn write_file<'data, A: Arch<Platform = Elf>>(
     layout: &ElfLayout<'data>,
     trace: &TraceOutput,
     sym_index_map: &[Option<u32>],
-    incremental: &PreparedState,
+    incremental: &PreparedState<'data>,
     existing_output_bytes_available: bool,
     group_file_offsets: &OutputSectionPartMap<usize>,
     group_file_sizes: &OutputSectionPartMap<usize>,
@@ -1586,7 +1595,7 @@ fn write_object<'data, A: Arch<Platform = Elf>>(
     layout: &ElfLayout<'data>,
     trace: &TraceOutput,
     sym_index_map: &[Option<u32>],
-    incremental: &PreparedState,
+    incremental: &PreparedState<'data>,
     existing_output_bytes_available: bool,
     group_file_offsets: &OutputSectionPartMap<usize>,
     group_file_sizes: &OutputSectionPartMap<usize>,
@@ -2029,7 +2038,7 @@ fn write_object_section<'data, A: Arch<Platform = Elf>>(
     buffers: &mut OutputSectionPartMap<&mut [u8]>,
     table_writer: &mut TableWriter,
     trace: &TraceOutput,
-    incremental: &PreparedState,
+    incremental: &PreparedState<'data>,
     existing_output_bytes_available: bool,
     group_file_offsets: &OutputSectionPartMap<usize>,
     group_file_sizes: &OutputSectionPartMap<usize>,
@@ -2149,7 +2158,7 @@ fn write_section_reversed<'data, A: Arch<Platform = Elf>>(
     section_index: object::SectionIndex,
     table_writer: &mut TableWriter<'_, '_>,
     trace: &TraceOutput,
-    incremental: &PreparedState,
+    incremental: &PreparedState<'data>,
     output_offset: u64,
     out: &mut [u8],
 ) -> Result {
@@ -2226,7 +2235,7 @@ fn write_debug_section<'data, A: Arch<Platform = Elf>>(
     section: &Section,
     section_index: object::SectionIndex,
     buffers: &mut OutputSectionPartMap<&mut [u8]>,
-    incremental: &PreparedState,
+    incremental: &PreparedState<'data>,
     existing_output_bytes_available: bool,
     group_file_offsets: &OutputSectionPartMap<usize>,
     group_file_sizes: &OutputSectionPartMap<usize>,
@@ -2240,11 +2249,15 @@ fn write_debug_section<'data, A: Arch<Platform = Elf>>(
     }
 
     let relocations = object.relocations(section_index)?;
+    let has_relocations = relocations.num_relocations() != 0;
     let record_for_reuse = !layout.args().should_output_partial_object()
-        && relocations.num_relocations() == 0
         && object.section_relax_deltas.get(section_index.0).is_none()
         && !section.flags.needs_got()
         && !section.flags.needs_plt();
+    // Relocated debug sections need patch metadata, but their linked addresses must be rewritten
+    // by a normal relink when section placement changes.
+    let can_reuse_existing_bytes =
+        existing_output_bytes_available && record_for_reuse && !has_relocations;
     let written = write_section_raw(
         object,
         layout,
@@ -2253,7 +2266,7 @@ fn write_debug_section<'data, A: Arch<Platform = Elf>>(
         buffers,
         incremental,
         record_for_reuse,
-        existing_output_bytes_available && record_for_reuse,
+        can_reuse_existing_bytes,
         group_file_offsets,
         group_file_sizes,
     )?;
@@ -2266,12 +2279,20 @@ fn write_debug_section<'data, A: Arch<Platform = Elf>>(
             object,
             out,
             section_index,
+            Some(written.output_offset),
             rela.iter().map(|rela| Ok(*rela)),
             layout,
+            Some(incremental),
         ),
-        elf::RelocationList::Crel(crel_iter) => {
-            apply_debug_relocations::<A, Crel, _>(object, out, section_index, crel_iter, layout)
-        }
+        elf::RelocationList::Crel(crel_iter) => apply_debug_relocations::<A, Crel, _>(
+            object,
+            out,
+            section_index,
+            Some(written.output_offset),
+            crel_iter,
+            layout,
+            Some(incremental),
+        ),
     };
     result.with_context(|| {
         format!(
@@ -2536,7 +2557,7 @@ fn apply_relocations<
     layout: &ElfLayout<'data>,
     table_writer: &mut TableWriter,
     trace: &TraceOutput,
-    incremental: &PreparedState,
+    incremental: &PreparedState<'data>,
 ) -> Result {
     let section_address = object.section_resolutions[section_index.0]
         .address()
@@ -2549,6 +2570,11 @@ fn apply_relocations<
     let mut relocation_cache = RelocationCache::<R>::default();
     let relax_deltas = object.section_relax_deltas.get(section_index.0);
     let mut relax_cursor = relax_deltas.map(|deltas| deltas.cursor());
+    let mut incremental_relocations = if incremental.records_relocations() {
+        Vec::with_capacity(relocations.size_hint().0)
+    } else {
+        Vec::new()
+    };
 
     while let Some(rel) = relocations.next() {
         let rel = rel?;
@@ -2589,6 +2615,7 @@ fn apply_relocations<
             table_writer,
             trace,
             incremental,
+            &mut incremental_relocations,
             &relocation_cache,
             &relocations,
             relax_deltas,
@@ -2601,6 +2628,7 @@ fn apply_relocations<
         })?;
         relocation_cache.previous = Some(rel);
     }
+    incremental.record_relocations(incremental_relocations);
 
     layout
         .relocation_statistics
@@ -2622,8 +2650,10 @@ pub(crate) fn apply_debug_relocations<
     object: &ObjectLayout<'data, Elf>,
     out: &mut [u8],
     section_index: object::SectionIndex,
+    section_output_offset: Option<u64>,
     relocations: I,
     layout: &ElfLayout<'data>,
+    incremental: Option<&PreparedState<'data>>,
 ) -> Result {
     let object_section = object.object.section(section_index)?;
     let section_name = object.object.section_name(object_section)?;
@@ -2643,6 +2673,12 @@ pub(crate) fn apply_debug_relocations<
 
     let mut relocation_count = 0;
     let mut relocation_cache = RelocationCache::default();
+    let mut incremental_relocations = if incremental.is_some_and(PreparedState::records_relocations)
+    {
+        Vec::with_capacity(relocations.size_hint().0)
+    } else {
+        Vec::new()
+    };
 
     for rel in relocations {
         relocation_count += 1;
@@ -2650,11 +2686,15 @@ pub(crate) fn apply_debug_relocations<
         let offset_in_section = rel.offset();
         apply_debug_relocation::<A, R>(
             object,
+            section_index,
             offset_in_section,
             &rel,
             layout,
             tombstone_value,
             out,
+            section_output_offset,
+            incremental,
+            &mut incremental_relocations,
             &relocation_cache,
         )
         .with_context(|| {
@@ -2664,6 +2704,9 @@ pub(crate) fn apply_debug_relocations<
             )
         })?;
         relocation_cache.previous = Some(rel);
+    }
+    if let Some(incremental) = incremental {
+        incremental.record_relocations(incremental_relocations);
     }
     layout
         .relocation_statistics
@@ -2682,7 +2725,7 @@ fn write_eh_frame_data<'data, A: Arch<Platform = Elf>>(
     layout: &ElfLayout<'data>,
     table_writer: &mut TableWriter,
     trace: &TraceOutput,
-    incremental: &PreparedState,
+    incremental: &PreparedState<'data>,
 ) -> Result {
     let eh_frame_section = object.object.section(eh_frame_section_index)?;
     match object.relocations(eh_frame_section_index)? {
@@ -2715,7 +2758,7 @@ fn write_eh_frame_relocations<'data, A: Arch<Platform = Elf>, R: Relocation>(
     layout: &ElfLayout<'data>,
     table_writer: &mut TableWriter<'_, '_>,
     trace: &TraceOutput,
-    incremental: &PreparedState,
+    incremental: &PreparedState<'data>,
     eh_frame_section: &object::elf::SectionHeader64<LittleEndian>,
     relocations: impl Iterator<Item = R>,
 ) -> std::result::Result<(), error::Error> {
@@ -2728,7 +2771,7 @@ fn write_eh_frame_relocations<'data, A: Arch<Platform = Elf>, R: Relocation>(
     let mut output_pos = 0;
     let frame_info_ptr_base = table_writer.eh_frame_start_address;
     let eh_frame_hdr_address = layout.mem_address_of_built_in(output_section_id::EH_FRAME_HDR);
-
+    let mut incremental_relocations = Vec::new();
     // Map from input offset to output offset of each CIE.
     let mut cies_offset_conversion: HashMap<u32, u32> = HashMap::new();
 
@@ -2859,6 +2902,7 @@ fn write_eh_frame_relocations<'data, A: Arch<Platform = Elf>, R: Relocation>(
                     table_writer,
                     trace,
                     incremental,
+                    &mut incremental_relocations,
                     &RelocationCache::default(),
                     &iter::empty(),
                     None,
@@ -3189,7 +3233,8 @@ fn apply_relocation<
     out: &mut [u8],
     table_writer: &mut TableWriter,
     trace: &TraceOutput,
-    incremental: &PreparedState,
+    incremental: &PreparedState<'data>,
+    incremental_relocations: &mut Vec<crate::incremental::DeferredRelocationRecord<'data>>,
     relocation_cache: &RelocationCache<R>,
     relocation_iterator: &I,
     relax_deltas: Option<&SectionRelaxDeltas>,
@@ -3647,17 +3692,13 @@ fn apply_relocation<
         value = thunked_value;
     };
 
-    if let Some(source_section_index) = section_info.source_section_index {
-        let target_symbol_id = layout.symbol_db.definition(local_symbol_id);
-        let target_name = layout
-            .symbol_db
-            .symbol_name(target_symbol_id)
-            .ok()
-            .and_then(|name| (!name.bytes().is_empty()).then(|| hex::encode(name.bytes())));
-        let target = relocation_target_owner(layout, target_symbol_id)?;
-        let target_symbol_id = u32::try_from(target_symbol_id.as_usize())
+    if let Some(source_section_index) = section_info.source_section_index
+        && incremental.records_relocations()
+    {
+        let target_symbol = layout.symbol_db.definition(local_symbol_id);
+        let target_symbol_id = u32::try_from(target_symbol.as_usize())
             .context("Incremental relocation target symbol ID overflow")?;
-        incremental.record_relocation(
+        if let Some(record) = crate::incremental::PreparedState::deferred_relocation_record(
             object_layout.input,
             source_section_index,
             target_symbol_id,
@@ -3668,9 +3709,19 @@ fn apply_relocation<
             addend,
             value,
             resolution.raw_value,
-            target_name,
-            target,
-        );
+            || {
+                Ok((
+                    layout
+                        .symbol_db
+                        .symbol_name(target_symbol)
+                        .ok()
+                        .and_then(|name| (!name.bytes().is_empty()).then(|| name.bytes())),
+                    relocation_target_owner(layout, target_symbol)?,
+                ))
+            },
+        )? {
+            incremental_relocations.push(record);
+        }
     }
 
     rel_info.write_to_buffer(value, &mut out[offset_in_section..])?;
@@ -3752,25 +3803,30 @@ fn maybe_get_thunk_for_relocation<A: Arch<Platform = Elf>>(
 
 fn apply_debug_relocation<'data, A: Arch<Platform = Elf>, R: Relocation>(
     object_layout: &ObjectLayout<'data, Elf>,
+    source_section_index: object::SectionIndex,
     offset_in_section: u64,
     rel: &R,
-    layout: &ElfLayout,
+    layout: &ElfLayout<'data>,
     section_tombstone_value: u64,
     out: &mut [u8],
+    section_output_offset: Option<u64>,
+    incremental: Option<&PreparedState<'data>>,
+    incremental_relocations: &mut Vec<crate::incremental::DeferredRelocationRecord<'data>>,
     relocation_cache: &RelocationCache<R>,
 ) -> Result<()> {
     let symbol_index = rel.symbol().context("Unsupported absolute relocation")?;
+    let local_symbol_id = object_layout.symbol_id_range.input_to_id(symbol_index);
     let sym = object_layout.object.symbol(symbol_index)?;
-    let section_index = object_layout.object.symbol_section(sym, symbol_index)?;
+    let target_section_index = object_layout.object.symbol_section(sym, symbol_index)?;
 
     let addend = rel.addend();
     let r_type = rel.raw_type();
     let rel_info = A::relocation_from_raw(r_type)?;
 
     let resolution = layout
-        .merged_symbol_resolution(object_layout.symbol_id_range.input_to_id(symbol_index))
+        .merged_symbol_resolution(local_symbol_id)
         .or_else(|| {
-            section_index.and_then(|section_index| {
+            target_section_index.and_then(|section_index| {
                 let section_address =
                     object_layout.section_resolutions[section_index.0].address()?;
                 // Include the symbol's offset within the section (adjusted for any relaxation
@@ -3849,7 +3905,7 @@ fn apply_debug_relocation<'data, A: Arch<Platform = Elf>, R: Relocation>(
             RelocationKind::Relative if rel_info.size == RelocationSize::ByteSize(0) => 0,
             kind => bail!("Unsupported debug relocation kind {kind:?}"),
         }
-    } else if let Some(section_index) = section_index {
+    } else if let Some(section_index) = target_section_index {
         match object_layout.sections[section_index.0] {
             SectionSlot::MergeStrings(..) => get_merged_string_output_address::<Elf>(
                 symbol_index,
@@ -3872,6 +3928,45 @@ fn apply_debug_relocation<'data, A: Arch<Platform = Elf>, R: Relocation>(
         // tests for this, but building chromium does trigger this branch.
         section_tombstone_value
     };
+
+    // Merged-string and tombstoned debug targets have no ordinary resolution, but their written
+    // fields still need records so changed-input copies preserve linked output bytes.
+    if let Some(incremental) = incremental
+        && incremental.records_relocations()
+        && let Some(section_output_offset) = section_output_offset
+    {
+        let target_symbol = layout.symbol_db.definition(local_symbol_id);
+        let target_symbol_id = u32::try_from(target_symbol.as_usize())
+            .context("Incremental debug relocation target symbol ID overflow")?;
+        if let Some(record) = crate::incremental::PreparedState::deferred_relocation_record(
+            object_layout.input,
+            source_section_index,
+            target_symbol_id,
+            rel.offset(),
+            section_output_offset + offset_in_section,
+            relocation_record_size(&rel_info) as u64,
+            r_type,
+            addend,
+            value,
+            resolution.map_or(value, |resolution| resolution.raw_value),
+            || {
+                if resolution.is_some() {
+                    Ok((
+                        layout
+                            .symbol_db
+                            .symbol_name(target_symbol)
+                            .ok()
+                            .and_then(|name| (!name.bytes().is_empty()).then(|| name.bytes())),
+                        relocation_target_owner(layout, target_symbol)?,
+                    ))
+                } else {
+                    Ok((None, None))
+                }
+            },
+        )? {
+            incremental_relocations.push(record);
+        }
+    }
 
     rel_info.write_to_buffer(value, &mut out[offset_in_section as usize..])?;
 

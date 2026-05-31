@@ -2166,6 +2166,14 @@ impl platform::Args for ElfArgs {
         matches!(self.build_id, BuildIdOption::Fast)
     }
 
+    fn should_retain_output_snapshot(&self) -> bool {
+        true
+    }
+
+    fn should_validate_x86_64_elf_got_relaxation_contexts(&self) -> bool {
+        true
+    }
+
     fn relocation_model(&self) -> crate::args::RelocationModel {
         self.relocation_model
     }
@@ -2483,6 +2491,16 @@ mod tests {
             first.incremental_link_options(),
             changed_option.incremental_link_options()
         );
+    }
+
+    #[test]
+    fn elf_incremental_state_may_publish_after_output_is_available() {
+        let args = ElfArgs::new().expect("ELF arguments should initialize");
+
+        assert!(args.should_publish_incremental_state_in_background());
+        assert!(args.should_retain_output_snapshot());
+        assert!(!args.should_snapshot_changed_inputs_while_finalizing_direct_patches());
+        assert!(args.should_validate_x86_64_elf_got_relaxation_contexts());
     }
 
     #[test]

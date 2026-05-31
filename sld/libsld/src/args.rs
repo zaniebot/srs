@@ -43,11 +43,13 @@ use std::sync::atomic::AtomicI64;
 
 pub(crate) const FILES_PER_GROUP_ENV: &str = "SLD_FILES_PER_GROUP";
 pub const INCREMENTAL_ENV: &str = "SLD_INCREMENTAL";
+pub const INCREMENTAL_PADDING_PERCENT_ENV: &str = "SLD_INCREMENTAL_PADDING_PERCENT";
 pub const REFERENCE_LINKER_ENV: &str = "SLD_REFERENCE_LINKER";
 pub const VALIDATE_ENV: &str = "SLD_VALIDATE_OUTPUT";
 pub const SLD_UNSUPPORTED_ENV: &str = "SLD_UNSUPPORTED";
 pub const WRITE_LAYOUT_ENV: &str = "SLD_WRITE_LAYOUT";
 pub const WRITE_TRACE_ENV: &str = "SLD_WRITE_TRACE";
+pub const TIME_PHASES_ENV: &str = "SLD_TIME";
 
 /// Set this environment variable if you get a failure during writing due to too much or too little
 /// space being allocated to some section. When set, each time we allocate during layout, we'll
@@ -61,10 +63,12 @@ pub struct CommonArgs {
     pub(crate) unrecognized_options: Vec<String>,
 
     /// The number of actually available threads (considering jobserver)
+    #[debug(skip)]
     pub(crate) available_threads: NonZeroUsize,
     pub num_threads: Option<NonZeroUsize>,
     pub(crate) files_per_group: Option<u32>,
 
+    #[debug(skip)]
     jobserver_client: Option<Client>,
     pub(crate) inputs: Vec<Input>,
     pub(crate) file_write_mode: Option<FileWriteMode>,
@@ -285,7 +289,10 @@ impl Default for CommonArgs {
             save_dir: SaveDir::default(),
             mmap_output_file: true,
             incremental: std::env::var(INCREMENTAL_ENV).is_ok_and(|v| v == "1"),
-            incremental_padding_percent: 0,
+            incremental_padding_percent: std::env::var(INCREMENTAL_PADDING_PERCENT_ENV)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0),
             prepopulate_maps: false,
             debug_fuel: None,
             should_fork: true,
@@ -302,7 +309,9 @@ impl Default for CommonArgs {
                 .map(FileId::from_encoded),
             numeric_experiments: Vec::new(),
             sym_info: None,
-            time_phase_options: None,
+            time_phase_options: std::env::var(TIME_PHASES_ENV)
+                .is_ok_and(|value| value == "1")
+                .then(Vec::new),
             warning_callback: Box::new(default_warning_callback),
             version: std::borrow::Cow::Borrowed("unknown version"),
             has_flavor: false,
@@ -461,10 +470,9 @@ impl fmt::Debug for CommonIncrementalLinkOptions<'_> {
         let args = self.0;
         f.debug_struct("CommonArgs")
             .field("unrecognized_options", &args.unrecognized_options)
-            .field("available_threads", &args.available_threads)
+            // Cargo jobserver availability varies between equivalent linker invocations.
             .field("num_threads", &args.num_threads)
             .field("files_per_group", &args.files_per_group)
-            .field("jobserver_client", &args.jobserver_client)
             .field("file_write_mode", &args.file_write_mode)
             .field("save_dir", &args.save_dir)
             .field("prepopulate_maps", &args.prepopulate_maps)
@@ -488,7 +496,6 @@ impl fmt::Debug for CommonIncrementalLinkOptions<'_> {
             .field("sym_info", &args.sym_info)
             .field("numeric_experiments", &args.numeric_experiments)
             .field("version_mode", &args.version_mode)
-            .field("time_phase_options", &args.time_phase_options)
             .field("version", &args.version)
             .finish()
     }
@@ -1357,12 +1364,74 @@ mod tests {
     }
 
     #[test]
+    fn incremental_padding_env_sets_padding_percent() {
+        with_env_var(INCREMENTAL_PADDING_PERCENT_ENV, Some("25"), || {
+            let args = Args::new(|| ["sld", "-flavor", "gnu"].into_iter()).unwrap();
+
+            assert_eq!(args.common().incremental_padding_percent, 25);
+        });
+    }
+
+    #[test]
+    fn timing_env_enables_default_phase_timing() {
+        with_env_var(TIME_PHASES_ENV, Some("1"), || {
+            let args = Args::new(|| ["sld", "-flavor", "gnu"].into_iter()).unwrap();
+
+            assert!(
+                args.common()
+                    .time_phase_options
+                    .as_ref()
+                    .is_some_and(|options| options.is_empty())
+            );
+        });
+    }
+
+    #[test]
     fn parses_incremental_padding_percent() {
         let mut args = Args::new(|| ["sld", "-flavor", "gnu"].into_iter()).unwrap();
         args.parse(|| ["sld", "-flavor", "gnu", "--incremental-padding-percent=25"].into_iter())
             .unwrap();
 
         assert_eq!(args.common().incremental_padding_percent, 25);
+    }
+
+    #[test]
+    fn incremental_link_options_ignore_jobserver_availability() {
+        with_env_var(INCREMENTAL_ENV, None, || {
+            let mut first = CommonArgs::default();
+            first.jobserver_client = Some(Client::new(1).unwrap());
+            let mut second = CommonArgs::default();
+            second.jobserver_client = Some(Client::new(1).unwrap());
+            second.available_threads = NonZeroUsize::new(2).unwrap();
+
+            assert_eq!(
+                format!("{:?}", first.incremental_link_options()),
+                format!("{:?}", second.incremental_link_options())
+            );
+            assert_eq!(format!("{first:?}"), format!("{second:?}"));
+
+            second.num_threads = NonZeroUsize::new(2);
+            assert_ne!(
+                format!("{:?}", first.incremental_link_options()),
+                format!("{:?}", second.incremental_link_options())
+            );
+            assert_ne!(format!("{first:?}"), format!("{second:?}"));
+        });
+    }
+
+    #[test]
+    fn incremental_link_options_ignore_phase_timing() {
+        with_env_var(TIME_PHASES_ENV, None, || {
+            let first = CommonArgs::default();
+            let mut second = CommonArgs::default();
+            second.time_phase_options = Some(Vec::new());
+
+            assert_eq!(
+                format!("{:?}", first.incremental_link_options()),
+                format!("{:?}", second.incremental_link_options())
+            );
+            assert_ne!(format!("{first:?}"), format!("{second:?}"));
+        });
     }
 
     fn with_env_var(key: &str, value: Option<&str>, f: impl FnOnce()) {

@@ -55,6 +55,9 @@ pub(crate) enum Mutation {
         #[serde(default)]
         grow: u64,
     },
+    FirstIncrementalPatchSection {
+        incremental_patch: String,
+    },
 }
 
 impl Config {
@@ -186,6 +189,29 @@ mutate_files = [{ section = ".data", grow = 1 }]
             [super::Mutation::FirstElfSection {
                 section: ".data".to_owned(),
                 grow: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_incremental_recorded_patch_section_mutation() {
+        let config: Config = toml::from_str(
+            r#"
+name = "test"
+
+[bench.changed-incremental]
+save = "large"
+sld_extra_flags = ["--incremental"]
+mutate_files = [{ incremental_patch = "__const" }]
+"#,
+        )
+        .unwrap();
+
+        let bench = config.benches.get("changed-incremental").unwrap();
+        assert_eq!(
+            bench.mutate_files,
+            [super::Mutation::FirstIncrementalPatchSection {
+                incremental_patch: "__const".to_owned(),
             }]
         );
     }

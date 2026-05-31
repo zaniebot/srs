@@ -2,6 +2,7 @@ use crate::OutputKind;
 use crate::Result;
 use crate::alignment::Alignment;
 use crate::args::DefsymValue;
+use crate::args::FileWriteMode;
 use crate::bail;
 use crate::error::Warning;
 use crate::grouping::Group;
@@ -266,7 +267,7 @@ pub(crate) trait Platform:
     fn write_output_file<'data, A: Arch<Platform = Self>>(
         output: &crate::file_writer::Output,
         layout: &Layout<'data, Self>,
-        incremental: &crate::incremental::PreparedState,
+        incremental: &crate::incremental::PreparedState<'data>,
     ) -> Result;
 
     fn maybe_compress_debug_sections<'data, A: Arch<Platform = Self>>(
@@ -1263,6 +1264,10 @@ pub(crate) trait Args: std::fmt::Debug + Send + Sync + 'static {
 
     fn common_mut(&mut self) -> &mut crate::args::CommonArgs;
 
+    fn should_mmap_output_file(&self, _file_write_mode: FileWriteMode) -> bool {
+        self.common().mmap_output_file
+    }
+
     fn incremental_link_options(&self) -> String {
         format!("{self:?}")
     }
@@ -1368,6 +1373,62 @@ pub(crate) trait Args: std::fmt::Debug + Send + Sync + 'static {
 
     fn has_incremental_fast_build_id(&self) -> bool {
         false
+    }
+
+    fn should_patch_changed_inputs_before_loading(&self) -> bool {
+        true
+    }
+
+    /// Finalize platform-specific data derived from bytes modified by a direct incremental patch.
+    fn finalize_directly_patched_output(
+        &self,
+        _output: &mut [u8],
+        _flush_ranges: &mut Vec<std::ops::Range<usize>>,
+    ) -> Result {
+        Ok(())
+    }
+
+    /// Whether changed-input snapshots should be taken while finalizing direct output patches.
+    fn should_snapshot_changed_inputs_while_finalizing_direct_patches(&self) -> bool {
+        false
+    }
+
+    /// Whether direct incremental output patches must remain reusable after output identity
+    /// changes by validating the complete output content.
+    fn should_hash_directly_patched_output(&self) -> bool {
+        false
+    }
+
+    /// Whether an owned persistent output can be reused when only its metadata-change timestamp
+    /// settles after the link, while its data-bearing identity remains unchanged.
+    fn should_trust_persistent_output_data_identity(&self) -> bool {
+        false
+    }
+
+    /// Whether to retain a private output snapshot for restoring a missing incremental output.
+    fn should_retain_output_snapshot(&self) -> bool {
+        false
+    }
+
+    /// Whether changed-input patching needs to validate Mach-O cstring literal boundaries.
+    fn should_validate_macho_cstring_patches(&self) -> bool {
+        false
+    }
+
+    /// Whether changed-input patching needs to validate x86-64 ELF GOT relaxation contexts.
+    fn should_validate_x86_64_elf_got_relaxation_contexts(&self) -> bool {
+        false
+    }
+
+    /// Whether incremental patches should normalize transient Rust archive members.
+    fn should_normalize_rust_archive_patch_inputs(&self) -> bool {
+        false
+    }
+
+    /// Returns whether an output may be reported complete before its incremental state is
+    /// published for reuse by the next link.
+    fn should_publish_incremental_state_in_background(&self) -> bool {
+        true
     }
 
     fn relocation_model(&self) -> crate::args::RelocationModel;

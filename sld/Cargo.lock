@@ -180,7 +180,9 @@ name = "benchmark-runner"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "clap",
+ "hex",
  "indicatif",
  "object 0.39.1",
  "postcard",
@@ -188,6 +190,7 @@ dependencies = [
  "tempfile",
  "toml",
  "wait4",
+ "zstd",
 ]
 
 [[package]]
@@ -912,6 +915,8 @@ dependencies = [
  "perf-event",
  "perfetto-recorder",
  "rayon",
+ "serde",
+ "serde_json",
  "sha2",
  "sharded-offset-map",
  "sharded-vec-writer 0.4.0",
@@ -1803,6 +1808,7 @@ dependencies = [
  "toml",
  "wait-timeout",
  "which",
+ "zstd",
 ]
 
 [[package]]
