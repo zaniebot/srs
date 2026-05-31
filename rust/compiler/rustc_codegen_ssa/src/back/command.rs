@@ -11,9 +11,7 @@ use rustc_target::spec::LldFlavor;
 pub(crate) struct Command {
     program: Program,
     args: Vec<OsString>,
-    env: Vec<(OsString, OsString)>,
-    env_remove: Vec<OsString>,
-    env_clear: bool,
+    env: Vec<EnvironmentOperation>,
 }
 
 #[derive(Clone)]
@@ -21,6 +19,13 @@ enum Program {
     Normal(OsString),
     CmdBatScript(OsString),
     Lld(OsString, LldFlavor),
+}
+
+#[derive(Clone)]
+enum EnvironmentOperation {
+    Set(OsString, OsString),
+    Remove(OsString),
+    Clear,
 }
 
 impl Command {
@@ -37,13 +42,7 @@ impl Command {
     }
 
     fn _new(program: Program) -> Command {
-        Command {
-            program,
-            args: Vec::new(),
-            env: Vec::new(),
-            env_remove: Vec::new(),
-            env_clear: false,
-        }
+        Command { program, args: Vec::new(), env: Vec::new() }
     }
 
     pub(crate) fn arg<P: AsRef<OsStr>>(&mut self, arg: P) -> &mut Command {
@@ -75,8 +74,7 @@ impl Command {
     }
 
     fn _env(&mut self, key: &OsStr, value: &OsStr) {
-        self.env_remove.retain(|removed| removed != key);
-        self.env.push((key.to_owned(), value.to_owned()));
+        self.env.push(EnvironmentOperation::Set(key.to_owned(), value.to_owned()));
     }
 
     pub(crate) fn env_remove<K>(&mut self, key: K) -> &mut Command
@@ -88,13 +86,12 @@ impl Command {
     }
 
     pub(crate) fn env_clear(&mut self) -> &mut Command {
-        self.env_clear = true;
+        self.env.push(EnvironmentOperation::Clear);
         self
     }
 
     fn _env_remove(&mut self, key: &OsStr) {
-        self.env.retain(|(existing, _)| existing != key);
-        self.env_remove.push(key.to_owned());
+        self.env.push(EnvironmentOperation::Remove(key.to_owned()));
     }
 
     pub(crate) fn output(&mut self) -> io::Result<Output> {
@@ -116,12 +113,18 @@ impl Command {
             }
         };
         ret.args(&self.args);
-        ret.envs(self.env.clone());
-        for k in &self.env_remove {
-            ret.env_remove(k);
-        }
-        if self.env_clear {
-            ret.env_clear();
+        for operation in &self.env {
+            match operation {
+                EnvironmentOperation::Set(key, value) => {
+                    ret.env(key, value);
+                }
+                EnvironmentOperation::Remove(key) => {
+                    ret.env_remove(key);
+                }
+                EnvironmentOperation::Clear => {
+                    ret.env_clear();
+                }
+            }
         }
         ret
     }
@@ -157,16 +160,19 @@ impl Command {
                 acc.saturating_add(arg).saturating_add(nul).saturating_add(ptr_size)
             });
             // key + `=` + value + \0 + pointer
-            let envs_size = self.env.iter().fold(0usize, |acc, (k, v)| {
-                let k = k.as_encoded_bytes().len();
-                let eq = 1;
-                let v = v.as_encoded_bytes().len();
-                let nul = 1;
-                acc.saturating_add(k)
-                    .saturating_add(eq)
-                    .saturating_add(v)
-                    .saturating_add(nul)
-                    .saturating_add(ptr_size)
+            let envs_size = self.env.iter().fold(0usize, |acc, operation| match operation {
+                EnvironmentOperation::Set(key, value) => {
+                    let key = key.as_encoded_bytes().len();
+                    let eq = 1;
+                    let value = value.as_encoded_bytes().len();
+                    let nul = 1;
+                    acc.saturating_add(key)
+                        .saturating_add(eq)
+                        .saturating_add(value)
+                        .saturating_add(nul)
+                        .saturating_add(ptr_size)
+                }
+                EnvironmentOperation::Remove(_) | EnvironmentOperation::Clear => acc,
             });
             let arg_max = match unsafe { libc::sysconf(libc::_SC_ARG_MAX) } {
                 -1 => return false, // Go to OS anyway.
@@ -234,6 +240,21 @@ mod tests {
         assert_eq!(
             command.get_envs().find(|(key, _)| *key == "SET_THEN_REMOVED"),
             Some(("SET_THEN_REMOVED".as_ref(), None))
+        );
+    }
+
+    #[test]
+    fn environment_clear_uses_operation_order() {
+        let mut command = Command::new("echo");
+        command.env("SET_THEN_CLEARED", "absent");
+        command.env_clear();
+        command.env("CLEARED_THEN_SET", "present");
+
+        let command = command.command();
+        assert_eq!(command.get_envs().find(|(key, _)| *key == "SET_THEN_CLEARED"), None);
+        assert_eq!(
+            command.get_envs().find(|(key, _)| *key == "CLEARED_THEN_SET"),
+            Some(("CLEARED_THEN_SET".as_ref(), Some("present".as_ref())))
         );
     }
 }
