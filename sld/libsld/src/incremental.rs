@@ -1127,7 +1127,7 @@ pub(crate) fn stabilize_rustc_transient_inputs(args: &mut crate::args::Args) -> 
     let state_dir = state_dir_for_output(&output);
     timing_phase!("Stabilize rustc transient inputs");
     let stable_dir = state_dir.join(STABLE_RUSTC_INPUT_DIR);
-    let provenance = rustc_work_product_provenance_from_env();
+    let (provenance, provenance_file) = rustc_work_product_provenance_from_env();
     let previous = provenance
         .as_ref()
         .and_then(|_| PersistedState::read_metadata(&state_dir).unwrap_or_default());
@@ -1218,7 +1218,7 @@ pub(crate) fn stabilize_rustc_transient_inputs(args: &mut crate::args::Args) -> 
             &format!(
                 "loaded {} rustc work-product producer digest record{}; matched \
                  {matched_producer_digests} stabilized input{}; reused {reused_isolated} isolated \
-                 input{}",
+                 input{}; manifest path present: {}; readable: {}; parsed: {}",
                 provenance.len(),
                 if provenance.len() == 1 { "" } else { "s" },
                 if matched_producer_digests == 1 {
@@ -1227,20 +1227,42 @@ pub(crate) fn stabilize_rustc_transient_inputs(args: &mut crate::args::Args) -> 
                     "s"
                 },
                 if reused_isolated == 1 { "" } else { "s" },
+                provenance_file.path_present,
+                provenance_file.readable,
+                provenance_file.parsed,
             ),
         )?;
     }
     Ok(())
 }
 
-fn rustc_work_product_provenance_from_env() -> Option<HashMap<PathBuf, String>> {
+struct RustcWorkProductProvenanceFile {
+    path_present: bool,
+    readable: bool,
+    parsed: bool,
+}
+
+fn rustc_work_product_provenance_from_env() -> (
+    Option<HashMap<PathBuf, String>>,
+    RustcWorkProductProvenanceFile,
+) {
     let requested =
         std::env::var_os(RUSTC_WORK_PRODUCT_PROVENANCE_ENV).as_deref() == Some("1".as_ref());
     let path = std::env::var_os(RUSTC_WORK_PRODUCT_PROVENANCE_FILE_ENV);
     let contents = path
         .as_ref()
         .and_then(|path| std::fs::read_to_string(path).ok());
-    rustc_work_product_provenance(contents.as_deref(), requested || path.is_some())
+    let parsed = contents
+        .as_deref()
+        .and_then(parse_rustc_work_product_provenance);
+    (
+        rustc_work_product_provenance(contents.as_deref(), requested || path.is_some()),
+        RustcWorkProductProvenanceFile {
+            path_present: path.is_some(),
+            readable: contents.is_some(),
+            parsed: parsed.is_some(),
+        },
+    )
 }
 
 fn rustc_work_product_provenance(
