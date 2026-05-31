@@ -3439,6 +3439,7 @@ fn materialize_deferred_relocation_patch(
 struct DirectlyPatchedOutput {
     path: PathBuf,
     published_path: Option<PathBuf>,
+    published_identity: Option<FileIdentity>,
     standby_state_path: Option<PathBuf>,
 }
 
@@ -3448,10 +3449,12 @@ impl DirectlyPatchedOutput {
             return Some(Self {
                 path: output.to_path_buf(),
                 published_path: None,
+                published_identity: None,
                 standby_state_path: None,
             });
         }
 
+        let published_identity = FileIdentity::from_path(output).ok().flatten()?;
         let generation = directly_patched_output_standby_path(state_dir);
         let standby_state_path = directly_patched_output_standby_state_path(state_dir);
         let reused_standby =
@@ -3471,9 +3474,21 @@ impl DirectlyPatchedOutput {
                 return None;
             }
         }
+        if !FileIdentity::from_path(output)
+            .ok()
+            .flatten()
+            .as_ref()
+            .is_some_and(|identity| {
+                identity.matches_same_data_ignoring_change_time(&published_identity)
+            })
+        {
+            let _ = std::fs::remove_file(&generation);
+            return None;
+        }
         Some(Self {
             path: generation,
             published_path: Some(output.to_path_buf()),
+            published_identity: Some(published_identity),
             standby_state_path: Some(standby_state_path),
         })
     }
@@ -3496,14 +3511,31 @@ impl DirectlyPatchedOutput {
         };
         verbose_timing_phase!("Install directly patched output generation");
         install_directly_patched_output_generation(&self.path, published_path)?;
-        if let Some(standby_state_path) = self.standby_state_path.as_ref()
-            && write_directly_patched_output_standby_state(
-                standby_state_path,
-                published_path,
-                &self.path,
-                ranges,
-            )
-            .is_err()
+        let standby_is_predecessor = self
+            .published_identity
+            .as_ref()
+            .zip(FileIdentity::from_path(&self.path).ok().flatten().as_ref())
+            .is_some_and(|(expected, actual)| {
+                expected.matches_same_data_ignoring_change_time(actual)
+            });
+        let standby_state_installed = standby_is_predecessor
+            && self
+                .standby_state_path
+                .as_ref()
+                .is_some_and(|standby_state_path| {
+                    write_directly_patched_output_standby_state(
+                        standby_state_path,
+                        published_path,
+                        &self.path,
+                        ranges,
+                    )
+                    .is_ok()
+                });
+        if !standby_state_installed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+        if !standby_state_installed
+            && let Some(standby_state_path) = self.standby_state_path.as_ref()
         {
             let _ = std::fs::remove_file(standby_state_path);
         }
@@ -13628,7 +13660,7 @@ fn snapshot_identity_matches_previous_atomic_replacement_input(
     snapshot: &Path,
     trust_rustc_work_product_provenance: bool,
 ) -> bool {
-    if !trust_rustc_work_product_provenance {
+    if !trust_rustc_work_product_provenance || !previous_input.content.hash.is_empty() {
         return false;
     }
     let Ok(path) = decode_path(&previous_input.path) else {
@@ -15718,6 +15750,35 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn directly_patched_output_generation_discards_replaced_predecessor() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("app");
+        let state_dir = dir.path().join("app.incr");
+        std::fs::create_dir(&state_dir).unwrap();
+        std::fs::write(&output, b"abcdefgh").unwrap();
+
+        let mut first = DirectlyPatchedOutput::new(&output, &state_dir, true).unwrap();
+        std::fs::write(first.path(), b"Abcdefgh").unwrap();
+        first.install(&[0..1]).unwrap();
+        drop(first);
+
+        let mut raced = DirectlyPatchedOutput::new(&output, &state_dir, true).unwrap();
+        assert_eq!(std::fs::read(raced.path()).unwrap(), b"Abcdefgh");
+        std::fs::write(raced.path(), b"ABcdefgh").unwrap();
+        let replacement = dir.path().join("replacement");
+        std::fs::write(&replacement, b"XXXXXXXX").unwrap();
+        std::fs::rename(&replacement, &output).unwrap();
+        raced.install(&[1..2]).unwrap();
+        drop(raced);
+
+        assert_eq!(std::fs::read(&output).unwrap(), b"ABcdefgh");
+        assert!(!directly_patched_output_standby_state_path(&state_dir).exists());
+        let recloned = DirectlyPatchedOutput::new(&output, &state_dir, true).unwrap();
+        assert_eq!(std::fs::read(recloned.path()).unwrap(), b"ABcdefgh");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn directly_patched_output_generation_rejects_truncated_standby_state() {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("app");
@@ -16282,7 +16343,7 @@ mod tests {
     fn content_hash_verifies_snapshot_until_snapshot_changes() {
         let dir = tempfile::tempdir().unwrap();
         let state_dir = dir.path().join("app.incr");
-        let input = dir.path().join("input.o");
+        let input = dir.path().join("libcrate.rlib");
         std::fs::write(&input, b"object").unwrap();
         snapshot_input_paths(&state_dir, [input.as_path()]).unwrap();
         let snapshot = input_snapshot_path(&state_dir, &input);
@@ -16298,6 +16359,11 @@ mod tests {
                 .unwrap()
                 .unwrap(),
             b"object"
+        );
+        assert!(
+            !snapshot_identity_matches_previous_atomic_replacement_input(
+                &previous, &snapshot, true,
+            )
         );
         std::fs::write(&snapshot, b"damage").unwrap();
         assert!(
