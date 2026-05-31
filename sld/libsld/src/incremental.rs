@@ -53,7 +53,8 @@ use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-const STATE_VERSION: &str = "sld-incremental-state-v33";
+const STATE_VERSION: &str = "sld-incremental-state-v34";
+const STATE_VERSION_V33: &str = "sld-incremental-state-v33";
 const STATE_VERSION_V32: &str = "sld-incremental-state-v32";
 const STATE_VERSION_V31: &str = "sld-incremental-state-v31";
 const STATE_VERSION_V30: &str = "sld-incremental-state-v30";
@@ -103,6 +104,10 @@ const STABILIZE_RUSTC_TRANSIENT_INPUTS_ENV: &str = "SLD_STABILIZE_RUSTC_TRANSIEN
 const RUSTC_WORK_PRODUCT_PROVENANCE_ENV: &str = "SLD_RUSTC_WORK_PRODUCT_PROVENANCE";
 const RUSTC_WORK_PRODUCT_PROVENANCE_FILE_ENV: &str = "SLD_RUSTC_WORK_PRODUCT_PROVENANCE_FILE";
 const RUSTC_WORK_PRODUCT_PROVENANCE_VERSION: &str = "sld-rustc-work-product-provenance-v1";
+const RUSTC_RLIB_LINK_CONTENT_DIGEST_PREFIX: &[u8] = b"rustc-rlib-link-content-v1:";
+const RUSTC_RLIB_LINK_METADATA_MEMBER: &[u8] = b"lib.rmeta-link";
+const RUSTC_RLIB_LINK_METADATA_SECTION: &str = ".rmeta-link";
+const RUSTC_SERIALIZED_METADATA_END: &[u8] = b"rust-end-file";
 const BUILD_ID_HASH_FILE: &str = "build-id-hash";
 const UPDATE_MARKER_FILE: &str = "update-in-progress";
 const STATE_LOCK_FILE: &str = "state.lock";
@@ -431,6 +436,7 @@ struct ArchiveMemberSetProof {
     raw_ordered_hash: String,
     normalized_multiset_hash: String,
     member_count: usize,
+    rustc_link_content_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1747,9 +1753,14 @@ fn patch_changed_inputs(
     let mut expected_changed_inputs = Vec::new();
     let mut rewritten_input_count = 0;
     let mut normalized_unchanged_input_count = 0;
+    let mut rustc_link_content_digest_unchanged_input_count = 0;
     let mut patched_input_count = 0;
     let mut patched_section_count = 0;
     let mut previous_output = LazyOutputBytes::new(|| read_output_bytes(args.output()));
+    // The embedded digest is a rustc producer assertion. Trust it only inside the
+    // Cargo-managed provenance lane; all other callers keep the byte classifier fallback.
+    let trust_rustc_link_content_digests =
+        std::env::var_os(RUSTC_WORK_PRODUCT_PROVENANCE_ENV).as_deref() == Some("1".as_ref());
     for (input_index, path) in changed_inputs {
         let mut loaded_input = None;
         let can_normalize_rust_archive_patch =
@@ -1828,6 +1839,17 @@ fn patch_changed_inputs(
             loaded_input
         };
         let input = &previous.input_files[*input_index];
+        if can_normalize_rust_archive_patch
+            && trust_rustc_link_content_digests
+            && rustc_rlib_link_content_digest_matches_previous(input, &bytes)
+        {
+            expected_changed_inputs.push(ExpectedInputContent::from_content(path, &input_content));
+            previous.input_files[*input_index].content = input_content;
+            previous.input_files[*input_index].snapshot_identity = None;
+            normalized_unchanged_input_count += 1;
+            rustc_link_content_digest_unchanged_input_count += 1;
+            continue;
+        }
         let normalized_rust_archive_patch_state = if can_normalize_rust_archive_patch {
             classify_normalized_rust_archive_patch_state(input, &bytes, &previous_patch)?
         } else {
@@ -2528,6 +2550,19 @@ fn patch_changed_inputs(
                 ),
             )?;
         }
+        if rustc_link_content_digest_unchanged_input_count > 0 {
+            append_log(
+                state_dir,
+                &format!(
+                    "reused {rustc_link_content_digest_unchanged_input_count} unchanged Rust archive input file{} by rustc link-content digest before loading inputs",
+                    if rustc_link_content_digest_unchanged_input_count == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                ),
+            )?;
+        }
         append_log(state_dir, "reused existing output before loading inputs")?;
         return Ok(ChangedInputPatchResult::Patched);
     }
@@ -2797,6 +2832,19 @@ fn patch_changed_inputs(
             &format!(
                 "updated {normalized_unchanged_input_count} unchanged normalized Rust archive input file{} before loading inputs",
                 if normalized_unchanged_input_count == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ),
+        )?;
+    }
+    if rustc_link_content_digest_unchanged_input_count > 0 {
+        append_log(
+            state_dir,
+            &format!(
+                "reused {rustc_link_content_digest_unchanged_input_count} unchanged Rust archive input file{} by rustc link-content digest before loading inputs",
+                if rustc_link_content_digest_unchanged_input_count == 1 {
                     ""
                 } else {
                     "s"
@@ -4490,6 +4538,7 @@ impl PersistedState {
         let mut lines = contents.lines().peekable();
         let version = lines.next().context("Missing incremental state header")?;
         if version != STATE_VERSION
+            && version != STATE_VERSION_V33
             && version != STATE_VERSION_V32
             && version != STATE_VERSION_V31
             && version != STATE_VERSION_V30
@@ -4602,6 +4651,7 @@ impl PersistedState {
         let mut fdes = Vec::new();
         let mut dynamic_relocations = Vec::new();
         let sections = if version == STATE_VERSION
+            || version == STATE_VERSION_V33
             || version == STATE_VERSION_V32
             || version == STATE_VERSION_V31
             || version == STATE_VERSION_V30
@@ -4636,12 +4686,13 @@ impl PersistedState {
                 .context("Missing incremental section input count")?;
             if first_line.starts_with("indexed-sections-file\t") {
                 if version != STATE_VERSION
+                    && version != STATE_VERSION_V33
                     && version != STATE_VERSION_V32
                     && version != STATE_VERSION_V31
                     && version != STATE_VERSION_V30
                 {
                     return Err(crate::error!(
-                        "Indexed incremental sections require incremental state version `{STATE_VERSION}`, `{STATE_VERSION_V32}`, `{STATE_VERSION_V31}`, or `{STATE_VERSION_V30}`"
+                        "Indexed incremental sections require incremental state version `{STATE_VERSION}`, `{STATE_VERSION_V33}`, `{STATE_VERSION_V32}`, `{STATE_VERSION_V31}`, or `{STATE_VERSION_V30}`"
                     ));
                 }
                 let file =
@@ -6954,7 +7005,45 @@ fn archive_member_set_proof(bytes: &[u8]) -> Result<Option<ArchiveMemberSetProof
             &normalized_members,
         ),
         member_count: raw_members.len(),
+        rustc_link_content_digest: rustc_rlib_link_content_digest(bytes),
     }))
+}
+
+fn rustc_rlib_link_content_digest_matches_previous(input: &FileState, bytes: &[u8]) -> bool {
+    let Some(current_digest) = rustc_rlib_link_content_digest(bytes) else {
+        return false;
+    };
+    input
+        .patch
+        .as_ref()
+        .and_then(|patch| patch.archive_member_set_proof.as_ref())
+        .and_then(|proof| proof.rustc_link_content_digest.as_deref())
+        == Some(current_digest.as_str())
+}
+
+fn rustc_rlib_link_content_digest(bytes: &[u8]) -> Option<String> {
+    let archive = ArchiveIterator::from_archive_bytes(bytes).ok()?;
+    for entry in archive {
+        let ArchiveEntry::Regular(content) = entry.ok()? else {
+            return None;
+        };
+        if content.ident.as_slice() != RUSTC_RLIB_LINK_METADATA_MEMBER {
+            continue;
+        }
+        let file = object::File::parse(content.entry_data).ok()?;
+        let section = file.section_by_name(RUSTC_RLIB_LINK_METADATA_SECTION)?;
+        return decode_rustc_rlib_link_content_digest(section.data().ok()?);
+    }
+    None
+}
+
+fn decode_rustc_rlib_link_content_digest(metadata: &[u8]) -> Option<String> {
+    let metadata = metadata.strip_suffix(RUSTC_SERIALIZED_METADATA_END)?;
+    let suffix_len = RUSTC_RLIB_LINK_CONTENT_DIGEST_PREFIX.len() + blake3::OUT_LEN * 2;
+    let suffix = metadata.get(metadata.len().checked_sub(suffix_len)?..)?;
+    let digest = suffix.strip_prefix(RUSTC_RLIB_LINK_CONTENT_DIGEST_PREFIX)?;
+    let digest = std::str::from_utf8(digest).ok()?;
+    is_blake3_hex_digest(digest).then(|| digest.to_owned())
 }
 
 fn archive_member_identifier_list_hash(domain: &[u8], members: &[Vec<u8>]) -> String {
@@ -11902,8 +11991,14 @@ fn render_input_line_rest(input: &FileState) -> String {
 
 fn render_archive_member_set_proof(proof: &ArchiveMemberSetProof) -> String {
     format!(
-        "{}:{}:{}",
-        proof.raw_ordered_hash, proof.normalized_multiset_hash, proof.member_count
+        "{}:{}:{}:{}",
+        proof.raw_ordered_hash,
+        proof.normalized_multiset_hash,
+        proof.member_count,
+        proof
+            .rustc_link_content_digest
+            .as_deref()
+            .unwrap_or(ABSENT_FIELD)
     )
 }
 
@@ -11922,6 +12017,18 @@ fn parse_archive_member_set_proof(proof: &str) -> Result<ArchiveMemberSetProof> 
         .context("Malformed incremental archive member-set proof")?
         .parse()
         .context("Invalid incremental archive member-set count")?;
+    let rustc_link_content_digest = parts
+        .next()
+        .filter(|digest| *digest != ABSENT_FIELD)
+        .map(|digest| {
+            if !is_blake3_hex_digest(digest) {
+                return Err(crate::error!(
+                    "Invalid incremental rustc rlib link-content digest"
+                ));
+            }
+            Ok(digest.to_owned())
+        })
+        .transpose()?;
     if parts.next().is_some() {
         return Err(crate::error!(
             "Malformed incremental archive member-set proof"
@@ -11931,6 +12038,7 @@ fn parse_archive_member_set_proof(proof: &str) -> Result<ArchiveMemberSetProof> 
         raw_ordered_hash,
         normalized_multiset_hash,
         member_count,
+        rustc_link_content_digest,
     })
 }
 
@@ -17819,6 +17927,76 @@ mod tests {
     }
 
     #[test]
+    fn rustc_rlib_link_content_digest_decoder_requires_versioned_blake3_trailer() {
+        let digest = "a".repeat(blake3::OUT_LEN * 2);
+        let mut metadata = b"encoded metadata".to_vec();
+        metadata.extend_from_slice(RUSTC_RLIB_LINK_CONTENT_DIGEST_PREFIX);
+        metadata.extend_from_slice(digest.as_bytes());
+        metadata.extend_from_slice(RUSTC_SERIALIZED_METADATA_END);
+
+        assert_eq!(
+            decode_rustc_rlib_link_content_digest(&metadata),
+            Some(digest)
+        );
+        assert_eq!(
+            decode_rustc_rlib_link_content_digest(b"encoded metadatarust-end-file"),
+            None
+        );
+
+        let last = metadata.len() - RUSTC_SERIALIZED_METADATA_END.len() - 1;
+        metadata[last] = b'g';
+        assert_eq!(decode_rustc_rlib_link_content_digest(&metadata), None);
+    }
+
+    #[test]
+    fn rustc_rlib_link_content_digest_reads_metadata_archive_member() {
+        let archive = |digest: &str| {
+            let mut metadata = b"encoded metadata".to_vec();
+            metadata.extend_from_slice(RUSTC_RLIB_LINK_CONTENT_DIGEST_PREFIX);
+            metadata.extend_from_slice(digest.as_bytes());
+            metadata.extend_from_slice(RUSTC_SERIALIZED_METADATA_END);
+            let metadata = rmeta_link_wrapper_elf(&metadata);
+            let mut builder = ar::Builder::new(Vec::new());
+            builder
+                .append(
+                    &ar::Header::new(
+                        RUSTC_RLIB_LINK_METADATA_MEMBER.to_vec(),
+                        metadata.len() as u64,
+                    ),
+                    metadata.as_slice(),
+                )
+                .unwrap();
+            builder.into_inner().unwrap()
+        };
+        let previous_digest = "a".repeat(blake3::OUT_LEN * 2);
+        let current_digest = "b".repeat(blake3::OUT_LEN * 2);
+        let previous = archive(&previous_digest);
+        let current = archive(&current_digest);
+        let input = FileState {
+            path: hex::encode("libarchive.rlib"),
+            content: FileContentState::from_bytes(&previous),
+            snapshot_identity: None,
+            patch: Some(FilePatchState {
+                fingerprint: String::new(),
+                archive_member_set_proof: archive_member_set_proof(&previous).unwrap(),
+                sections: Vec::new(),
+                raw_sections: None,
+            }),
+        };
+
+        assert_eq!(
+            rustc_rlib_link_content_digest(&previous),
+            Some(previous_digest)
+        );
+        assert!(rustc_rlib_link_content_digest_matches_previous(
+            &input, &previous
+        ));
+        assert!(!rustc_rlib_link_content_digest_matches_previous(
+            &input, &current
+        ));
+    }
+
+    #[test]
     fn archive_member_set_proofs_distinguish_raw_order_and_normalize_rustc_invocations() {
         let archive = |members: &[&[u8]]| {
             let mut builder = ar::Builder::new(Vec::new());
@@ -18583,6 +18761,7 @@ mod tests {
                 raw_ordered_hash: "raw-hash".to_owned(),
                 normalized_multiset_hash: "normalized-hash".to_owned(),
                 member_count: 3,
+                rustc_link_content_digest: Some("a".repeat(blake3::OUT_LEN * 2)),
             }),
             sections: vec![FilePatchSectionState {
                 input: hex::encode("libarchive.a"),
@@ -18598,6 +18777,34 @@ mod tests {
         });
 
         assert_eq!(PersistedState::parse(&state.render()).unwrap(), state);
+    }
+
+    #[test]
+    fn v33_archive_member_set_proof_without_rustc_link_content_digest_is_accepted() {
+        let mut state = state("args", b"output", &[("libarchive.a", b"archive")]);
+        state.input_files[0].patch = Some(FilePatchState {
+            fingerprint: "patch-hash".to_owned(),
+            archive_member_set_proof: Some(ArchiveMemberSetProof {
+                raw_ordered_hash: "raw-hash".to_owned(),
+                normalized_multiset_hash: "normalized-hash".to_owned(),
+                member_count: 3,
+                rustc_link_content_digest: None,
+            }),
+            sections: Vec::new(),
+            raw_sections: None,
+        });
+        let rendered = state
+            .render()
+            .replacen(STATE_VERSION, STATE_VERSION_V33, 1)
+            .replacen(
+                "raw-hash:normalized-hash:3:-",
+                "raw-hash:normalized-hash:3",
+                1,
+            );
+
+        let parsed = PersistedState::parse(&rendered).unwrap();
+
+        assert_eq!(parsed, state);
     }
 
     #[test]
@@ -19452,6 +19659,7 @@ mod tests {
                 raw_ordered_hash: "raw-hash".to_owned(),
                 normalized_multiset_hash: "normalized-hash".to_owned(),
                 member_count: 2,
+                rustc_link_content_digest: None,
             }),
             sections: vec![FilePatchSectionState {
                 input: hex::encode("a.o"),
