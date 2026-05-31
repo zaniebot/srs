@@ -3527,6 +3527,7 @@ pub(crate) fn refresh_code_signature(
 ) -> Result<Range<usize>> {
     timing_phase!("Refresh Mach-O code signature");
     let code_signature_range = {
+        verbose_timing_phase!("Read Mach-O code signature range");
         let bytes: &[u8] = output;
         let header = macho::MachHeader64::<Endianness>::parse(bytes, 0)?;
         let mut commands = header.load_commands(LE, bytes, 0)?;
@@ -3567,14 +3568,20 @@ pub(crate) fn refresh_code_signature(
     }
     changed_pages.sort_unstable();
     changed_pages.dedup();
-    let calculated_hashes = changed_pages
-        .iter()
-        .map(|page_index| {
-            let start = page_index * CS_BLOCK_SIZE;
-            let end = (start + CS_BLOCK_SIZE).min(code_signature_range.start);
-            (*page_index, Sha256::digest(&output[start..end]))
-        })
-        .collect::<Vec<_>>();
+    let calculated_hashes = {
+        verbose_timing_phase!(
+            "Hash changed Mach-O code signature pages",
+            page_count = changed_pages.len()
+        );
+        changed_pages
+            .iter()
+            .map(|page_index| {
+                let start = page_index * CS_BLOCK_SIZE;
+                let end = (start + CS_BLOCK_SIZE).min(code_signature_range.start);
+                (*page_index, Sha256::digest(&output[start..end]))
+            })
+            .collect::<Vec<_>>()
+    };
     let code_signature = output
         .get_mut(code_signature_range.clone())
         .ok_or_else(|| error!("Invalid CODE_SIGNATURE range"))?;
@@ -3638,10 +3645,16 @@ pub(crate) fn refresh_code_signature(
     let hashes = code_signature
         .get_mut(hashes_start..hashes_end)
         .ok_or_else(|| error!("Invalid Mach-O code signature hash range"))?;
-    for (page_index, calculated_hash) in calculated_hashes {
-        let hash_start = page_index * CS_HASH_SIZE as usize;
-        let hash_end = hash_start + CS_HASH_SIZE as usize;
-        hashes[hash_start..hash_end].copy_from_slice(&calculated_hash);
+    {
+        verbose_timing_phase!(
+            "Write changed Mach-O code signature hashes",
+            page_count = changed_pages.len()
+        );
+        for (page_index, calculated_hash) in calculated_hashes {
+            let hash_start = page_index * CS_HASH_SIZE as usize;
+            let hash_end = hash_start + CS_HASH_SIZE as usize;
+            hashes[hash_start..hash_end].copy_from_slice(&calculated_hash);
+        }
     }
 
     invalidate_code_signature_cache(output, code_signature_range.end);
@@ -3650,6 +3663,10 @@ pub(crate) fn refresh_code_signature(
 
 #[cfg(target_os = "macos")]
 fn invalidate_code_signature_cache(output: &mut [u8], output_length: usize) {
+    verbose_timing_phase!(
+        "Invalidate Mach-O code signature cache",
+        output_length = output_length
+    );
     // Match lld's workaround for the macOS kernel caching verification data before the final
     // signature bytes have been written: https://openradar.appspot.com/FB8914231
     //
