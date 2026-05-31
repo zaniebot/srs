@@ -53,7 +53,8 @@ use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-const STATE_VERSION: &str = "sld-incremental-state-v35";
+const STATE_VERSION: &str = "sld-incremental-state-v36";
+const STATE_VERSION_V35: &str = "sld-incremental-state-v35";
 const STATE_VERSION_V34: &str = "sld-incremental-state-v34";
 const STATE_VERSION_V33: &str = "sld-incremental-state-v33";
 const STATE_VERSION_V32: &str = "sld-incremental-state-v32";
@@ -106,6 +107,7 @@ const RUSTC_WORK_PRODUCT_PROVENANCE_ENV: &str = "SLD_RUSTC_WORK_PRODUCT_PROVENAN
 const RUSTC_WORK_PRODUCT_PROVENANCE_FILE_ENV: &str = "SLD_RUSTC_WORK_PRODUCT_PROVENANCE_FILE";
 const RUSTC_WORK_PRODUCT_PROVENANCE_VERSION: &str = "sld-rustc-work-product-provenance-v1";
 const RUSTC_RLIB_LINK_CONTENT_DIGEST_PREFIX: &[u8] = b"rustc-rlib-link-content-v1:";
+const RUSTC_RLIB_RAW_OBJECT_DIGESTS_PREFIX: &[u8] = b"rustc-rlib-raw-object-digests-v1:";
 const RUSTC_RLIB_LINK_METADATA_MEMBER: &[u8] = b"lib.rmeta-link";
 const RUSTC_RLIB_LINK_METADATA_SECTION: &str = ".rmeta-link";
 const RUSTC_RLIB_LINK_METADATA_WRAPPER_MAX_LEN: u64 = 16 * 1024 * 1024;
@@ -429,8 +431,19 @@ struct FileState {
 struct FilePatchState {
     fingerprint: String,
     archive_member_set_proof: Option<ArchiveMemberSetProof>,
+    archive_member_patch_fingerprints: Option<Vec<ArchiveMemberPatchFingerprint>>,
     sections: Vec<FilePatchSectionState>,
     raw_sections: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ArchiveMemberPatchFingerprint {
+    archive_member_index: usize,
+    identifier: Vec<u8>,
+    data_len: usize,
+    ranges_hash: String,
+    rustc_object_digest: String,
+    fingerprint: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -439,6 +452,12 @@ struct ArchiveMemberSetProof {
     normalized_ordered_hash: String,
     member_count: usize,
     rustc_link_content_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RustcRlibRawObjectDigest {
+    identifier: Vec<u8>,
+    digest: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1259,8 +1278,7 @@ fn rustc_work_product_provenance_from_env() -> (
     Option<HashMap<PathBuf, String>>,
     RustcWorkProductProvenanceFile,
 ) {
-    let requested =
-        std::env::var_os(RUSTC_WORK_PRODUCT_PROVENANCE_ENV).as_deref() == Some("1".as_ref());
+    let requested = rustc_work_product_provenance_enabled();
     let path = std::env::var_os(RUSTC_WORK_PRODUCT_PROVENANCE_FILE_ENV);
     let contents = path
         .as_ref()
@@ -1313,11 +1331,24 @@ fn parse_rustc_work_product_provenance(contents: &str) -> Option<HashMap<PathBuf
     Some(provenance)
 }
 
+fn rustc_work_product_provenance_enabled() -> bool {
+    std::env::var_os(RUSTC_WORK_PRODUCT_PROVENANCE_ENV).as_deref() == Some("1".as_ref())
+}
+
 fn is_blake3_hex_digest(digest: &str) -> bool {
     digest.len() == 64
         && digest
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn parse_blake3_hex_digest(digest: &str) -> Option<[u8; blake3::OUT_LEN]> {
+    if !is_blake3_hex_digest(digest) {
+        return None;
+    }
+    let mut bytes = [0; blake3::OUT_LEN];
+    hex::decode_to_slice(digest, &mut bytes).ok()?;
+    Some(bytes)
 }
 
 fn previous_input_files_by_path(previous: Option<&PersistedState>) -> HashMap<&str, &FileState> {
@@ -1915,6 +1946,7 @@ fn patch_changed_inputs(
 
         let (
             fingerprint,
+            archive_member_patch_fingerprints,
             archive_member_set_proof,
             matched_sections,
             current_sections,
@@ -2186,9 +2218,9 @@ fn patch_changed_inputs(
                         .flat_map(|candidate| candidate.input_ranges.iter().cloned()),
                 )
                 .collect::<Vec<_>>();
-            let Some(fingerprint) = ({
+            let Some((fingerprint, archive_member_patch_fingerprints)) = ({
                 timing_phase!("Fingerprint changed patch input");
-                patch_fingerprint_with_resolver(
+                patch_fingerprint_with_resolver_and_archive_member_patch_fingerprints(
                     &bytes,
                     input.path.as_str(),
                     current_sections.iter().cloned(),
@@ -2196,6 +2228,7 @@ fn patch_changed_inputs(
                     &current_resolver,
                     PatchInputLookup::MatchArchiveMember,
                     normalize_rust_archive_patch_inputs,
+                    previous_patch.archive_member_patch_fingerprints.as_deref(),
                 )?
             }) else {
                 return Ok(ChangedInputPatchResult::Unsupported(format!(
@@ -2411,6 +2444,7 @@ fn patch_changed_inputs(
 
             (
                 fingerprint,
+                archive_member_patch_fingerprints,
                 archive_member_set_proof,
                 matched_sections,
                 current_sections,
@@ -2498,6 +2532,7 @@ fn patch_changed_inputs(
         previous.input_files[*input_index].patch = Some(FilePatchState {
             fingerprint: fingerprint.clone(),
             archive_member_set_proof,
+            archive_member_patch_fingerprints,
             sections: current_sections
                 .iter()
                 .map(|section| FilePatchSectionState {
@@ -2966,6 +3001,7 @@ fn patch_changed_inputs(
 
 struct PreviousPatchState {
     fingerprint: String,
+    archive_member_patch_fingerprints: Option<Vec<ArchiveMemberPatchFingerprint>>,
     sections: Vec<PatchSection>,
 }
 
@@ -3030,15 +3066,17 @@ fn classify_normalized_rust_archive_patch_state(
         .into_iter()
         .map(|section| section.current)
         .collect::<Vec<_>>();
-    let Some(fingerprint) = patch_fingerprint_with_resolver(
-        bytes,
-        input.path.as_str(),
-        current_sections.iter().cloned(),
-        std::iter::empty(),
-        &resolver,
-        PatchInputLookup::MatchArchiveMember,
-        true,
-    )?
+    let Some((fingerprint, archive_member_patch_fingerprints)) =
+        patch_fingerprint_with_resolver_and_archive_member_patch_fingerprints(
+            bytes,
+            input.path.as_str(),
+            current_sections.iter().cloned(),
+            std::iter::empty(),
+            &resolver,
+            PatchInputLookup::MatchArchiveMember,
+            true,
+            previous_patch.archive_member_patch_fingerprints.as_deref(),
+        )?
     else {
         return Ok(NormalizedRustArchivePatchState::Unknown);
     };
@@ -3048,6 +3086,7 @@ fn classify_normalized_rust_archive_patch_state(
     Ok(NormalizedRustArchivePatchState::Unchanged(FilePatchState {
         fingerprint,
         archive_member_set_proof: archive_member_set_proof(bytes)?,
+        archive_member_patch_fingerprints,
         sections: current_sections
             .iter()
             .map(|section| FilePatchSectionState {
@@ -3101,6 +3140,7 @@ fn patch_sections_from_previous_state(
     }
     Ok(PreviousPatchState {
         fingerprint: previous_patch.fingerprint.clone(),
+        archive_member_patch_fingerprints: previous_patch.archive_member_patch_fingerprints.clone(),
         sections: sections
             .iter()
             .map(|section| PatchSection {
@@ -4733,6 +4773,7 @@ impl PersistedState {
         let mut lines = contents.lines().peekable();
         let version = lines.next().context("Missing incremental state header")?;
         if version != STATE_VERSION
+            && version != STATE_VERSION_V35
             && version != STATE_VERSION_V34
             && version != STATE_VERSION_V33
             && version != STATE_VERSION_V32
@@ -4847,6 +4888,7 @@ impl PersistedState {
         let mut fdes = Vec::new();
         let mut dynamic_relocations = Vec::new();
         let sections = if version == STATE_VERSION
+            || version == STATE_VERSION_V35
             || version == STATE_VERSION_V34
             || version == STATE_VERSION_V33
             || version == STATE_VERSION_V32
@@ -4883,6 +4925,7 @@ impl PersistedState {
                 .context("Missing incremental section input count")?;
             if first_line.starts_with("indexed-sections-file\t") {
                 if version != STATE_VERSION
+                    && version != STATE_VERSION_V35
                     && version != STATE_VERSION_V34
                     && version != STATE_VERSION_V33
                     && version != STATE_VERSION_V32
@@ -4890,7 +4933,7 @@ impl PersistedState {
                     && version != STATE_VERSION_V30
                 {
                     return Err(crate::error!(
-                        "Indexed incremental sections require incremental state version `{STATE_VERSION}`, `{STATE_VERSION_V34}`, `{STATE_VERSION_V33}`, `{STATE_VERSION_V32}`, `{STATE_VERSION_V31}`, or `{STATE_VERSION_V30}`"
+                        "Indexed incremental sections require incremental state version `{STATE_VERSION}`, `{STATE_VERSION_V35}`, `{STATE_VERSION_V34}`, `{STATE_VERSION_V33}`, `{STATE_VERSION_V32}`, `{STATE_VERSION_V31}`, or `{STATE_VERSION_V30}`"
                     ));
                 }
                 let file =
@@ -6447,7 +6490,7 @@ fn current_patch_state(
     )?;
     let fde_relocation_ranges =
         fde_patch_input_ranges_for_current_records(bytes, input_file_path, fdes.iter().copied())?;
-    Ok(patch_fingerprint_for_current_records_with_extra_ranges(
+    Ok(patch_fingerprint_for_current_records_with_extra_ranges_and_archive_member_patch_fingerprints(
         bytes,
         input_file_path,
         patch_sections.iter().cloned(),
@@ -6459,9 +6502,10 @@ fn current_patch_state(
             .chain(fde_relocation_ranges),
         normalize_rust_archive_patch_inputs,
     )?
-    .map(|fingerprint| FilePatchState {
+    .map(|(fingerprint, archive_member_patch_fingerprints)| FilePatchState {
         fingerprint,
         archive_member_set_proof,
+        archive_member_patch_fingerprints,
         sections: patch_sections
             .iter()
             .map(|section| FilePatchSectionState {
@@ -7288,6 +7332,70 @@ fn decode_rustc_rlib_link_content_digest(metadata: &[u8]) -> Option<String> {
     is_blake3_hex_digest(digest).then(|| digest.to_owned())
 }
 
+fn rustc_rlib_raw_object_digests_from_wrapper<'data, R: object::read::ReadRef<'data>>(
+    data: R,
+) -> Option<Vec<RustcRlibRawObjectDigest>> {
+    let file = object::File::parse(data).ok()?;
+    let section = file.section_by_name(RUSTC_RLIB_LINK_METADATA_SECTION)?;
+    decode_rustc_rlib_raw_object_digests(section.data().ok()?)
+}
+
+fn decode_rustc_rlib_raw_object_digests(metadata: &[u8]) -> Option<Vec<RustcRlibRawObjectDigest>> {
+    let mut metadata = metadata.strip_suffix(RUSTC_SERIALIZED_METADATA_END)?;
+    let link_content_suffix_len = RUSTC_RLIB_LINK_CONTENT_DIGEST_PREFIX.len() + blake3::OUT_LEN * 2;
+    if let Some(suffix_start) = metadata.len().checked_sub(link_content_suffix_len)
+        && let Some(suffix) = metadata.get(suffix_start..)
+        && let Some(digest) = suffix.strip_prefix(RUSTC_RLIB_LINK_CONTENT_DIGEST_PREFIX)
+        && let Ok(digest) = std::str::from_utf8(digest)
+        && is_blake3_hex_digest(digest)
+    {
+        metadata = &metadata[..suffix_start];
+    }
+
+    let payload_len = usize::try_from(read_u64_le(
+        metadata.get(metadata.len().checked_sub(8)?..)?,
+    )?)
+    .ok()?;
+    let payload_end = metadata.len().checked_sub(8)?;
+    let payload_start = payload_end.checked_sub(payload_len)?;
+    let prefix_start = payload_start.checked_sub(RUSTC_RLIB_RAW_OBJECT_DIGESTS_PREFIX.len())?;
+    if metadata.get(prefix_start..payload_start)? != RUSTC_RLIB_RAW_OBJECT_DIGESTS_PREFIX {
+        return None;
+    }
+    let mut payload = metadata.get(payload_start..payload_end)?;
+    let object_count = usize::try_from(take_u64_le(&mut payload)?).ok()?;
+    if object_count > payload.len() / (8 + blake3::OUT_LEN * 2) {
+        return None;
+    }
+    let mut objects = Vec::with_capacity(object_count);
+    for _ in 0..object_count {
+        let identifier_len = usize::try_from(take_u64_le(&mut payload)?).ok()?;
+        let identifier = take_bytes(&mut payload, identifier_len)?.to_vec();
+        if identifier.is_empty() {
+            return None;
+        }
+        let digest = std::str::from_utf8(take_bytes(&mut payload, blake3::OUT_LEN * 2)?).ok()?;
+        if !is_blake3_hex_digest(digest) {
+            return None;
+        }
+        objects.push(RustcRlibRawObjectDigest {
+            identifier,
+            digest: digest.to_owned(),
+        });
+    }
+    payload.is_empty().then_some(objects)
+}
+
+fn take_u64_le(bytes: &mut &[u8]) -> Option<u64> {
+    read_u64_le(take_bytes(bytes, 8)?)
+}
+
+fn take_bytes<'a>(bytes: &mut &'a [u8], len: usize) -> Option<&'a [u8]> {
+    let (taken, rest) = bytes.split_at_checked(len)?;
+    *bytes = rest;
+    Some(taken)
+}
+
 fn archive_member_identifier_list_hash(domain: &[u8], members: &[Vec<u8>]) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(domain);
@@ -7351,39 +7459,28 @@ fn patch_fingerprint_with_extra_ranges_mode(
     )
 }
 
-fn patch_fingerprint_for_current_records_with_extra_ranges(
+fn patch_fingerprint_for_current_records_with_extra_ranges_and_archive_member_patch_fingerprints(
     bytes: &[u8],
     input_file_path: &str,
     sections: impl IntoIterator<Item = PatchSection>,
     extra_ranges: impl IntoIterator<Item = std::ops::Range<usize>>,
     normalize_rust_archive_patch_inputs: bool,
-) -> Result<Option<String>> {
-    patch_fingerprint_with_lookup(
+) -> Result<Option<(String, Option<Vec<ArchiveMemberPatchFingerprint>>)>> {
+    let Some(ranges) = patch_ranges_with_lookup(
         bytes,
         input_file_path,
         sections,
-        extra_ranges,
         PatchInputLookup::CurrentRecordedRange,
-        normalize_rust_archive_patch_inputs,
-    )
-}
-
-fn patch_fingerprint_with_lookup(
-    bytes: &[u8],
-    input_file_path: &str,
-    sections: impl IntoIterator<Item = PatchSection>,
-    extra_ranges: impl IntoIterator<Item = std::ops::Range<usize>>,
-    lookup: PatchInputLookup,
-    normalize_rust_archive_patch_inputs: bool,
-) -> Result<Option<String>> {
-    let Some(ranges) = patch_ranges_with_lookup(bytes, input_file_path, sections, lookup)? else {
+    )?
+    else {
         return Ok(None);
     };
-    patch_fingerprint_from_ranges(
+    patch_fingerprint_from_ranges_with_archive_member_patch_fingerprints(
         bytes,
         ranges,
         extra_ranges,
         normalize_rust_archive_patch_inputs,
+        None,
     )
 }
 
@@ -7409,12 +7506,55 @@ fn patch_fingerprint_with_resolver(
     )
 }
 
+fn patch_fingerprint_with_resolver_and_archive_member_patch_fingerprints(
+    bytes: &[u8],
+    input_file_path: &str,
+    sections: impl IntoIterator<Item = PatchSection>,
+    extra_ranges: impl IntoIterator<Item = std::ops::Range<usize>>,
+    resolver: &PatchInputResolver<'_>,
+    lookup: PatchInputLookup,
+    normalize_rust_archive_patch_inputs: bool,
+    previous_archive_member_patch_fingerprints: Option<&[ArchiveMemberPatchFingerprint]>,
+) -> Result<Option<(String, Option<Vec<ArchiveMemberPatchFingerprint>>)>> {
+    let Some(ranges) =
+        patch_ranges_with_resolver(bytes, input_file_path, sections, resolver, lookup)?
+    else {
+        return Ok(None);
+    };
+    patch_fingerprint_from_ranges_with_archive_member_patch_fingerprints(
+        bytes,
+        ranges,
+        extra_ranges,
+        normalize_rust_archive_patch_inputs,
+        previous_archive_member_patch_fingerprints,
+    )
+}
+
 fn patch_fingerprint_from_ranges(
+    bytes: &[u8],
+    ranges: Vec<std::ops::Range<usize>>,
+    extra_ranges: impl IntoIterator<Item = std::ops::Range<usize>>,
+    normalize_rust_archive_patch_inputs: bool,
+) -> Result<Option<String>> {
+    Ok(
+        patch_fingerprint_from_ranges_with_archive_member_patch_fingerprints(
+            bytes,
+            ranges,
+            extra_ranges,
+            normalize_rust_archive_patch_inputs,
+            None,
+        )?
+        .map(|(fingerprint, _)| fingerprint),
+    )
+}
+
+fn patch_fingerprint_from_ranges_with_archive_member_patch_fingerprints(
     bytes: &[u8],
     mut ranges: Vec<std::ops::Range<usize>>,
     extra_ranges: impl IntoIterator<Item = std::ops::Range<usize>>,
     normalize_rust_archive_patch_inputs: bool,
-) -> Result<Option<String>> {
+    previous_archive_member_patch_fingerprints: Option<&[ArchiveMemberPatchFingerprint]>,
+) -> Result<Option<(String, Option<Vec<ArchiveMemberPatchFingerprint>>)>> {
     ranges.extend(extra_ranges);
     dedup_ranges(&mut ranges);
     let Some(ranges) = normalize_patch_ranges(ranges, bytes.len()) else {
@@ -7422,7 +7562,12 @@ fn patch_fingerprint_from_ranges(
     };
 
     if normalize_rust_archive_patch_inputs
-        && let Some(fingerprint) = archive_patch_fingerprint(bytes, &ranges)?
+        && let Some(fingerprint) = archive_patch_fingerprint_with_previous(
+            bytes,
+            &ranges,
+            previous_archive_member_patch_fingerprints,
+            rustc_work_product_provenance_enabled(),
+        )?
     {
         return Ok(Some(fingerprint));
     }
@@ -7435,59 +7580,166 @@ fn patch_fingerprint_from_ranges(
         position = range.end;
     }
     hasher.update(&bytes[position..]);
-    Ok(Some(hasher.finalize().to_hex().to_string()))
+    Ok(Some((hasher.finalize().to_hex().to_string(), None)))
 }
 
+#[cfg(test)]
 fn archive_patch_fingerprint(
     bytes: &[u8],
     ranges: &[std::ops::Range<usize>],
 ) -> Result<Option<String>> {
+    Ok(
+        archive_patch_fingerprint_with_previous(bytes, ranges, None, false)?
+            .map(|(fingerprint, _)| fingerprint),
+    )
+}
+
+fn archive_patch_fingerprint_with_previous(
+    bytes: &[u8],
+    ranges: &[std::ops::Range<usize>],
+    previous_archive_member_patch_fingerprints: Option<&[ArchiveMemberPatchFingerprint]>,
+    trust_rustc_object_digests: bool,
+) -> Result<Option<(String, Option<Vec<ArchiveMemberPatchFingerprint>>)>> {
     let Ok(archive) = ArchiveIterator::from_archive_bytes(bytes) else {
         return Ok(None);
     };
     let mut members = Vec::new();
     let mut is_rust_archive = false;
+    let mut raw_object_digests = None;
+    let mut raw_object_digest_metadata_count = 0;
     for entry in archive {
         match entry? {
             ArchiveEntry::Regular(content) => {
+                let raw_identifier = content.ident.as_slice();
                 let identifier = archive_member_patch_identifier(content.ident.as_slice());
                 is_rust_archive |= identifier != content.ident.as_slice();
-                members.push((identifier, content.entry_data, content.data_offset));
+                if trust_rustc_object_digests && raw_identifier == RUSTC_RLIB_LINK_METADATA_MEMBER {
+                    raw_object_digest_metadata_count += 1;
+                    raw_object_digests =
+                        rustc_rlib_raw_object_digests_from_wrapper(content.entry_data);
+                }
+                members.push((
+                    raw_identifier.to_vec(),
+                    identifier,
+                    content.entry_data,
+                    content.data_offset,
+                ));
             }
             ArchiveEntry::Thin(_) => return Ok(None),
         }
     }
+    let rustc_object_digests = (raw_object_digest_metadata_count == 1)
+        .then_some(raw_object_digests)
+        .flatten()
+        .and_then(|objects| {
+            let mut digests = HashMap::with_capacity(objects.len());
+            for object in objects {
+                let identifier = archive_member_patch_identifier(&object.identifier);
+                if digests.insert(identifier, object.digest).is_some() {
+                    return None;
+                }
+            }
+            Some(digests)
+        });
+    let previous_archive_member_patch_fingerprints = previous_archive_member_patch_fingerprints
+        .map(|fingerprints| {
+            fingerprints
+                .iter()
+                .map(|fingerprint| (fingerprint.archive_member_index, fingerprint))
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
     let member_hashes = members
         .par_iter()
-        .map(|(identifier, data, data_offset)| {
-            if identifier.starts_with(b"__.SYMDEF")
-                || (is_rust_archive
-                    && matches!(identifier.as_slice(), b"lib.rmeta" | b"lib.rmeta-link"))
-            {
-                return None;
-            }
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(b"sld-archive-member-patch-fingerprint-v1");
-            hasher.update(&(data.len() as u64).to_le_bytes());
-            update_hash_with_ranges(&mut hasher, data, *data_offset, ranges);
-            Some(hasher.finalize())
-        })
+        .enumerate()
+        .map(
+            |(archive_member_index, (_, identifier, data, data_offset))| {
+                if identifier.starts_with(b"__.SYMDEF")
+                    || (is_rust_archive
+                        && matches!(identifier.as_slice(), b"lib.rmeta" | b"lib.rmeta-link"))
+                {
+                    return None;
+                }
+                let ranges_hash =
+                    archive_member_patch_ranges_hash(*data_offset, data.len(), ranges);
+                let rustc_object_digest = rustc_object_digests
+                    .as_ref()
+                    .and_then(|digests| digests.get(identifier.as_slice()));
+                // A raw producer digest cannot replace the output-specific patch
+                // fingerprint. It can only prove that a prior constituent remains
+                // valid when the member position and masked ranges also match.
+                if let Some(rustc_object_digest) = rustc_object_digest
+                    && let Some(previous) =
+                        previous_archive_member_patch_fingerprints.get(&archive_member_index)
+                    && previous.identifier == *identifier
+                    && previous.data_len == data.len()
+                    && previous.ranges_hash == ranges_hash
+                    && previous.rustc_object_digest == *rustc_object_digest
+                    && let Some(fingerprint) = parse_blake3_hex_digest(&previous.fingerprint)
+                {
+                    return Some((fingerprint, Some((*previous).clone())));
+                }
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(b"sld-archive-member-patch-fingerprint-v1");
+                hasher.update(&(data.len() as u64).to_le_bytes());
+                update_hash_with_ranges(&mut hasher, data, *data_offset, ranges);
+                let fingerprint = hasher.finalize();
+                let archive_member_patch_fingerprint =
+                    rustc_object_digest.map(|rustc_object_digest| ArchiveMemberPatchFingerprint {
+                        archive_member_index,
+                        identifier: identifier.clone(),
+                        data_len: data.len(),
+                        ranges_hash,
+                        rustc_object_digest: rustc_object_digest.clone(),
+                        fingerprint: fingerprint.to_hex().to_string(),
+                    });
+                Some((*fingerprint.as_bytes(), archive_member_patch_fingerprint))
+            },
+        )
         .collect::<Vec<_>>();
 
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"sld-parallel-archive-patch-fingerprint-v2");
-    for ((identifier, _, _), member_hash) in members.into_iter().zip(member_hashes) {
-        let Some(member_hash) = member_hash else {
+    let mut archive_member_patch_fingerprints = Vec::new();
+    for ((_, identifier, _, _), member_hash) in members.into_iter().zip(member_hashes) {
+        let Some((member_hash, archive_member_patch_fingerprint)) = member_hash else {
             continue;
         };
         hasher.update(&(identifier.len() as u64).to_le_bytes());
         hasher.update(&identifier);
-        hasher.update(member_hash.as_bytes());
+        hasher.update(&member_hash);
+        if let Some(archive_member_patch_fingerprint) = archive_member_patch_fingerprint {
+            archive_member_patch_fingerprints.push(archive_member_patch_fingerprint);
+        }
     }
-    Ok(Some(format!(
-        "{PARALLEL_ARCHIVE_PATCH_FINGERPRINT_PREFIX}{}",
-        hasher.finalize().to_hex()
+    Ok(Some((
+        format!(
+            "{PARALLEL_ARCHIVE_PATCH_FINGERPRINT_PREFIX}{}",
+            hasher.finalize().to_hex()
+        ),
+        (!archive_member_patch_fingerprints.is_empty())
+            .then_some(archive_member_patch_fingerprints),
     )))
+}
+
+fn archive_member_patch_ranges_hash(
+    data_offset: usize,
+    data_len: usize,
+    ranges: &[std::ops::Range<usize>],
+) -> String {
+    let data_end = data_offset + data_len;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"sld-archive-member-patch-ranges-v1");
+    for range in ranges {
+        if range.end <= data_offset || range.start >= data_end {
+            continue;
+        }
+        let start = range.start.max(data_offset) - data_offset;
+        let end = range.end.min(data_end) - data_offset;
+        hasher.update(&(start as u64).to_le_bytes());
+        hasher.update(&(end as u64).to_le_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
 }
 
 fn update_hash_with_ranges(
@@ -12064,6 +12316,11 @@ fn parse_input_line(line: &str, patch_section_mode: PatchSectionReadMode) -> Res
         .filter(|proof| *proof != ABSENT_FIELD)
         .map(parse_archive_member_set_proof)
         .transpose()?;
+    let archive_member_patch_fingerprints = parts
+        .next()
+        .filter(|fingerprints| *fingerprints != ABSENT_FIELD)
+        .map(parse_archive_member_patch_fingerprints)
+        .transpose()?;
     let patch = match patch_fingerprint.zip(patch_sections) {
         Some((fingerprint, raw_sections)) => {
             let sections = match patch_section_mode {
@@ -12073,6 +12330,7 @@ fn parse_input_line(line: &str, patch_section_mode: PatchSectionReadMode) -> Res
             Some(FilePatchState {
                 fingerprint: fingerprint.to_owned(),
                 archive_member_set_proof,
+                archive_member_patch_fingerprints,
                 sections,
                 raw_sections: matches!(patch_section_mode, PatchSectionReadMode::PreserveRaw)
                     .then(|| raw_sections.to_owned()),
@@ -12131,14 +12389,26 @@ fn render_patch_sections(patch: &FilePatchState) -> String {
 }
 
 fn render_input_line_rest(input: &FileState) -> String {
+    let archive_member_patch_fingerprints = input
+        .patch
+        .as_ref()
+        .and_then(|patch| patch.archive_member_patch_fingerprints.as_deref())
+        .map(|fingerprints| {
+            format!(
+                "\t{}",
+                render_archive_member_patch_fingerprints(fingerprints)
+            )
+        })
+        .unwrap_or_default();
     let archive_member_set_proof = input
         .patch
         .as_ref()
         .and_then(|patch| patch.archive_member_set_proof.as_ref())
         .map(|proof| format!("\t{}", render_archive_member_set_proof(proof)))
+        .or_else(|| (!archive_member_patch_fingerprints.is_empty()).then(|| "\t-".to_owned()))
         .unwrap_or_default();
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}{}{}",
         input.path,
         input.content.len,
         input.content.hash,
@@ -12156,7 +12426,91 @@ fn render_input_line_rest(input: &FileState) -> String {
             .as_ref()
             .map_or_else(|| ABSENT_FIELD.to_owned(), FileIdentity::render),
         archive_member_set_proof,
+        archive_member_patch_fingerprints,
     )
+}
+
+fn render_archive_member_patch_fingerprints(
+    fingerprints: &[ArchiveMemberPatchFingerprint],
+) -> String {
+    fingerprints
+        .iter()
+        .map(|fingerprint| {
+            format!(
+                "{}:{}:{}:{}:{}:{}",
+                fingerprint.archive_member_index,
+                hex::encode(&fingerprint.identifier),
+                fingerprint.data_len,
+                fingerprint.ranges_hash,
+                fingerprint.rustc_object_digest,
+                fingerprint.fingerprint,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn parse_archive_member_patch_fingerprints(
+    fingerprints: &str,
+) -> Result<Vec<ArchiveMemberPatchFingerprint>> {
+    if fingerprints.is_empty() {
+        return Err(crate::error!(
+            "Malformed incremental archive member patch fingerprints"
+        ));
+    }
+    let mut parsed = Vec::new();
+    let mut indices = HashSet::new();
+    for fingerprint in fingerprints.split(',') {
+        let mut parts = fingerprint.split(':');
+        let archive_member_index = parts
+            .next()
+            .context("Malformed incremental archive member patch fingerprint")?
+            .parse()
+            .context("Invalid incremental archive member patch fingerprint index")?;
+        let identifier = hex::decode(
+            parts
+                .next()
+                .context("Malformed incremental archive member patch fingerprint")?,
+        )
+        .context("Invalid incremental archive member patch fingerprint identifier")?;
+        let data_len = parts
+            .next()
+            .context("Malformed incremental archive member patch fingerprint")?
+            .parse()
+            .context("Invalid incremental archive member patch fingerprint data length")?;
+        let ranges_hash = parts
+            .next()
+            .context("Malformed incremental archive member patch fingerprint")?
+            .to_owned();
+        let rustc_object_digest = parts
+            .next()
+            .context("Malformed incremental archive member patch fingerprint")?
+            .to_owned();
+        let member_fingerprint = parts
+            .next()
+            .context("Malformed incremental archive member patch fingerprint")?
+            .to_owned();
+        if identifier.is_empty()
+            || !is_blake3_hex_digest(&ranges_hash)
+            || !is_blake3_hex_digest(&rustc_object_digest)
+            || !is_blake3_hex_digest(&member_fingerprint)
+            || parts.next().is_some()
+            || !indices.insert(archive_member_index)
+        {
+            return Err(crate::error!(
+                "Malformed incremental archive member patch fingerprint"
+            ));
+        }
+        parsed.push(ArchiveMemberPatchFingerprint {
+            archive_member_index,
+            identifier,
+            data_len,
+            ranges_hash,
+            rustc_object_digest,
+            fingerprint: member_fingerprint,
+        });
+    }
+    Ok(parsed)
 }
 
 fn render_archive_member_set_proof(proof: &ArchiveMemberSetProof) -> String {
@@ -18260,6 +18614,7 @@ mod tests {
             fingerprint: patch_fingerprint(&previous, input_path.as_str(), [section.clone()])
                 .unwrap()
                 .unwrap(),
+            archive_member_patch_fingerprints: None,
             sections: vec![section.clone()],
         };
         let input = FileState {
@@ -18282,6 +18637,7 @@ mod tests {
 
         let mismatched_previous_patch = PreviousPatchState {
             fingerprint: "mismatched fingerprint".to_owned(),
+            archive_member_patch_fingerprints: None,
             sections: vec![section.clone()],
         };
         let mismatched_state = classify_normalized_rust_archive_patch_state(
@@ -18370,6 +18726,132 @@ mod tests {
     }
 
     #[test]
+    fn rustc_rlib_raw_object_digest_decoder_requires_versioned_ordered_trailer() {
+        let aggregate_digest = "c".repeat(blake3::OUT_LEN * 2);
+        let objects = [
+            (
+                b"crate.cgu.0.old.rcgu.o".as_slice(),
+                "a".repeat(blake3::OUT_LEN * 2),
+            ),
+            (
+                b"crate.cgu.1.old.rcgu.o".as_slice(),
+                "b".repeat(blake3::OUT_LEN * 2),
+            ),
+        ];
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&(objects.len() as u64).to_le_bytes());
+        for (identifier, digest) in &objects {
+            payload.extend_from_slice(&(identifier.len() as u64).to_le_bytes());
+            payload.extend_from_slice(identifier);
+            payload.extend_from_slice(digest.as_bytes());
+        }
+        let mut metadata = b"encoded metadata".to_vec();
+        metadata.extend_from_slice(RUSTC_RLIB_RAW_OBJECT_DIGESTS_PREFIX);
+        metadata.extend_from_slice(&payload);
+        metadata.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        metadata.extend_from_slice(RUSTC_RLIB_LINK_CONTENT_DIGEST_PREFIX);
+        metadata.extend_from_slice(aggregate_digest.as_bytes());
+        metadata.extend_from_slice(RUSTC_SERIALIZED_METADATA_END);
+
+        assert_eq!(
+            decode_rustc_rlib_raw_object_digests(&metadata),
+            Some(
+                objects
+                    .iter()
+                    .map(|(identifier, digest)| RustcRlibRawObjectDigest {
+                        identifier: identifier.to_vec(),
+                        digest: digest.clone(),
+                    })
+                    .collect()
+            )
+        );
+        assert_eq!(
+            decode_rustc_rlib_link_content_digest(&metadata),
+            Some(aggregate_digest)
+        );
+
+        let payload_len_offset = metadata.len()
+            - RUSTC_SERIALIZED_METADATA_END.len()
+            - RUSTC_RLIB_LINK_CONTENT_DIGEST_PREFIX.len()
+            - blake3::OUT_LEN * 2
+            - 8;
+        metadata[payload_len_offset..payload_len_offset + 8]
+            .copy_from_slice(&u64::MAX.to_le_bytes());
+        assert_eq!(decode_rustc_rlib_raw_object_digests(&metadata), None);
+        assert_eq!(
+            decode_rustc_rlib_link_content_digest(&metadata),
+            Some("c".repeat(blake3::OUT_LEN * 2))
+        );
+    }
+
+    #[test]
+    fn archive_patch_fingerprint_reuses_trusted_unchanged_rustc_object_digests() {
+        let archive = |digest: &str, object: &[u8]| {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&1_u64.to_le_bytes());
+            payload.extend_from_slice(&(b"crate.cgu.0.old.rcgu.o".len() as u64).to_le_bytes());
+            payload.extend_from_slice(b"crate.cgu.0.old.rcgu.o");
+            payload.extend_from_slice(digest.as_bytes());
+            let mut metadata = b"encoded metadata".to_vec();
+            metadata.extend_from_slice(RUSTC_RLIB_RAW_OBJECT_DIGESTS_PREFIX);
+            metadata.extend_from_slice(&payload);
+            metadata.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+            metadata.extend_from_slice(RUSTC_RLIB_LINK_CONTENT_DIGEST_PREFIX);
+            metadata.extend_from_slice("c".repeat(blake3::OUT_LEN * 2).as_bytes());
+            metadata.extend_from_slice(RUSTC_SERIALIZED_METADATA_END);
+            let metadata = rmeta_link_wrapper_elf(&metadata);
+            let mut builder = ar::Builder::new(Vec::new());
+            builder
+                .append(
+                    &ar::Header::new(
+                        RUSTC_RLIB_LINK_METADATA_MEMBER.to_vec(),
+                        metadata.len() as u64,
+                    ),
+                    metadata.as_slice(),
+                )
+                .unwrap();
+            builder
+                .append(
+                    &ar::Header::new(b"crate.cgu.0.old.rcgu.o".to_vec(), object.len() as u64),
+                    object,
+                )
+                .unwrap();
+            builder.into_inner().unwrap()
+        };
+        let digest = "a".repeat(blake3::OUT_LEN * 2);
+        let previous = archive(&digest, b"object");
+        let changed_with_same_digest = archive(&digest, b"mutant");
+        let changed_with_changed_digest = archive(&"b".repeat(blake3::OUT_LEN * 2), b"mutant");
+        let (previous_fingerprint, previous_members) =
+            archive_patch_fingerprint_with_previous(&previous, &[], None, true)
+                .unwrap()
+                .unwrap();
+        let (reused_fingerprint, _) = archive_patch_fingerprint_with_previous(
+            &changed_with_same_digest,
+            &[],
+            previous_members.as_deref(),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        let (changed_fingerprint, _) = archive_patch_fingerprint_with_previous(
+            &changed_with_changed_digest,
+            &[],
+            previous_members.as_deref(),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(previous_fingerprint, reused_fingerprint);
+        assert_ne!(previous_fingerprint, changed_fingerprint);
+        assert_eq!(
+            archive_patch_fingerprint(&previous, &[]).unwrap(),
+            Some(previous_fingerprint)
+        );
+    }
+
+    #[test]
     fn rustc_rlib_link_content_digest_reads_metadata_archive_member() {
         let archive = |digest: &str| {
             let mut metadata = b"encoded metadata".to_vec();
@@ -18400,6 +18882,7 @@ mod tests {
             patch: Some(FilePatchState {
                 fingerprint: String::new(),
                 archive_member_set_proof: archive_member_set_proof(&previous).unwrap(),
+                archive_member_patch_fingerprints: None,
                 sections: Vec::new(),
                 raw_sections: None,
             }),
@@ -18450,6 +18933,7 @@ mod tests {
         let reordered_proof = archive_member_set_proof(&reordered).unwrap().unwrap();
         let direct_previous_patch = PreviousPatchState {
             fingerprint: String::new(),
+            archive_member_patch_fingerprints: None,
             sections: Vec::new(),
         };
 
@@ -18474,6 +18958,7 @@ mod tests {
             patch: Some(FilePatchState {
                 fingerprint: String::new(),
                 archive_member_set_proof: Some(previous_proof),
+                archive_member_patch_fingerprints: None,
                 sections: Vec::new(),
                 raw_sections: None,
             }),
@@ -18517,6 +19002,7 @@ mod tests {
             patch: Some(FilePatchState {
                 fingerprint: String::new(),
                 archive_member_set_proof: None,
+                archive_member_patch_fingerprints: None,
                 sections: Vec::new(),
                 raw_sections: None,
             }),
@@ -18538,12 +19024,14 @@ mod tests {
             patch: Some(FilePatchState {
                 fingerprint: String::new(),
                 archive_member_set_proof: None,
+                archive_member_patch_fingerprints: None,
                 sections: Vec::new(),
                 raw_sections: None,
             }),
         };
         let legacy_previous_patch = PreviousPatchState {
             fingerprint: String::new(),
+            archive_member_patch_fingerprints: None,
             sections: vec![PatchSection {
                 input: hex::encode("libarchive.rlib\0member.o\00:1"),
                 section_index: 0,
@@ -18600,6 +19088,7 @@ mod tests {
             patch: Some(FilePatchState {
                 fingerprint: String::new(),
                 archive_member_set_proof: None,
+                archive_member_patch_fingerprints: None,
                 sections: vec![FilePatchSectionState {
                     input: hex::encode(member_ref),
                     section_index: 0,
@@ -19150,6 +19639,7 @@ mod tests {
         state.input_files[0].patch = Some(FilePatchState {
             fingerprint: "patch-hash".to_owned(),
             archive_member_set_proof: None,
+            archive_member_patch_fingerprints: None,
             sections: vec![
                 FilePatchSectionState {
                     input: hex::encode("a.o"),
@@ -19210,6 +19700,14 @@ mod tests {
                 member_count: 3,
                 rustc_link_content_digest: Some("a".repeat(blake3::OUT_LEN * 2)),
             }),
+            archive_member_patch_fingerprints: Some(vec![ArchiveMemberPatchFingerprint {
+                archive_member_index: 2,
+                identifier: b"crate.cgu.rcgu.o".to_vec(),
+                data_len: 42,
+                ranges_hash: "b".repeat(blake3::OUT_LEN * 2),
+                rustc_object_digest: "c".repeat(blake3::OUT_LEN * 2),
+                fingerprint: "d".repeat(blake3::OUT_LEN * 2),
+            }]),
             sections: vec![FilePatchSectionState {
                 input: hex::encode("libarchive.a"),
                 section_index: 1,
@@ -19237,6 +19735,7 @@ mod tests {
                 member_count: 3,
                 rustc_link_content_digest: None,
             }),
+            archive_member_patch_fingerprints: None,
             sections: Vec::new(),
             raw_sections: None,
         });
@@ -19260,6 +19759,7 @@ mod tests {
         state.input_files[0].patch = Some(FilePatchState {
             fingerprint: "patch-hash".to_owned(),
             archive_member_set_proof: None,
+            archive_member_patch_fingerprints: None,
             sections: vec![FilePatchSectionState {
                 input: hex::encode("a.o"),
                 section_index: 1,
@@ -19340,6 +19840,7 @@ mod tests {
         let patch = FilePatchState {
             fingerprint: "patch-hash".to_owned(),
             archive_member_set_proof: None,
+            archive_member_patch_fingerprints: None,
             sections: vec![
                 FilePatchSectionState {
                     input: hex::encode("a.o"),
@@ -19391,6 +19892,7 @@ mod tests {
             patch: Some(FilePatchState {
                 fingerprint: "patch-hash".to_owned(),
                 archive_member_set_proof: None,
+                archive_member_patch_fingerprints: None,
                 sections: vec![FilePatchSectionState {
                     input: hex::encode("a.o"),
                     section_index: 1,
@@ -19436,6 +19938,7 @@ mod tests {
             patch: Some(FilePatchState {
                 fingerprint: "patch-hash".to_owned(),
                 archive_member_set_proof: None,
+                archive_member_patch_fingerprints: None,
                 sections: vec![FilePatchSectionState {
                     input: hex::encode("a.o"),
                     section_index: 1,
@@ -19497,6 +20000,7 @@ mod tests {
             patch: Some(FilePatchState {
                 fingerprint: "patch-hash".to_owned(),
                 archive_member_set_proof: None,
+                archive_member_patch_fingerprints: None,
                 sections: vec![FilePatchSectionState {
                     input: hex::encode("a.o"),
                     section_index: 1,
@@ -19537,6 +20041,7 @@ mod tests {
             patch: Some(FilePatchState {
                 fingerprint: "legacy-patch-hash".to_owned(),
                 archive_member_set_proof: None,
+                archive_member_patch_fingerprints: None,
                 sections: Vec::new(),
                 raw_sections: None,
             }),
@@ -19611,6 +20116,7 @@ mod tests {
         state.input_files[0].patch = Some(FilePatchState {
             fingerprint: "patch-hash".to_owned(),
             archive_member_set_proof: None,
+            archive_member_patch_fingerprints: None,
             sections: vec![FilePatchSectionState {
                 input: hex::encode("a.o"),
                 section_index: 1,
@@ -19840,6 +20346,7 @@ mod tests {
         previous.input_files[0].patch = Some(FilePatchState {
             fingerprint: "unused-patch".to_owned(),
             archive_member_set_proof: None,
+            archive_member_patch_fingerprints: None,
             sections: Vec::new(),
             raw_sections: None,
         });
@@ -20033,6 +20540,7 @@ mod tests {
         state.input_files[0].patch = Some(FilePatchState {
             fingerprint: "patch-hash".to_owned(),
             archive_member_set_proof: None,
+            archive_member_patch_fingerprints: None,
             sections: vec![FilePatchSectionState {
                 input: hex::encode("a.o"),
                 section_index: 1,
@@ -20073,6 +20581,7 @@ mod tests {
         state.input_files[0].patch = Some(FilePatchState {
             fingerprint: "old-patch-hash".to_owned(),
             archive_member_set_proof: None,
+            archive_member_patch_fingerprints: None,
             sections: vec![FilePatchSectionState {
                 input: hex::encode("a.o"),
                 section_index: 1,
@@ -20108,6 +20617,7 @@ mod tests {
                 member_count: 2,
                 rustc_link_content_digest: None,
             }),
+            archive_member_patch_fingerprints: None,
             sections: vec![FilePatchSectionState {
                 input: hex::encode("a.o"),
                 section_index: 1,
