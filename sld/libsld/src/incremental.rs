@@ -107,6 +107,7 @@ const RUSTC_WORK_PRODUCT_PROVENANCE_VERSION: &str = "sld-rustc-work-product-prov
 const RUSTC_RLIB_LINK_CONTENT_DIGEST_PREFIX: &[u8] = b"rustc-rlib-link-content-v1:";
 const RUSTC_RLIB_LINK_METADATA_MEMBER: &[u8] = b"lib.rmeta-link";
 const RUSTC_RLIB_LINK_METADATA_SECTION: &str = ".rmeta-link";
+const RUSTC_RLIB_LINK_METADATA_WRAPPER_MAX_LEN: u64 = 16 * 1024 * 1024;
 const RUSTC_SERIALIZED_METADATA_END: &[u8] = b"rust-end-file";
 const BUILD_ID_HASH_FILE: &str = "build-id-hash";
 const UPDATE_MARKER_FILE: &str = "update-in-progress";
@@ -1765,6 +1766,25 @@ fn patch_changed_inputs(
         let mut loaded_input = None;
         let can_normalize_rust_archive_patch =
             can_normalize_rust_archive_patch(args, &previous, *input_index, path);
+        if can_normalize_rust_archive_patch
+            && trust_rustc_link_content_digests
+            && previous_rustc_rlib_link_content_digest(&previous.input_files[*input_index])
+                .is_some()
+            && let Some(input_content) = ({
+                timing_phase!("Read rustc rlib link-content digest");
+                rustc_rlib_link_content_digest_matches_previous_path(
+                    &previous.input_files[*input_index],
+                    path,
+                )
+            })
+        {
+            expected_changed_inputs.push(ExpectedInputContent::from_content(path, &input_content));
+            previous.input_files[*input_index].content = input_content;
+            previous.input_files[*input_index].snapshot_identity = None;
+            normalized_unchanged_input_count += 1;
+            rustc_link_content_digest_unchanged_input_count += 1;
+            continue;
+        }
         if previous.input_files[*input_index].patch.is_some() {
             let Some((bytes, input_content)) = ({
                 timing_phase!("Read changed incremental input");
@@ -7013,12 +7033,72 @@ fn rustc_rlib_link_content_digest_matches_previous(input: &FileState, bytes: &[u
     let Some(current_digest) = rustc_rlib_link_content_digest(bytes) else {
         return false;
     };
+    rustc_rlib_link_content_digest_value_matches_previous(input, &current_digest)
+}
+
+fn rustc_rlib_link_content_digest_matches_previous_path(
+    input: &FileState,
+    path: &Path,
+) -> Option<FileContentState> {
+    #[cfg(not(unix))]
+    {
+        let _ = (input, path);
+        None
+    }
+    #[cfg(unix)]
+    {
+        let before = FileIdentity::from_path(path).ok().flatten()?;
+        let file = OpenOptions::new().read(true).open(path).ok()?;
+        let opened = FileIdentity::from_metadata(&file.metadata().ok()?);
+        if before != opened {
+            return None;
+        }
+        let data = object::read::ReadCache::new(file);
+        let archive = object::read::archive::ArchiveFile::parse(&data).ok()?;
+        if archive.is_thin() {
+            return None;
+        }
+        for member in archive.members() {
+            let member = member.ok()?;
+            if member.name() != RUSTC_RLIB_LINK_METADATA_MEMBER {
+                continue;
+            }
+            let (offset, size) = member.file_range();
+            if size > RUSTC_RLIB_LINK_METADATA_WRAPPER_MAX_LEN {
+                return None;
+            }
+            let current_digest =
+                rustc_rlib_link_content_digest_from_wrapper(data.range(offset, size))?;
+            if !rustc_rlib_link_content_digest_value_matches_previous(input, &current_digest) {
+                return None;
+            }
+            let after = FileIdentity::from_path(path).ok().flatten()?;
+            if opened != after {
+                return None;
+            }
+            return Some(FileContentState {
+                len: after.len,
+                hash: String::new(),
+                identity: Some(after),
+            });
+        }
+        None
+    }
+}
+
+fn rustc_rlib_link_content_digest_value_matches_previous(
+    input: &FileState,
+    current_digest: &str,
+) -> bool {
+    previous_rustc_rlib_link_content_digest(input) == Some(current_digest)
+}
+
+fn previous_rustc_rlib_link_content_digest(input: &FileState) -> Option<&str> {
     input
         .patch
         .as_ref()
         .and_then(|patch| patch.archive_member_set_proof.as_ref())
         .and_then(|proof| proof.rustc_link_content_digest.as_deref())
-        == Some(current_digest.as_str())
 }
 
 fn rustc_rlib_link_content_digest(bytes: &[u8]) -> Option<String> {
@@ -7030,11 +7110,17 @@ fn rustc_rlib_link_content_digest(bytes: &[u8]) -> Option<String> {
         if content.ident.as_slice() != RUSTC_RLIB_LINK_METADATA_MEMBER {
             continue;
         }
-        let file = object::File::parse(content.entry_data).ok()?;
-        let section = file.section_by_name(RUSTC_RLIB_LINK_METADATA_SECTION)?;
-        return decode_rustc_rlib_link_content_digest(section.data().ok()?);
+        return rustc_rlib_link_content_digest_from_wrapper(content.entry_data);
     }
     None
+}
+
+fn rustc_rlib_link_content_digest_from_wrapper<'data, R: object::read::ReadRef<'data>>(
+    data: R,
+) -> Option<String> {
+    let file = object::File::parse(data).ok()?;
+    let section = file.section_by_name(RUSTC_RLIB_LINK_METADATA_SECTION)?;
+    decode_rustc_rlib_link_content_digest(section.data().ok()?)
 }
 
 fn decode_rustc_rlib_link_content_digest(metadata: &[u8]) -> Option<String> {
@@ -18049,6 +18135,17 @@ mod tests {
         assert!(!rustc_rlib_link_content_digest_matches_previous(
             &input, &current
         ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("libarchive.rlib");
+        std::fs::write(&path, &previous).unwrap();
+        let content = rustc_rlib_link_content_digest_matches_previous_path(&input, &path).unwrap();
+        assert_eq!(content.len, previous.len() as u64);
+        assert!(content.hash.is_empty());
+        assert!(content.identity.is_some());
+
+        std::fs::write(&path, &current).unwrap();
+        assert!(rustc_rlib_link_content_digest_matches_previous_path(&input, &path).is_none());
     }
 
     #[test]
