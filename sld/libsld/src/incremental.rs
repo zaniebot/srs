@@ -1755,6 +1755,7 @@ fn patch_changed_inputs(
     let mut rewritten_input_count = 0;
     let mut normalized_unchanged_input_count = 0;
     let mut rustc_link_content_digest_unchanged_input_count = 0;
+    let mut rustc_link_content_digest_unchanged_input_indices = HashSet::new();
     let mut patched_input_count = 0;
     let mut patched_section_count = 0;
     let mut previous_output = LazyOutputBytes::new(|| read_output_bytes(args.output()));
@@ -1783,6 +1784,7 @@ fn patch_changed_inputs(
             previous.input_files[*input_index].snapshot_identity = None;
             normalized_unchanged_input_count += 1;
             rustc_link_content_digest_unchanged_input_count += 1;
+            rustc_link_content_digest_unchanged_input_indices.insert(*input_index);
             continue;
         }
         if previous.input_files[*input_index].patch.is_some() {
@@ -1868,6 +1870,7 @@ fn patch_changed_inputs(
             previous.input_files[*input_index].snapshot_identity = None;
             normalized_unchanged_input_count += 1;
             rustc_link_content_digest_unchanged_input_count += 1;
+            rustc_link_content_digest_unchanged_input_indices.insert(*input_index);
             continue;
         }
         let normalized_rust_archive_patch_state = if can_normalize_rust_archive_patch {
@@ -2527,12 +2530,20 @@ fn patch_changed_inputs(
         }
         snapshot_input_paths(
             state_dir,
-            changed_inputs.iter().map(|(_, path)| path.as_path()),
+            changed_inputs_requiring_snapshot(
+                changed_inputs,
+                &rustc_link_content_digest_unchanged_input_indices,
+            )
+            .map(|(_, path)| path.as_path()),
         )?;
         refresh_input_snapshot_identities_at_indices(
             state_dir,
             &mut previous.input_files,
-            changed_inputs.iter().map(|(input_index, _)| *input_index),
+            changed_inputs_requiring_snapshot(
+                changed_inputs,
+                &rustc_link_content_digest_unchanged_input_indices,
+            )
+            .map(|(input_index, _)| *input_index),
         );
         refresh_input_file_identities_at_indices(
             &mut previous.input_files,
@@ -2747,7 +2758,11 @@ fn patch_changed_inputs(
                     timing_phase!("Snapshot changed incremental inputs");
                     snapshot_input_paths(
                         state_dir,
-                        changed_inputs.iter().map(|(_, path)| path.as_path()),
+                        changed_inputs_requiring_snapshot(
+                            changed_inputs,
+                            &rustc_link_content_digest_unchanged_input_indices,
+                        )
+                        .map(|(_, path)| path.as_path()),
                     )
                 },
             );
@@ -2786,13 +2801,21 @@ fn patch_changed_inputs(
             timing_phase!("Snapshot changed incremental inputs");
             snapshot_input_paths(
                 state_dir,
-                changed_inputs.iter().map(|(_, path)| path.as_path()),
+                changed_inputs_requiring_snapshot(
+                    changed_inputs,
+                    &rustc_link_content_digest_unchanged_input_indices,
+                )
+                .map(|(_, path)| path.as_path()),
             )
         })?;
         refresh_input_snapshot_identities_at_indices(
             state_dir,
             &mut previous.input_files,
-            changed_inputs.iter().map(|(input_index, _)| *input_index),
+            changed_inputs_requiring_snapshot(
+                changed_inputs,
+                &rustc_link_content_digest_unchanged_input_indices,
+            )
+            .map(|(input_index, _)| *input_index),
         );
         refresh_input_file_identities_at_indices(
             &mut previous.input_files,
@@ -13148,6 +13171,18 @@ fn snapshot_input_paths<'a>(
     Ok(snapshotted)
 }
 
+fn changed_inputs_requiring_snapshot<'a>(
+    changed_inputs: &'a [(usize, PathBuf)],
+    rustc_link_content_digest_unchanged_input_indices: &'a HashSet<usize>,
+) -> impl Iterator<Item = &'a (usize, PathBuf)> {
+    // Matching producer digests prove link equivalence without proving byte equality. Keep the old
+    // snapshot untouched: the persisted empty content hash and cleared snapshot identity prevent
+    // its stale bytes from being trusted by a later patch.
+    changed_inputs.iter().filter(|(input_index, _)| {
+        !rustc_link_content_digest_unchanged_input_indices.contains(input_index)
+    })
+}
+
 fn snapshot_input_path(state_dir: &Path, path: &Path) -> Result<bool> {
     let metadata = match std::fs::metadata(path) {
         Ok(metadata) => metadata,
@@ -14895,6 +14930,71 @@ mod tests {
         assert_eq!(
             snapshot_input_paths(&state_dir, [input.as_path(), input.as_path()]).unwrap(),
             1
+        );
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn changed_input_snapshots_skip_unchanged_rustc_rlibs() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("app.incr");
+        let unchanged = dir.path().join("libunchanged.rlib");
+        let changed = dir.path().join("libchanged.rlib");
+        std::fs::write(&unchanged, b"old unchanged").unwrap();
+        std::fs::write(&changed, b"old changed").unwrap();
+        snapshot_input_paths(&state_dir, [unchanged.as_path(), changed.as_path()]).unwrap();
+
+        let replacement = dir.path().join("replacement.rlib");
+        std::fs::write(&replacement, b"new unchanged").unwrap();
+        std::fs::rename(&replacement, &unchanged).unwrap();
+        let replacement = dir.path().join("replacement.rlib");
+        std::fs::write(&replacement, b"new changed").unwrap();
+        std::fs::rename(&replacement, &changed).unwrap();
+
+        let changed_inputs = vec![(0, unchanged.clone()), (1, changed.clone())];
+        let unchanged_rustc_rlibs = HashSet::from([0]);
+        assert_eq!(
+            snapshot_input_paths(
+                &state_dir,
+                changed_inputs_requiring_snapshot(&changed_inputs, &unchanged_rustc_rlibs)
+                    .map(|(_, path)| path.as_path()),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            std::fs::read(input_snapshot_path(&state_dir, &unchanged)).unwrap(),
+            b"old unchanged"
+        );
+        assert_eq!(
+            std::fs::read(input_snapshot_path(&state_dir, &changed)).unwrap(),
+            b"new changed"
+        );
+
+        let mut input_files = vec![
+            FileState {
+                path: encode_path(&unchanged),
+                content: FileContentState::from_path_identity_only(&unchanged).unwrap(),
+                snapshot_identity: None,
+                patch: None,
+            },
+            FileState {
+                path: encode_path(&changed),
+                content: FileContentState::from_path_identity_only(&changed).unwrap(),
+                snapshot_identity: None,
+                patch: None,
+            },
+        ];
+        refresh_input_snapshot_identities_at_indices(
+            &state_dir,
+            &mut input_files,
+            changed_inputs_requiring_snapshot(&changed_inputs, &unchanged_rustc_rlibs)
+                .map(|(input_index, _)| *input_index),
+        );
+        assert!(input_files[0].snapshot_identity.is_none());
+        assert_eq!(
+            input_files[1].snapshot_identity,
+            FileIdentity::from_path(&input_snapshot_path(&state_dir, &changed)).unwrap()
         );
     }
 
