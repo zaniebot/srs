@@ -16905,6 +16905,61 @@ mod tests {
         bytes
     }
 
+    fn rmeta_link_wrapper_elf(metadata: &[u8]) -> Vec<u8> {
+        const ELF_HEADER_SIZE: usize = 64;
+        const SECTION_HEADER_SIZE: usize = 64;
+        const SECTION_COUNT: usize = 3;
+        const SECTION_NAMES: &[u8] = b"\0.rmeta-link\0.shstrtab\0";
+
+        let metadata_offset = ELF_HEADER_SIZE;
+        let section_names_offset = metadata_offset + metadata.len();
+        let section_headers_offset =
+            (section_names_offset + SECTION_NAMES.len()).next_multiple_of(8);
+        let mut bytes = vec![0; section_headers_offset + SECTION_HEADER_SIZE * SECTION_COUNT];
+
+        bytes[0..4].copy_from_slice(b"\x7fELF");
+        bytes[4] = 2;
+        bytes[5] = 1;
+        bytes[6] = 1;
+        bytes[16..18].copy_from_slice(&1_u16.to_le_bytes());
+        bytes[18..20].copy_from_slice(&62_u16.to_le_bytes());
+        bytes[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[40..48].copy_from_slice(&(section_headers_offset as u64).to_le_bytes());
+        bytes[52..54].copy_from_slice(&(ELF_HEADER_SIZE as u16).to_le_bytes());
+        bytes[58..60].copy_from_slice(&(SECTION_HEADER_SIZE as u16).to_le_bytes());
+        bytes[60..62].copy_from_slice(&(SECTION_COUNT as u16).to_le_bytes());
+        bytes[62..64].copy_from_slice(&2_u16.to_le_bytes());
+
+        bytes[metadata_offset..section_names_offset].copy_from_slice(metadata);
+        bytes[section_names_offset..section_names_offset + SECTION_NAMES.len()]
+            .copy_from_slice(SECTION_NAMES);
+
+        let metadata_header = section_headers_offset + SECTION_HEADER_SIZE;
+        bytes[metadata_header..metadata_header + 4].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[metadata_header + 4..metadata_header + 8].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[metadata_header + 8..metadata_header + 16]
+            .copy_from_slice(&u64::from(object::elf::SHF_EXCLUDE).to_le_bytes());
+        bytes[metadata_header + 24..metadata_header + 32]
+            .copy_from_slice(&(metadata_offset as u64).to_le_bytes());
+        bytes[metadata_header + 32..metadata_header + 40]
+            .copy_from_slice(&(metadata.len() as u64).to_le_bytes());
+        bytes[metadata_header + 48..metadata_header + 56].copy_from_slice(&1_u64.to_le_bytes());
+
+        let section_names_header = section_headers_offset + SECTION_HEADER_SIZE * 2;
+        bytes[section_names_header..section_names_header + 4]
+            .copy_from_slice(&13_u32.to_le_bytes());
+        bytes[section_names_header + 4..section_names_header + 8]
+            .copy_from_slice(&3_u32.to_le_bytes());
+        bytes[section_names_header + 24..section_names_header + 32]
+            .copy_from_slice(&(section_names_offset as u64).to_le_bytes());
+        bytes[section_names_header + 32..section_names_header + 40]
+            .copy_from_slice(&(SECTION_NAMES.len() as u64).to_le_bytes());
+        bytes[section_names_header + 48..section_names_header + 56]
+            .copy_from_slice(&1_u64.to_le_bytes());
+
+        bytes
+    }
+
     fn relocated_data_elf() -> Vec<u8> {
         let mut bytes = vec![0; 0x220];
 
