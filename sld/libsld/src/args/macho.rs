@@ -251,12 +251,12 @@ impl platform::Args for MachOArgs {
         should_invalidate_code_signature_cache: bool,
     ) -> Result {
         if self.should_emit_code_signature && self.has_private_persistent_output_contract {
-            let code_signature_range = crate::macho_writer::refresh_code_signature(
+            let code_signature_ranges = crate::macho_writer::refresh_code_signature(
                 output,
                 flush_ranges,
                 should_invalidate_code_signature_cache,
             )?;
-            flush_ranges.push(code_signature_range);
+            flush_ranges.extend(code_signature_ranges);
         }
         Ok(())
     }
