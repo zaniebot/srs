@@ -77,6 +77,21 @@ install_snapshot() {
         "$root/install.sh" "$name" "$toolchain_dir" "$cargo_bin"
 }
 
+if env \
+    SRS_INSTALL_ROOT="$install_root" \
+    SRS_RUSTUP_BIN="$rustup_bin" \
+    SRS_SLD_BIN="$sld_bin" \
+    SRS_TEST_RUSTUP_LINKS="$rustup_links" \
+    "$root/install.sh" --help "$toolchain_dir" "$cargo_bin" > "$scratch/option-like-name.log" 2>&1
+then
+    printf 'installer unexpectedly accepted an option-like toolchain name\n' >&2
+    exit 1
+fi
+if ! grep -q 'invalid SRS toolchain name' "$scratch/option-like-name.log"; then
+    printf 'installer did not explain the option-like toolchain name refusal\n' >&2
+    exit 1
+fi
+
 install_snapshot
 
 if [[ "$(readlink "$rustup_links/$name")" != "$snapshot_dir" ]]; then
@@ -196,9 +211,30 @@ if [[ "$("$snapshot_dir/bin/cargo")" != "fake cargo A" ]]; then
     exit 1
 fi
 
+ln -s ../../rust-source "$toolchain_dir/lib/mutable-relative-external"
+if SRS_INSTALL_REPLACE=1 install_snapshot > "$scratch/relative-external-symlink.log" 2>&1; then
+    printf 'installer unexpectedly accepted a retained external relative symlink\n' >&2
+    exit 1
+fi
+if ! grep -q 'refusing external relative symlink in SRS toolchain snapshot' "$scratch/relative-external-symlink.log"; then
+    printf 'installer did not explain the retained external relative symlink refusal\n' >&2
+    exit 1
+fi
+rm "$toolchain_dir/lib/mutable-relative-external"
+if [[ "$("$snapshot_dir/bin/cargo")" != "fake cargo A" ]]; then
+    printf 'installer changed snapshot after rejecting an external relative symlink\n' >&2
+    exit 1
+fi
+
+mkdir -p "$toolchain_dir/lib/internal-target"
+ln -s internal-target "$toolchain_dir/lib/internal-relative"
 SRS_INSTALL_REPLACE=1 install_snapshot
 if [[ "$("$snapshot_dir/bin/cargo")" != "fake cargo B" ]]; then
     printf 'installer did not replace snapshot after explicit opt-in\n' >&2
+    exit 1
+fi
+if [[ ! -L "$snapshot_dir/lib/internal-relative" || "$(readlink "$snapshot_dir/lib/internal-relative")" != "internal-target" ]]; then
+    printf 'installer did not retain an internal relative symlink\n' >&2
     exit 1
 fi
 
