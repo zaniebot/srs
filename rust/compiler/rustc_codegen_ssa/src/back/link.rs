@@ -316,9 +316,12 @@ fn link_rlib<'a>(
     let link_content_digest = matches!(flavor, RlibFlavor::Normal)
         .then(|| rlib_link_content_digest(sess, compiled_modules, crate_info))
         .flatten();
+    let raw_object_digests =
+        link_content_digest.as_ref().and_then(|_| rlib_raw_object_digests(compiled_modules));
 
     let metadata_link_file = if matches!(flavor, RlibFlavor::Normal) {
-        let metadata_link = rmeta_link::RmetaLink { rust_object_files, link_content_digest };
+        let metadata_link =
+            rmeta_link::RmetaLink { rust_object_files, raw_object_digests, link_content_digest };
         let metadata_link_data = metadata_link.encode();
         let (wrapper, _) =
             create_wrapper_file(sess, rmeta_link::SECTION.to_string(), &metadata_link_data);
@@ -495,6 +498,23 @@ fn rlib_link_content_digest(
         .map(|module| Some((module.name.as_str(), module.object_digest.as_deref()?)))
         .collect::<Option<Vec<_>>>()?;
     rmeta_link::link_content_digest(objects)
+}
+
+fn rlib_raw_object_digests(
+    compiled_modules: &CompiledModules,
+) -> Option<Vec<rmeta_link::RawObjectDigest>> {
+    compiled_modules
+        .modules
+        .iter()
+        .filter(|module| module.object.is_some())
+        .map(|module| {
+            let object = module.object.as_ref()?;
+            Some(rmeta_link::RawObjectDigest {
+                member_name: object.file_name()?.to_str()?.to_owned(),
+                digest: module.object_digest.clone()?,
+            })
+        })
+        .collect()
 }
 
 /// Create a static archive.
