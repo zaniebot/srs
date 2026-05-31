@@ -14,17 +14,25 @@ use anyhow::bail;
 use object::Object as _;
 use object::ObjectSection as _;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::io::Read as _;
+use std::io::Seek as _;
+use std::io::SeekFrom;
 use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Stdio;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 use wait4::Wait4 as _;
+
+static MUTATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const COMPRESSED_SECTIONS_FILE_PREFIX: &str = "sections-zstd-";
 
 pub(crate) fn run_bench(args: &BenchArgs, config: &Config) -> Result {
     if !args.allow_non_tmpfs {
@@ -139,10 +147,19 @@ fn run(bins: &[Bin], benchmarks: &[Benchmark], args: &BenchArgs) -> Result<Bench
         }
 
         let mut bench_results = Vec::new();
+        let incremental_output_path = bins
+            .iter()
+            .find(|bin| bin.identifier.kind == LinkerKind::Sld && bench.supports_bin(bin))
+            .map(|bin| output_path_for_bin(args.tmp.as_path(), bin));
+        let mut mutation_state = MutationState::default();
         for batch_num in 0..args.num_batches {
             let mut batch_runs = vec![Vec::new(); bins.len()];
             for group in timed_run_groups(bins.len(), args.batch_size) {
-                mutate_inputs(bench)?;
+                mutate_inputs_with_state(
+                    bench,
+                    incremental_output_path.as_deref(),
+                    &mut mutation_state,
+                )?;
                 for bin_index in group.bin_indexes {
                     let bin = &bins[bin_index];
                     let measure_memory = !args.no_mem && batch_num == 0;
@@ -214,7 +231,25 @@ fn extra_flags_for_run(bin: &Bin, bench: &Benchmark, measure_memory: bool) -> Ve
     extra_flags
 }
 
-fn mutate_inputs(bench: &Benchmark) -> Result {
+#[cfg(test)]
+fn mutate_inputs(bench: &Benchmark, incremental_output_path: Option<&Path>) -> Result {
+    mutate_inputs_with_state(
+        bench,
+        incremental_output_path,
+        &mut MutationState::default(),
+    )
+}
+
+#[derive(Default)]
+struct MutationState {
+    incremental_patch_sections: HashMap<usize, RecordedIncrementalPatchMutation>,
+}
+
+fn mutate_inputs_with_state(
+    bench: &Benchmark,
+    incremental_output_path: Option<&Path>,
+    mutation_state: &mut MutationState,
+) -> Result {
     if bench.config.mutate_files.is_empty() {
         return Ok(());
     }
@@ -224,7 +259,7 @@ fn mutate_inputs(bench: &Benchmark) -> Result {
         .parent()
         .with_context(|| format!("Benchmark path `{}` has no parent", bench.path.display()))?;
 
-    for mutation in &bench.config.mutate_files {
+    for (mutation_index, mutation) in bench.config.mutate_files.iter().enumerate() {
         match mutation {
             Mutation::AppendZero(relative_path) => {
                 ensure_relative_path(relative_path)?;
@@ -242,6 +277,27 @@ fn mutate_inputs(bench: &Benchmark) -> Result {
                 let (path, section) = find_first_relocatable_elf_with_section(save_dir, section)?;
                 mutate_elf_section(&path, &section, *grow)?;
             }
+            Mutation::FirstIncrementalPatchSection { incremental_patch } => {
+                let output_path = incremental_output_path.context(
+                    "Incremental patch-section mutation requires an sld benchmark binary",
+                )?;
+                let mutation = if let Some(mutation) = mutation_state
+                    .incremental_patch_sections
+                    .get(&mutation_index)
+                {
+                    mutation.clone()
+                } else {
+                    let mutation = find_first_recorded_incremental_patch_section(
+                        output_path,
+                        incremental_patch,
+                    )?;
+                    mutation_state
+                        .incremental_patch_sections
+                        .insert(mutation_index, mutation.clone());
+                    mutation
+                };
+                mutate_input_byte(&mutation.path, mutation.offset)?;
+            }
         }
     }
 
@@ -250,7 +306,7 @@ fn mutate_inputs(bench: &Benchmark) -> Result {
 
 fn mutate_elf_section(path: &Path, section: &str, grow: u64) -> Result {
     if grow == 0 {
-        mutate_elf_section_byte(path, section)
+        mutate_object_section_byte(path, section)
     } else {
         grow_elf_section(path, section, grow)
     }
@@ -333,20 +389,17 @@ fn section_selector_matches(selector: &str, section_name: &str) -> bool {
 }
 
 fn append_zero(path: &Path) -> Result {
-    let mut file = std::fs::OpenOptions::new()
-        .append(true)
-        .open(path)
-        .with_context(|| format!("Failed to open mutation input `{}`", path.display()))?;
-    file.write_all(&[0])
-        .with_context(|| format!("Failed to mutate input `{}`", path.display()))?;
-    Ok(())
+    let mut bytes =
+        std::fs::read(path).with_context(|| format!("Failed to read `{}`", path.display()))?;
+    bytes.push(0);
+    install_mutated_input(path, &bytes)
 }
 
-fn mutate_elf_section_byte(path: &Path, section_name: &str) -> Result {
+fn mutate_object_section_byte(path: &Path, section_name: &str) -> Result {
     let mut bytes =
         std::fs::read(path).with_context(|| format!("Failed to read `{}`", path.display()))?;
     let object = object::File::parse(&*bytes)
-        .with_context(|| format!("Failed to parse ELF mutation input `{}`", path.display()))?;
+        .with_context(|| format!("Failed to parse object mutation input `{}`", path.display()))?;
     let section = object.section_by_name(section_name).with_context(|| {
         format!(
             "Mutation input `{}` does not contain section `{section_name}`",
@@ -369,9 +422,413 @@ fn mutate_elf_section_byte(path: &Path, section_name: &str) -> Result {
         .get_mut(start as usize)
         .with_context(|| format!("Mutation section `{section_name}` starts past end of file"))?;
     *byte = byte.wrapping_add(1);
-    std::fs::write(path, bytes)
-        .with_context(|| format!("Failed to write mutation input `{}`", path.display()))?;
-    Ok(())
+    install_mutated_input(path, &bytes)
+}
+
+fn mutate_input_byte(path: &Path, offset: usize) -> Result {
+    let mut bytes = std::fs::read(path)
+        .with_context(|| format!("Failed to read mutation input `{}`", path.display()))?;
+    let byte = bytes
+        .get_mut(offset)
+        .context("Mutation byte offset starts past end of file")?;
+    *byte = byte.wrapping_add(1);
+    install_mutated_input(path, &bytes)
+}
+
+#[derive(Debug)]
+struct IncrementalPatchRecordLocation {
+    input_file: String,
+    offset: usize,
+    len: usize,
+    hash: String,
+}
+
+#[derive(Debug)]
+struct IncrementalSectionRecord {
+    input_file: String,
+    input: String,
+    section_index: usize,
+    output_offset: usize,
+    size: usize,
+}
+
+#[derive(Clone)]
+struct RecordedIncrementalPatchMutation {
+    path: PathBuf,
+    offset: usize,
+}
+
+fn find_first_recorded_incremental_patch_section(
+    output_path: &Path,
+    section_selector: &str,
+) -> Result<RecordedIncrementalPatchMutation> {
+    let state_dir = incremental_state_dir(output_path);
+    let index_path = state_dir.join("index");
+    let index = std::fs::read_to_string(&index_path).with_context(|| {
+        format!(
+            "Failed to read sld incremental index `{}`",
+            index_path.display()
+        )
+    })?;
+    let (sections_file, locations) = parse_incremental_patch_record_locations(&index)?;
+    let sidecar_path = state_dir.join(&sections_file);
+    let sidecar = std::fs::read(&sidecar_path).with_context(|| {
+        format!(
+            "Failed to read sld incremental sections `{}`",
+            sidecar_path.display()
+        )
+    })?;
+    let mut output = std::fs::File::open(output_path)
+        .with_context(|| format!("Failed to open linker output `{}`", output_path.display()))?;
+    let mut section_record_count = 0;
+    let mut readable_input_count = 0;
+    let mut resolved_input_range_count = 0;
+    let mut relocatable_input_count = 0;
+    let mut matching_name_count = 0;
+    let mut allowed_section_count = 0;
+    let mut relocation_free_section_count = 0;
+    let mut matching_output_count = 0;
+
+    for location in locations {
+        let Some(end) = location.offset.checked_add(location.len) else {
+            bail!(
+                "Incremental patch-record block for `{}` overflowed its sidecar offset",
+                location.input_file
+            );
+        };
+        let Some(block) = sidecar.get(location.offset..end) else {
+            bail!(
+                "Incremental patch-record block for `{}` is outside `{}`",
+                location.input_file,
+                sidecar_path.display()
+            );
+        };
+        if blake3::hash(block).to_hex().as_str() != location.hash {
+            bail!(
+                "Incremental patch-record block for `{}` does not match its recorded hash",
+                location.input_file
+            );
+        }
+        let block = if sections_file.starts_with(COMPRESSED_SECTIONS_FILE_PREFIX) {
+            zstd::stream::decode_all(block).with_context(|| {
+                format!(
+                    "Failed to decode incremental patch-record block for `{}`",
+                    location.input_file
+                )
+            })?
+        } else {
+            block.to_vec()
+        };
+        let block = String::from_utf8(block)
+            .context("Incremental patch-record block contained invalid UTF-8")?;
+
+        for record in parse_incremental_section_records(&block)? {
+            section_record_count += 1;
+            let input_file =
+                hex::decode(&record.input_file).context("Malformed incremental input file path")?;
+            let path = decoded_incremental_path(input_file.clone())?;
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            readable_input_count += 1;
+            let Some(input_range) = recorded_input_range(&input_file, &record.input, bytes.len())?
+            else {
+                continue;
+            };
+            let Some(input_bytes) = bytes.get(input_range.clone()) else {
+                continue;
+            };
+            resolved_input_range_count += 1;
+            let Ok(object) = object::File::parse(input_bytes) else {
+                continue;
+            };
+            if object.kind() != object::ObjectKind::Relocatable {
+                continue;
+            }
+            relocatable_input_count += 1;
+            let Some(section_index) =
+                recorded_incremental_patch_section_index(&object, record.section_index)
+            else {
+                continue;
+            };
+            let Ok(section) = object.section_by_index(section_index) else {
+                continue;
+            };
+            let Ok(section_name) = section.name() else {
+                continue;
+            };
+            if !section_selector_matches(section_selector, section_name) {
+                continue;
+            }
+            matching_name_count += 1;
+            if !section_name_allows_benchmark_direct_patching(section_name.as_bytes())
+                || !section_flags_allow_benchmark_direct_patching(section.flags())
+            {
+                continue;
+            }
+            allowed_section_count += 1;
+            if section.relocations().next().is_some() {
+                continue;
+            }
+            relocation_free_section_count += 1;
+            let Ok(data) = section.data() else {
+                continue;
+            };
+            if data.is_empty() || data.len() > record.size {
+                continue;
+            }
+            let Some(end) = record.output_offset.checked_add(record.size) else {
+                continue;
+            };
+            let mut output_range = vec![0; end - record.output_offset];
+            output
+                .seek(SeekFrom::Start(record.output_offset as u64))
+                .with_context(|| {
+                    format!("Failed to seek linker output `{}`", output_path.display())
+                })?;
+            output.read_exact(&mut output_range).with_context(|| {
+                format!("Failed to read linker output `{}`", output_path.display())
+            })?;
+            let (output_data, padding) = output_range.split_at(data.len());
+            if output_data == data && padding.iter().all(|byte| *byte == 0) {
+                matching_output_count += 1;
+                let Some((section_offset, _)) = section.file_range() else {
+                    continue;
+                };
+                let Ok(section_offset) = usize::try_from(section_offset) else {
+                    continue;
+                };
+                let Some(offset) = input_range.start.checked_add(section_offset) else {
+                    continue;
+                };
+                return Ok(RecordedIncrementalPatchMutation { path, offset });
+            }
+        }
+    }
+
+    bail!(
+        "Could not find a recorded incremental patch section matching `{section_selector}` for `{}` \
+         (records={section_record_count}, readable-inputs={readable_input_count}, \
+         resolved-input-ranges={resolved_input_range_count}, relocatable-inputs={relocatable_input_count}, \
+         matching-names={matching_name_count}, allowed-sections={allowed_section_count}, \
+         relocation-free-sections={relocation_free_section_count}, matching-output={matching_output_count})",
+        output_path.display(),
+    )
+}
+
+fn parse_incremental_patch_record_locations(
+    index: &str,
+) -> Result<(String, Vec<IncrementalPatchRecordLocation>)> {
+    let sections_file = index
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("indexed-sections-file\t")
+                .or_else(|| line.strip_prefix("patch-records-file\t"))
+        })
+        .context("Incremental index does not name an indexed patch-record file")?
+        .to_owned();
+    let locations = index
+        .lines()
+        .filter_map(|line| line.strip_prefix("patch-record\t"))
+        .map(|record| {
+            let mut parts = record.split('\t');
+            let input_file = parts
+                .next()
+                .context("Malformed incremental patch-record input")?
+                .to_owned();
+            let offset = parts
+                .next()
+                .context("Malformed incremental patch-record offset")?
+                .parse()
+                .context("Invalid incremental patch-record offset")?;
+            let len = parts
+                .next()
+                .context("Malformed incremental patch-record length")?
+                .parse()
+                .context("Invalid incremental patch-record length")?;
+            let hash = parts
+                .next()
+                .context("Malformed incremental patch-record hash")?
+                .to_owned();
+            if parts.next().is_some() {
+                bail!("Malformed incremental patch-record location");
+            }
+            Ok(IncrementalPatchRecordLocation {
+                input_file,
+                offset,
+                len,
+                hash,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if locations.is_empty() {
+        bail!("Incremental index contains no patch-record locations");
+    }
+    Ok((sections_file, locations))
+}
+
+fn parse_incremental_section_records(block: &str) -> Result<Vec<IncrementalSectionRecord>> {
+    let mut lines = block.lines();
+    let input_count: usize = parse_benchmark_prefixed_line(lines.next(), "section-inputs")?
+        .parse()
+        .context("Invalid incremental section-input count")?;
+    let mut inputs = Vec::with_capacity(input_count);
+    for _ in 0..input_count {
+        let rest = parse_benchmark_prefixed_line(lines.next(), "section-input")?;
+        let (input_file, input) = rest
+            .split_once('\t')
+            .context("Malformed incremental section-input")?;
+        inputs.push((input_file, input));
+    }
+    let section_count: usize = parse_benchmark_prefixed_line(lines.next(), "sections")?
+        .parse()
+        .context("Invalid incremental section count")?;
+    let mut sections = Vec::with_capacity(section_count);
+    for _ in 0..section_count {
+        let rest = parse_benchmark_prefixed_line(lines.next(), "section")?;
+        let mut parts = rest.split('\t');
+        let input_index: usize = parts
+            .next()
+            .context("Malformed incremental section input")?
+            .parse()
+            .context("Invalid incremental section input")?;
+        let (input_file, input) = inputs
+            .get(input_index)
+            .context("Incremental section input index is out of bounds")?;
+        let section_index = parts
+            .next()
+            .context("Malformed incremental section index")?
+            .parse()
+            .context("Invalid incremental section index")?;
+        let output_offset = parts
+            .next()
+            .context("Malformed incremental section output offset")?
+            .parse()
+            .context("Invalid incremental section output offset")?;
+        let size = parts
+            .next()
+            .context("Malformed incremental section size")?
+            .parse()
+            .context("Invalid incremental section size")?;
+        if parts.next().is_some() {
+            bail!("Malformed incremental section record");
+        }
+        sections.push(IncrementalSectionRecord {
+            input_file: (*input_file).to_owned(),
+            input: (*input).to_owned(),
+            section_index,
+            output_offset,
+            size,
+        });
+    }
+    Ok(sections)
+}
+
+fn parse_benchmark_prefixed_line<'a>(line: Option<&'a str>, expected: &str) -> Result<&'a str> {
+    let line = line.context("Missing incremental record line")?;
+    let (prefix, rest) = line
+        .split_once('\t')
+        .context("Malformed incremental record line")?;
+    if prefix != expected {
+        bail!("Expected incremental record `{expected}`, got `{prefix}`");
+    }
+    Ok(rest)
+}
+
+fn decoded_incremental_path(bytes: Vec<u8>) -> Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        Ok(PathBuf::from(OsString::from_vec(bytes)))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(PathBuf::from(String::from_utf8(bytes).context(
+            "Incremental input path contained invalid UTF-8",
+        )?))
+    }
+}
+
+fn recorded_input_range(
+    input_file: &[u8],
+    encoded_input: &str,
+    input_file_len: usize,
+) -> Result<Option<std::ops::Range<usize>>> {
+    let input = hex::decode(encoded_input).context("Malformed incremental input ref")?;
+    if input == input_file {
+        return Ok(Some(0..input_file_len));
+    }
+    let Some(rest) = input
+        .strip_prefix(input_file)
+        .and_then(|rest| rest.strip_prefix(&[0]))
+    else {
+        return Ok(None);
+    };
+    let Some(separator) = rest.iter().position(|byte| *byte == 0) else {
+        return Ok(None);
+    };
+    let range = std::str::from_utf8(&rest[separator + 1..])
+        .context("Malformed incremental archive member range")?;
+    let Some((start, end)) = range.split_once(':') else {
+        return Ok(None);
+    };
+    let start = start
+        .parse()
+        .context("Invalid incremental archive member start offset")?;
+    let end = end
+        .parse()
+        .context("Invalid incremental archive member end offset")?;
+    if start > end || end > input_file_len {
+        return Ok(None);
+    }
+    Ok(Some(start..end))
+}
+
+fn recorded_incremental_patch_section_index(
+    file: &object::File<'_>,
+    section_index: usize,
+) -> Option<object::SectionIndex> {
+    recorded_incremental_patch_section_index_for_format(
+        matches!(file, object::File::MachO32(_) | object::File::MachO64(_)),
+        section_index,
+    )
+}
+
+fn recorded_incremental_patch_section_index_for_format(
+    is_macho: bool,
+    section_index: usize,
+) -> Option<object::SectionIndex> {
+    let section_index = if is_macho {
+        section_index.checked_add(1)?
+    } else {
+        section_index
+    };
+    Some(object::SectionIndex(section_index))
+}
+
+fn section_flags_allow_benchmark_direct_patching(flags: object::SectionFlags) -> bool {
+    match flags {
+        object::SectionFlags::Elf { sh_flags } => sh_flags & u64::from(object::elf::SHF_ALLOC) != 0,
+        object::SectionFlags::MachO { flags } => {
+            matches!(
+                flags & object::macho::SECTION_TYPE,
+                object::macho::S_REGULAR | object::macho::S_CSTRING_LITERALS
+            )
+        }
+        _ => false,
+    }
+}
+
+fn section_name_allows_benchmark_direct_patching(name: &[u8]) -> bool {
+    (!name.starts_with(b"__") || matches!(name, b"__data" | b"__const" | b"__cstring"))
+        && !matches!(name, b".init" | b".fini")
+        && !name.starts_with(b".eh_frame")
+        && !name.starts_with(b".init_array")
+        && !name.starts_with(b".fini_array")
+        && !name.starts_with(b".preinit_array")
+        && !name.starts_with(b".ctors")
+        && !name.starts_with(b".dtors")
 }
 
 fn grow_elf_section(path: &Path, section_name: &str, growth: u64) -> Result {
@@ -432,9 +889,57 @@ fn grow_elf_section(path: &Path, section_name: &str, growth: u64) -> Result {
     }
     size_field.write(&mut bytes, new_size)?;
 
-    std::fs::write(path, bytes)
-        .with_context(|| format!("Failed to write mutation input `{}`", path.display()))?;
-    Ok(())
+    install_mutated_input(path, &bytes)
+}
+
+fn install_mutated_input(path: &Path, bytes: &[u8]) -> Result {
+    let permissions = std::fs::metadata(path)
+        .with_context(|| format!("Failed to stat mutation input `{}`", path.display()))?
+        .permissions();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("input");
+    let temp_path = path.with_file_name(format!(
+        ".{file_name}.benchmark-mutation.{}.{}.tmp",
+        std::process::id(),
+        MUTATION_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let mut temp = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .with_context(|| {
+                format!(
+                    "Failed to create replacement mutation input `{}`",
+                    temp_path.display()
+                )
+            })?;
+        temp.write_all(bytes).with_context(|| {
+            format!(
+                "Failed to write replacement mutation input `{}`",
+                temp_path.display()
+            )
+        })?;
+        temp.set_permissions(permissions).with_context(|| {
+            format!(
+                "Failed to set replacement mutation permissions `{}`",
+                temp_path.display()
+            )
+        })?;
+        drop(temp);
+        std::fs::rename(&temp_path, path).with_context(|| {
+            format!(
+                "Failed to install replacement mutation input `{}`",
+                path.display()
+            )
+        })
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
 }
 
 #[derive(Clone)]
@@ -622,6 +1127,9 @@ fn run_once(
             command.arg(arg);
         }
     }
+    let sld_log_offset = should_verify_sld_incremental_log(bin, bench, check_sld_log)
+        .then(|| incremental_log_len(&output_path))
+        .transpose()?;
 
     let (mut pipe_read, pipe_write) = std::io::pipe()?;
     command
@@ -660,8 +1168,8 @@ fn run_once(
         bail!("Command produced warnings: {command:?}\n{text_out}");
     }
 
-    if should_verify_sld_incremental_log(bin, bench, check_sld_log) {
-        verify_sld_incremental_log(&output_path, &bench.config.expect_sld_log)?;
+    if let Some(log_offset) = sld_log_offset {
+        verify_sld_incremental_log(&output_path, &bench.config.expect_sld_log, log_offset)?;
     }
 
     // However long we took to run, sleep for half of that. If the linker forked on startup, then
@@ -785,14 +1293,25 @@ fn should_verify_sld_incremental_log(bin: &Bin, bench: &Benchmark, check_sld_log
         && !bench.config.expect_sld_log.is_empty()
 }
 
-fn verify_sld_incremental_log(output_path: &Path, expected: &[String]) -> Result {
+fn incremental_log_len(output_path: &Path) -> Result<u64> {
+    let path = incremental_log_path(output_path);
+    match std::fs::metadata(&path) {
+        Ok(metadata) => Ok(metadata.len()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(error)
+            .with_context(|| format!("Failed to read sld incremental log `{}`", path.display())),
+    }
+}
+
+fn verify_sld_incremental_log(output_path: &Path, expected: &[String], offset: u64) -> Result {
     let path = incremental_log_path(output_path);
     let log = std::fs::read_to_string(&path)
         .with_context(|| format!("Failed to read sld incremental log `{}`", path.display()))?;
+    let current_log = log.get(offset as usize..).unwrap_or(&log);
     for expected in expected {
-        if !log.contains(expected) {
+        if !current_log.contains(expected) {
             bail!(
-                "sld incremental log `{}` did not contain expected text `{expected}`.\nLog:\n{log}",
+                "sld incremental log `{}` did not contain expected text `{expected}` for the current run.\nCurrent log:\n{current_log}",
                 path.display()
             );
         }
@@ -824,9 +1343,13 @@ fn verify_output_changed(
 }
 
 fn incremental_log_path(output_path: &Path) -> std::path::PathBuf {
+    incremental_state_dir(output_path).join("log")
+}
+
+fn incremental_state_dir(output_path: &Path) -> PathBuf {
     let mut state_dir = output_path.as_os_str().to_owned();
     state_dir.push(".incr");
-    std::path::PathBuf::from(state_dir).join("log")
+    PathBuf::from(state_dir)
 }
 
 fn find_benchmarks(args: &BenchArgs, config: &Config) -> Result<Vec<Benchmark>> {
@@ -898,10 +1421,12 @@ mod tests {
     use super::ensure_relative_path;
     use super::find_first_relocatable_elf_with_section;
     use super::grow_elf_section;
+    use super::incremental_log_len;
     use super::incremental_log_path;
+    use super::incremental_state_dir;
     use super::make_executable;
-    use super::mutate_elf_section_byte;
     use super::mutate_inputs;
+    use super::mutate_object_section_byte;
     use super::output_path_for_bin;
     use super::should_verify_sld_incremental_log;
     use super::verify_output_changed;
@@ -942,7 +1467,7 @@ mod tests {
             },
         };
 
-        mutate_inputs(&bench).unwrap();
+        mutate_inputs(&bench, None).unwrap();
 
         assert_eq!(std::fs::read(&input).unwrap(), b"abc\0");
     }
@@ -966,7 +1491,7 @@ mod tests {
         let path = dir.path().join("current-exe");
         std::fs::write(&path, &bytes).unwrap();
 
-        mutate_elf_section_byte(&path, ".data").unwrap();
+        mutate_object_section_byte(&path, ".data").unwrap();
 
         assert_ne!(std::fs::read(&path).unwrap(), bytes);
     }
@@ -977,8 +1502,8 @@ mod tests {
         let path = dir.path().join("changed.o");
         std::fs::write(&path, growable_data_elf()).unwrap();
 
-        mutate_elf_section_byte(&path, ".data").unwrap();
-        mutate_elf_section_byte(&path, ".data").unwrap();
+        mutate_object_section_byte(&path, ".data").unwrap();
+        mutate_object_section_byte(&path, ".data").unwrap();
 
         let bytes = std::fs::read(&path).unwrap();
         let object = object::File::parse(&*bytes).unwrap();
@@ -986,6 +1511,22 @@ mod tests {
             object.section_by_name(".data").unwrap().data().unwrap(),
             &[3, 2, 3, 4]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn elf_section_byte_mutation_preserves_existing_hardlink_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("changed.rcgu.o");
+        let snapshot = dir.path().join("snapshot.rcgu.o");
+        let original = growable_data_elf();
+        std::fs::write(&path, &original).unwrap();
+        std::fs::hard_link(&path, &snapshot).unwrap();
+
+        mutate_object_section_byte(&path, ".data").unwrap();
+
+        assert_eq!(std::fs::read(&snapshot).unwrap(), original);
+        assert_ne!(std::fs::read(&path).unwrap(), original);
     }
 
     #[test]
@@ -1022,7 +1563,7 @@ mod tests {
             },
         };
 
-        mutate_inputs(&bench).unwrap();
+        mutate_inputs(&bench, None).unwrap();
 
         let bytes = std::fs::read(&input).unwrap();
         let object = object::File::parse(&*bytes).unwrap();
@@ -1059,7 +1600,7 @@ mod tests {
             (input, ".data".to_owned())
         );
 
-        mutate_inputs(&bench).unwrap();
+        mutate_inputs(&bench, None).unwrap();
 
         let bytes = std::fs::read(nested.join("changed.o")).unwrap();
         let object = object::File::parse(&*bytes).unwrap();
@@ -1084,6 +1625,218 @@ mod tests {
     }
 
     #[test]
+    fn incremental_patch_section_mutation_reuses_recorded_live_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let save_dir = dir.path().join("save");
+        std::fs::create_dir(&save_dir).unwrap();
+        let input = save_dir.join("changed.o");
+        let original = growable_data_elf();
+        std::fs::write(&input, &original).unwrap();
+
+        let object = object::File::parse(&*original).unwrap();
+        let data = object.section_by_name(".data").unwrap().data().unwrap();
+        let output = dir.path().join("out");
+        let mut output_bytes = vec![0, 0];
+        output_bytes.extend_from_slice(data);
+        output_bytes.extend_from_slice(&[0, 0]);
+        std::fs::write(&output, output_bytes).unwrap();
+
+        let encoded_input = encode_path_for_test(&input);
+        let block = format!(
+            "section-inputs\t1\nsection-input\t{encoded_input}\t{encoded_input}\nsections\t1\nsection\t0\t1\t2\t6\nrelocs\t0\nfdes\t0\ndynrels\t0\n"
+        );
+        let compressed = zstd::stream::encode_all(block.as_bytes(), 0).unwrap();
+        let state_dir = incremental_state_dir(&output);
+        std::fs::create_dir(&state_dir).unwrap();
+        std::fs::write(state_dir.join("sections-zstd-test"), &compressed).unwrap();
+        std::fs::write(
+            state_dir.join("index"),
+            format!(
+                "indexed-sections-file\tsections-zstd-test\npatch-records\t1\npatch-record\t{encoded_input}\t0\t{}\t{}\n",
+                compressed.len(),
+                blake3::hash(&compressed).to_hex()
+            ),
+        )
+        .unwrap();
+
+        let bench = Benchmark {
+            name: "recorded-patch".to_owned(),
+            path: save_dir.join("run-with"),
+            config: BenchConfig {
+                mutate_files: vec![Mutation::FirstIncrementalPatchSection {
+                    incremental_patch: ".data".to_owned(),
+                }],
+                ..BenchConfig::default()
+            },
+        };
+
+        let mut mutation_state = super::MutationState::default();
+        super::mutate_inputs_with_state(&bench, Some(&output), &mut mutation_state).unwrap();
+        super::mutate_inputs_with_state(&bench, Some(&output), &mut mutation_state).unwrap();
+
+        let bytes = std::fs::read(&input).unwrap();
+        let object = object::File::parse(&*bytes).unwrap();
+        assert_eq!(
+            object.section_by_name(".data").unwrap().data().unwrap(),
+            &[3, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn incremental_patch_section_mutation_skips_recorded_non_live_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let save_dir = dir.path().join("save");
+        std::fs::create_dir(&save_dir).unwrap();
+        let dead_input = save_dir.join("dead.o");
+        let live_input = save_dir.join("live.o");
+        let original = growable_data_elf();
+        std::fs::write(&dead_input, &original).unwrap();
+        std::fs::write(&live_input, &original).unwrap();
+
+        let object = object::File::parse(&*original).unwrap();
+        let data = object.section_by_name(".data").unwrap().data().unwrap();
+        let output = dir.path().join("out");
+        let mut output_bytes = vec![0xff, 0xff];
+        output_bytes.extend_from_slice(data);
+        output_bytes.extend_from_slice(&[0, 0]);
+        std::fs::write(&output, output_bytes).unwrap();
+
+        let dead_input = encode_path_for_test(&dead_input);
+        let live_input = encode_path_for_test(&live_input);
+        let dead_block = format!(
+            "section-inputs\t1\nsection-input\t{dead_input}\t{dead_input}\nsections\t1\nsection\t0\t1\t0\t4\nrelocs\t0\nfdes\t0\ndynrels\t0\n"
+        );
+        let live_block = format!(
+            "section-inputs\t1\nsection-input\t{live_input}\t{live_input}\nsections\t1\nsection\t0\t1\t2\t6\nrelocs\t0\nfdes\t0\ndynrels\t0\n"
+        );
+        let dead_block = zstd::stream::encode_all(dead_block.as_bytes(), 0).unwrap();
+        let live_block = zstd::stream::encode_all(live_block.as_bytes(), 0).unwrap();
+        let state_dir = incremental_state_dir(&output);
+        std::fs::create_dir(&state_dir).unwrap();
+        std::fs::write(
+            state_dir.join("sections-zstd-test"),
+            [&*dead_block, &*live_block].concat(),
+        )
+        .unwrap();
+        std::fs::write(
+            state_dir.join("index"),
+            format!(
+                "indexed-sections-file\tsections-zstd-test\npatch-records\t2\npatch-record\t{dead_input}\t0\t{}\t{}\npatch-record\t{live_input}\t{}\t{}\t{}\n",
+                dead_block.len(),
+                blake3::hash(&dead_block).to_hex(),
+                dead_block.len(),
+                live_block.len(),
+                blake3::hash(&live_block).to_hex(),
+            ),
+        )
+        .unwrap();
+
+        let bench = Benchmark {
+            name: "recorded-patch".to_owned(),
+            path: save_dir.join("run-with"),
+            config: BenchConfig {
+                mutate_files: vec![Mutation::FirstIncrementalPatchSection {
+                    incremental_patch: ".data".to_owned(),
+                }],
+                ..BenchConfig::default()
+            },
+        };
+
+        mutate_inputs(&bench, Some(&output)).unwrap();
+
+        assert_eq!(std::fs::read(save_dir.join("dead.o")).unwrap(), original);
+        let bytes = std::fs::read(save_dir.join("live.o")).unwrap();
+        let object = object::File::parse(&*bytes).unwrap();
+        assert_eq!(
+            object.section_by_name(".data").unwrap().data().unwrap(),
+            &[2, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn incremental_patch_section_mutation_updates_recorded_archive_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let save_dir = dir.path().join("save");
+        std::fs::create_dir(&save_dir).unwrap();
+        let input = save_dir.join("libchanged.rlib");
+        let object_bytes = growable_data_elf();
+        let member_start = 32;
+        let member_end = member_start + object_bytes.len();
+        let mut archive = vec![0xa5; member_start];
+        archive.extend_from_slice(&object_bytes);
+        archive.extend_from_slice(&[0x5a; 16]);
+        std::fs::write(&input, &archive).unwrap();
+
+        let object = object::File::parse(&*object_bytes).unwrap();
+        let data = object.section_by_name(".data").unwrap().data().unwrap();
+        let output = dir.path().join("out");
+        let mut output_bytes = vec![0, 0];
+        output_bytes.extend_from_slice(data);
+        output_bytes.extend_from_slice(&[0, 0]);
+        std::fs::write(&output, output_bytes).unwrap();
+
+        let encoded_input_file = encode_path_for_test(&input);
+        let mut input_ref = input.as_os_str().as_encoded_bytes().to_vec();
+        input_ref.extend_from_slice(b"\0member.rcgu.o\0");
+        input_ref.extend_from_slice(format!("{member_start}:{member_end}").as_bytes());
+        let encoded_input_ref = hex::encode(input_ref);
+        let block = format!(
+            "section-inputs\t1\nsection-input\t{encoded_input_file}\t{encoded_input_ref}\nsections\t1\nsection\t0\t1\t2\t6\nrelocs\t0\nfdes\t0\ndynrels\t0\n"
+        );
+        let compressed = zstd::stream::encode_all(block.as_bytes(), 0).unwrap();
+        let state_dir = incremental_state_dir(&output);
+        std::fs::create_dir(&state_dir).unwrap();
+        std::fs::write(state_dir.join("sections-zstd-test"), &compressed).unwrap();
+        std::fs::write(
+            state_dir.join("index"),
+            format!(
+                "indexed-sections-file\tsections-zstd-test\npatch-records\t1\npatch-record\t{encoded_input_file}\t0\t{}\t{}\n",
+                compressed.len(),
+                blake3::hash(&compressed).to_hex()
+            ),
+        )
+        .unwrap();
+
+        let bench = Benchmark {
+            name: "recorded-archive-patch".to_owned(),
+            path: save_dir.join("run-with"),
+            config: BenchConfig {
+                mutate_files: vec![Mutation::FirstIncrementalPatchSection {
+                    incremental_patch: ".data".to_owned(),
+                }],
+                ..BenchConfig::default()
+            },
+        };
+
+        mutate_inputs(&bench, Some(&output)).unwrap();
+
+        let bytes = std::fs::read(&input).unwrap();
+        assert_eq!(&bytes[..member_start], &archive[..member_start]);
+        assert_eq!(&bytes[member_end..], &archive[member_end..]);
+        let object = object::File::parse(&bytes[member_start..member_end]).unwrap();
+        assert_eq!(
+            object.section_by_name(".data").unwrap().data().unwrap(),
+            &[2, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn recorded_incremental_patch_section_indexes_account_for_macho_headers() {
+        assert_eq!(
+            super::recorded_incremental_patch_section_index_for_format(false, 0),
+            Some(object::SectionIndex(0))
+        );
+        assert_eq!(
+            super::recorded_incremental_patch_section_index_for_format(true, 0),
+            Some(object::SectionIndex(1))
+        );
+        assert_eq!(
+            super::recorded_incremental_patch_section_index_for_format(true, usize::MAX),
+            None
+        );
+    }
+
+    #[test]
     fn sld_incremental_log_expectations_must_match() {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("out");
@@ -1101,13 +1854,47 @@ mod tests {
                 "patched 1 changed input file".to_owned(),
                 "before loading inputs".to_owned(),
             ],
+            0,
         )
         .unwrap();
 
-        let error = verify_sld_incremental_log(&output, &["reused existing output".to_owned()])
+        let error = verify_sld_incremental_log(&output, &["reused existing output".to_owned()], 0)
             .unwrap_err();
 
         assert!(error.to_string().contains("did not contain expected text"));
+    }
+
+    #[test]
+    fn sld_incremental_log_expectations_ignore_previous_invocations() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out");
+        let log_path = incremental_log_path(&output);
+        std::fs::create_dir_all(log_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &log_path,
+            "patched 1 changed input file before loading inputs\n",
+        )
+        .unwrap();
+        let offset = incremental_log_len(&output).unwrap();
+        std::fs::write(
+            &log_path,
+            "patched 1 changed input file before loading inputs\nfull relink: input file changed\n",
+        )
+        .unwrap();
+
+        let error = verify_sld_incremental_log(
+            &output,
+            &["patched 1 changed input file".to_owned()],
+            offset,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("for the current run"));
+        assert!(
+            error
+                .to_string()
+                .contains("full relink: input file changed")
+        );
     }
 
     #[test]
@@ -1299,5 +2086,18 @@ mod tests {
         bytes[shstrtab_header + 48..shstrtab_header + 56].copy_from_slice(&1_u64.to_le_bytes());
 
         bytes
+    }
+
+    fn encode_path_for_test(path: &Path) -> String {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+
+            hex::encode(path.as_os_str().as_bytes())
+        }
+        #[cfg(not(unix))]
+        {
+            hex::encode(path.to_string_lossy().as_bytes())
+        }
     }
 }

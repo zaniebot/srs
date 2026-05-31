@@ -82,6 +82,9 @@
 //! ExpectMachOBuildVersion:{platform} {min-os} {sdk} Checks that the output Mach-O contains an
 //! LC_BUILD_VERSION load command with the specified values.
 //!
+//! ExpectMachOUnwindInfoSld:{symbol-name} Checks that sld's final Mach-O `__unwind_info` contains
+//! an unwind entry for the specified symbol's final image offset.
+//!
 //! Mode:{mode} Set linking mode to static (default), dynamic or unspecified. Cannot be used
 //! together with LinkerDriver.
 //!
@@ -166,12 +169,24 @@
 //! testing runs sld twice with incremental linking enabled and verifies that the second run reuses
 //! the existing output.
 //!
+//! TestIncrementalUnsignedMachOOutput:{bool} Whether a Mach-O incremental test should request
+//! unsigned persistent output, allowing changed-input patching to be exercised without invalidating
+//! an embedded code signature. Defaults to false.
+//!
+//! TestIncrementalPrivateSignedMachOOutput:{bool} Whether a Mach-O incremental test should request
+//! a private persistent output whose embedded signature is refreshed after changed-input patches.
+//! Defaults to false.
+//!
 //! TestIncrementalCompareFull:{bool} Whether the first incremental output should be byte-compared
 //! to a normal full link. Defaults to true. Disable this when the initial incremental link
 //! intentionally reserves capacity and should preserve that layout for later updates.
 //!
 //! TestIncrementalChanged:{bool} Whether to extend TestIncremental by changing one input object,
 //! then checking that the changed-input incremental link matches a full relink.
+//!
+//! TestIncrementalChangedImmediately:{bool} Whether TestIncrementalChanged should first exercise
+//! its mutation immediately after the initial incremental output, before an unchanged reuse link
+//! can wait for state publication. Defaults to false.
 //!
 //! TestIncrementalInterrupted:{bool} Whether to extend TestIncremental by creating a stale
 //! update-in-progress marker, then checking that the next link performs a full relink.
@@ -189,7 +204,8 @@
 //! the direct patch fast path. Defaults to true. When false, the test expects a logged fallback.
 //!
 //! TestIncrementalChangedFallbackReason:{string} Substring expected in the logged fallback reason.
-//! Only used when TestIncrementalChangedExpectPatch is false.
+//! When TestIncrementalChangedExpectPatch is false, the fallback is required. When it is true, the
+//! fallback is accepted as an explicitly allowed alternative to the patch fast path.
 //!
 //! TestIncrementalChangedPatchedSectionCount:{count} Acceptable changed-section patch count for a
 //! changed-input relink. Can be repeated. Defaults to the exact count implied by
@@ -337,6 +353,7 @@ use std::io::BufReader;
 use std::io::ErrorKind;
 use std::io::IsTerminal;
 use std::io::Read;
+use std::mem::size_of;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -847,8 +864,11 @@ struct Config {
     requires_linker_plugin: bool,
     test_update_in_place: bool,
     test_incremental: bool,
+    test_incremental_unsigned_macho_output: bool,
+    test_incremental_private_signed_macho_output: bool,
     test_incremental_compare_full: bool,
     test_incremental_changed: bool,
+    test_incremental_changed_immediately: bool,
     test_incremental_interrupted: bool,
     test_incremental_added_input: Option<String>,
     test_incremental_removed_input: Option<String>,
@@ -1324,6 +1344,7 @@ struct Assertions {
     expected_section_bytes: Vec<ExpectedSectionBytes>,
     expected_section_types: Vec<ExpectedSectionType>,
     expected_macho_build_version: Option<ExpectedMachOBuildVersion>,
+    expected_sld_macho_unwind_info: Vec<String>,
     no_empty_load_segments: bool,
     output_file_matches: Vec<OutputFileMatch>,
     max_thunks: u64,
@@ -1580,8 +1601,11 @@ impl Config {
             requires_rust_musl: false,
             test_update_in_place: false,
             test_incremental: false,
+            test_incremental_unsigned_macho_output: false,
+            test_incremental_private_signed_macho_output: false,
             test_incremental_compare_full: true,
             test_incremental_changed: false,
+            test_incremental_changed_immediately: false,
             test_incremental_interrupted: false,
             test_incremental_added_input: None,
             test_incremental_removed_input: None,
@@ -1913,6 +1937,10 @@ fn process_directive(
             config.assertions.expected_macho_build_version =
                 Some(ExpectedMachOBuildVersion::parse(arg.trim())?);
         }
+        "ExpectMachOUnwindInfoSld" => config
+            .assertions
+            .expected_sld_macho_unwind_info
+            .push(arg.trim().to_owned()),
         "ExpectDynamic" => config
             .assertions
             .expected_dynamic_entries
@@ -2092,11 +2120,20 @@ fn process_directive(
         "TestIncremental" => {
             config.test_incremental = arg.to_lowercase().parse()?;
         }
+        "TestIncrementalUnsignedMachOOutput" => {
+            config.test_incremental_unsigned_macho_output = arg.to_lowercase().parse()?;
+        }
+        "TestIncrementalPrivateSignedMachOOutput" => {
+            config.test_incremental_private_signed_macho_output = arg.to_lowercase().parse()?;
+        }
         "TestIncrementalCompareFull" => {
             config.test_incremental_compare_full = arg.to_lowercase().parse()?;
         }
         "TestIncrementalChanged" => {
             config.test_incremental_changed = arg.to_lowercase().parse()?;
+        }
+        "TestIncrementalChangedImmediately" => {
+            config.test_incremental_changed_immediately = arg.to_lowercase().parse()?;
         }
         "TestIncrementalInterrupted" => {
             config.test_incremental_interrupted = arg.to_lowercase().parse()?;
@@ -2438,6 +2475,150 @@ impl ProgramInputs {
             );
         }
 
+        if config.test_incremental_changed_immediately {
+            if !config.test_incremental_changed {
+                bail!(
+                    "Incremental test failed for {}: TestIncrementalChangedImmediately requires \
+                    TestIncrementalChanged",
+                    self.name()
+                );
+            }
+            if config.test_incremental_changed_comp_args.is_some()
+                || config.test_incremental_changed_grow_section.is_some()
+                || config.test_incremental_changed_append_archive_member
+            {
+                bail!(
+                    "Incremental test failed for {}: TestIncrementalChangedImmediately currently \
+                    supports section byte mutations only",
+                    self.name()
+                );
+            }
+            let immediate_changed_inputs = if config.test_incremental_changed_inputs.is_empty() {
+                vec![inputs.last().cloned().with_context(|| {
+                    format!(
+                        "Immediate incremental changed-input test for {} needs at least one input",
+                        self.name()
+                    )
+                })?]
+            } else {
+                config
+                    .test_incremental_changed_inputs
+                    .iter()
+                    .map(|expected_name| {
+                        inputs
+                            .iter()
+                            .find(|input| {
+                                input
+                                    .path
+                                    .file_name()
+                                    .is_some_and(|name| name == expected_name.as_str())
+                            })
+                            .cloned()
+                            .with_context(|| {
+                                format!(
+                                    "Immediate incremental changed-input test for {} could not \
+                                    find input `{}`",
+                                    self.name(),
+                                    expected_name
+                                )
+                            })
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            };
+            if immediate_changed_inputs.len() != 1 {
+                bail!(
+                    "Incremental test failed for {}: TestIncrementalChangedImmediately requires \
+                    exactly one changed input",
+                    self.name()
+                );
+            }
+            let immediate_changed_input = &immediate_changed_inputs[0];
+            let restore_immediate_changed_input =
+                RestoreFileOnDrop::new(&immediate_changed_input.path)?;
+            let changed_sections = config.incremental_changed_sections();
+            for changed_section in &changed_sections {
+                mutate_section_byte(
+                    &immediate_changed_input.path,
+                    changed_section,
+                    config.test_incremental_changed_section_offset,
+                )?;
+            }
+
+            let immediate_changed_output =
+                Linker::Sld.link(self.name(), inputs, &incremental_config, cross_arch)?;
+            let immediate_changed_content = std::fs::read(&immediate_changed_output.binary)
+                .with_context(|| {
+                    format!(
+                        "Failed to read immediate changed incremental output: {}",
+                        immediate_changed_output.binary.display()
+                    )
+                })?;
+            if original_content == immediate_changed_content {
+                bail!(
+                    "Incremental test failed for {}: immediate changed input section did not \
+                    change output",
+                    self.name()
+                );
+            }
+
+            let immediate_log_path =
+                append_to_path(&immediate_changed_output.binary, ".incr").join("log");
+            let immediate_log =
+                std::fs::read_to_string(&immediate_log_path).with_context(|| {
+                    format!(
+                        "Failed to read immediate incremental log `{}`",
+                        immediate_log_path.display()
+                    )
+                })?;
+            if !immediate_log.contains("patched 1 changed input file before loading inputs") {
+                bail!(
+                    "Incremental test failed for {}: immediate changed-input relink did not patch \
+                    the changed input before loading all inputs. Log:\n{}",
+                    self.name(),
+                    immediate_log
+                );
+            }
+            let patched_section_counts = if config
+                .test_incremental_changed_patched_section_counts
+                .is_empty()
+            {
+                vec![changed_sections.len()]
+            } else {
+                config
+                    .test_incremental_changed_patched_section_counts
+                    .clone()
+            };
+            if !patched_section_counts.iter().any(|patched_section_count| {
+                immediate_log.contains(&format!(
+                    "patched {patched_section_count} changed input sections before loading inputs"
+                ))
+            }) {
+                bail!(
+                    "Incremental test failed for {}: immediate changed-input relink did not \
+                    narrow the update to the changed sections. Log:\n{}",
+                    self.name(),
+                    immediate_log
+                );
+            }
+
+            restore_immediate_changed_input.restore()?;
+            let restored_output =
+                Linker::Sld.link(self.name(), inputs, &incremental_config, cross_arch)?;
+            let restored_content = std::fs::read(&restored_output.binary).with_context(|| {
+                format!(
+                    "Failed to read restored immediate incremental output: {}",
+                    restored_output.binary.display()
+                )
+            })?;
+            if restored_content != original_content {
+                bail!(
+                    "Incremental test failed for {}: restoring immediate changed input did not \
+                    restore the seed output",
+                    self.name()
+                );
+            }
+        }
+
         let link_output_2 =
             Linker::Sld.link(self.name(), inputs, &incremental_config, cross_arch)?;
         let final_content = std::fs::read(&link_output_2.binary).with_context(|| {
@@ -2485,7 +2666,8 @@ impl ProgramInputs {
                 }
             }
         }
-        if config.platform == PlatformKind::MachO {
+        if config.platform == PlatformKind::MachO && !config.test_incremental_unsigned_macho_output
+        {
             verify_macho_signature(&link_output_2.binary)?;
         }
 
@@ -2722,7 +2904,9 @@ impl ProgramInputs {
                     self.name()
                 );
             }
-            if config.platform == PlatformKind::MachO {
+            if config.platform == PlatformKind::MachO
+                && !config.test_incremental_unsigned_macho_output
+            {
                 verify_macho_signature(&link_output_3.binary)?;
             }
 
@@ -2779,7 +2963,9 @@ impl ProgramInputs {
                     self.name()
                 );
             }
-            if config.platform == PlatformKind::MachO {
+            if config.platform == PlatformKind::MachO
+                && !config.test_incremental_unsigned_macho_output
+            {
                 verify_macho_signature(&link_output_5.binary)?;
             }
             let log = std::fs::read_to_string(&log_path).with_context(|| {
@@ -2820,7 +3006,15 @@ impl ProgramInputs {
             let fallback_message = "changed-input patch unavailable before loading inputs";
             let fallback_recorded =
                 log.contains(fallback_message) && log.contains("full relink: input file changed:");
-            if config.platform == PlatformKind::MachO {
+            let allowed_fallback_recorded = fallback_recorded
+                && config
+                    .test_incremental_changed_fallback_reason
+                    .as_ref()
+                    .is_some_and(|reason| log.contains(reason));
+            if config.platform == PlatformKind::MachO
+                && !config.test_incremental_unsigned_macho_output
+                && !config.test_incremental_private_signed_macho_output
+            {
                 if log.contains("patched ") && log.contains(" changed input file") {
                     bail!(
                         "Incremental test failed for {}: Mach-O changed-input relink patched \
@@ -2852,14 +3046,16 @@ impl ProgramInputs {
                     "patched {changed_input_count} changed input file{} before loading inputs",
                     if changed_input_count == 1 { "" } else { "s" }
                 );
-                if !log.contains(&patched_input_message) {
+                let patched_input_recorded = log.contains(&patched_input_message);
+                if !patched_input_recorded && !allowed_fallback_recorded {
                     bail!(
                         "Incremental test failed for {}: changed-input relink did not patch \
                         the changed input before loading all inputs. Log:\n{}",
                         self.name(),
                         log
                     );
-                } else {
+                }
+                if patched_input_recorded {
                     let patched_section_counts = if config
                         .test_incremental_changed_patched_section_counts
                         .is_empty()
@@ -3563,6 +3759,71 @@ fn read_u32_le(bytes: &[u8]) -> Option<u32> {
 
 fn read_u64_le(bytes: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(bytes.try_into().ok()?))
+}
+
+fn macho_regular_unwind_function_offsets(bytes: &[u8]) -> Result<HashSet<u32>> {
+    const MACHO_UNWIND_REGULAR_SECOND_LEVEL: u32 = 2;
+
+    let index_offset = read_macho_unwind_u32(bytes, 20, "index offset")? as usize;
+    let index_count = read_macho_unwind_u32(bytes, 24, "index count")? as usize;
+    let mut function_offsets = HashSet::new();
+
+    for index in 0..index_count.saturating_sub(1) {
+        let index_entry_offset = index_offset + index * 3 * size_of::<u32>();
+        let second_level_offset =
+            read_macho_unwind_u32(bytes, index_entry_offset + 4, "second-level page offset")?
+                as usize;
+        ensure!(
+            read_macho_unwind_u32(bytes, second_level_offset, "second-level page kind")?
+                == MACHO_UNWIND_REGULAR_SECOND_LEVEL,
+            "Expected sld Mach-O __unwind_info to use regular second-level pages"
+        );
+        let page_entry_offset = read_macho_unwind_u16(
+            bytes,
+            second_level_offset + size_of::<u32>(),
+            "second-level page entry offset",
+        )? as usize;
+        let page_entry_count = read_macho_unwind_u16(
+            bytes,
+            second_level_offset + size_of::<u32>() + size_of::<u16>(),
+            "second-level page entry count",
+        )? as usize;
+
+        for page_entry in 0..page_entry_count {
+            let function_offset = read_macho_unwind_u32(
+                bytes,
+                second_level_offset + page_entry_offset + page_entry * 2 * size_of::<u32>(),
+                "regular unwind function offset",
+            )?;
+            function_offsets.insert(function_offset);
+        }
+    }
+
+    Ok(function_offsets)
+}
+
+fn read_macho_unwind_u16(bytes: &[u8], offset: usize, field: &str) -> Result<u16> {
+    let end = offset
+        .checked_add(size_of::<u16>())
+        .context("Mach-O __unwind_info u16 offset overflow")?;
+    read_u16_le(
+        bytes
+            .get(offset..end)
+            .with_context(|| format!("Mach-O __unwind_info {field} is out of bounds"))?,
+    )
+    .with_context(|| format!("Failed to read Mach-O __unwind_info {field}"))
+}
+
+fn read_macho_unwind_u32(bytes: &[u8], offset: usize, field: &str) -> Result<u32> {
+    let end = offset
+        .checked_add(size_of::<u32>())
+        .context("Mach-O __unwind_info u32 offset overflow")?;
+    read_u32_le(
+        bytes
+            .get(offset..end)
+            .with_context(|| format!("Mach-O __unwind_info {field} is out of bounds"))?,
+    )
+    .with_context(|| format!("Failed to read Mach-O __unwind_info {field}"))
 }
 
 fn mutation_section_file_range(
@@ -4858,6 +5119,12 @@ impl LinkCommand {
         }
 
         if linker.is_sld() {
+            if config.test_incremental_unsigned_macho_output {
+                command.env("SLD_EXPERIMENT_UNSIGNED_PERSISTENT_OUTPUT", "1");
+            }
+            if config.test_incremental_private_signed_macho_output {
+                command.env("SLD_EXPERIMENT_PRIVATE_PERSISTENT_OUTPUT", "1");
+            }
             if matches!(config.linker_driver, LinkerDriver::Direct(_)) {
                 command.arg("--validate-output");
                 // TODO: Add a flag or do something so that unsupported flags get ignored. i.e. the
@@ -5246,30 +5513,61 @@ fn append_to_path(path: &Path, extra: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+const PUBLISHING_SECTIONS_FILE: &str = "sections-publishing";
+
 fn read_incremental_state_text(output: &Path) -> Result<String> {
     let state_dir = append_to_path(output, ".incr");
     let index_path = state_dir.join("index");
-    let mut state_text = std::fs::read_to_string(&index_path).with_context(|| {
-        format!(
-            "Failed to read incremental state `{}`",
-            index_path.display()
-        )
-    })?;
-    if let Some(sections_file) = state_text
-        .lines()
-        .find_map(|line| line.strip_prefix("sections-file\t"))
-    {
-        let sections_path = state_dir.join(sections_file);
-        let sections = std::fs::read_to_string(&sections_path).with_context(|| {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut state_text = std::fs::read_to_string(&index_path).with_context(|| {
             format!(
-                "Failed to read incremental sections `{}`",
-                sections_path.display()
+                "Failed to read incremental state `{}`",
+                index_path.display()
             )
         })?;
+        let Some(sections_file) = state_text.lines().find_map(|line| {
+            line.strip_prefix("sections-file\t")
+                .or_else(|| line.strip_prefix("indexed-sections-file\t"))
+        }) else {
+            return Ok(state_text);
+        };
+        if sections_file == PUBLISHING_SECTIONS_FILE {
+            if Instant::now() >= deadline {
+                bail!(
+                    "Timed out waiting for incremental state publication in `{}`",
+                    index_path.display()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+        let sections_path = state_dir.join(sections_file);
+        let sections = if sections_file.starts_with("sections-zstd-") {
+            let bytes = std::fs::read(&sections_path).with_context(|| {
+                format!(
+                    "Failed to read compressed incremental sections `{}`",
+                    sections_path.display()
+                )
+            })?;
+            String::from_utf8(zstd::stream::decode_all(bytes.as_slice())?).with_context(|| {
+                format!(
+                    "Invalid UTF-8 in incremental sections `{}`",
+                    sections_path.display()
+                )
+            })?
+        } else {
+            std::fs::read_to_string(&sections_path).with_context(|| {
+                format!(
+                    "Failed to read incremental sections `{}`",
+                    sections_path.display()
+                )
+            })?
+        };
         state_text.push('\n');
         state_text.push_str(&sections);
+        return Ok(state_text);
     }
-    Ok(state_text)
 }
 
 fn add_inputs_to_command(config: &Config, inputs: &[LinkerInput], command: &mut Command) {
@@ -5368,6 +5666,7 @@ impl Assertions {
             }
             object::File::MachO64(macho_obj) => {
                 self.verify_macho_build_version(&macho_obj)?;
+                self.verify_sld_macho_unwind_info(&macho_obj, linker_used)?;
                 if !self.expected_comments.is_empty() {
                     bail!("ExpectComment is not supported for MachO",);
                 }
@@ -5559,6 +5858,49 @@ impl Assertions {
             } else if !actual_comments.iter().any(|actual| actual == expected) {
                 bail!("Expected .comment `{expected}`");
             }
+        }
+
+        Ok(())
+    }
+
+    fn verify_sld_macho_unwind_info<'data>(
+        &self,
+        obj: &object::read::macho::MachOFile64<'data>,
+        linker_used: &Linker,
+    ) -> Result {
+        if self.expected_sld_macho_unwind_info.is_empty() || !linker_used.is_sld() {
+            return Ok(());
+        }
+
+        let unwind_info = obj
+            .section_by_name("__unwind_info")
+            .context("Expected Mach-O __unwind_info section")?
+            .data()
+            .context("Failed to read Mach-O __unwind_info section")?;
+        let unwind_function_offsets = macho_regular_unwind_function_offsets(unwind_info)?;
+
+        for symbol_name in &self.expected_sld_macho_unwind_info {
+            let symbol = obj
+                .symbols()
+                .find(|symbol| symbol.name().ok() == Some(symbol_name.as_str()))
+                .with_context(|| {
+                    format!("Expected Mach-O unwind symbol `{symbol_name}` to exist")
+                })?;
+            let image_offset = symbol
+                .address()
+                .checked_sub(0x1_0000_0000)
+                .and_then(|offset| u32::try_from(offset).ok())
+                .with_context(|| {
+                    format!(
+                        "Mach-O unwind symbol `{symbol_name}` address {:#x} is outside the 32-bit image range",
+                        symbol.address()
+                    )
+                })?;
+
+            ensure!(
+                unwind_function_offsets.contains(&image_offset),
+                "Expected sld Mach-O __unwind_info to contain `{symbol_name}` at image offset {image_offset:#x}, got offsets {unwind_function_offsets:#x?}"
+            );
         }
 
         Ok(())

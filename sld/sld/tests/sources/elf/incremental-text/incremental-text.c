@@ -6,6 +6,17 @@
 //#TestIncrementalChanged:true
 //#TestIncrementalChangedInput:incremental-text-value.c.o
 //#TestIncrementalChangedSection:.text.incremental_text
+//#Config:code-relocation
+//#Object:incremental-text-value.c
+//#RunEnabled:false
+//#DiffEnabled:false
+//#TestIncremental:true
+//#TestIncrementalChanged:true
+//#TestIncrementalChangedInput:incremental-text.c.o
+//#TestIncrementalChangedSection:.text
+//#Config:debug-line:code-relocation
+//#CompArgs:-g
+//#TestIncrementalChangedSection:.debug_line
 //#Config:eh-frame:incremental-text
 //#TestIncrementalChangedSection:.rela.eh_frame
 //#TestIncrementalChangedSectionOffset:16

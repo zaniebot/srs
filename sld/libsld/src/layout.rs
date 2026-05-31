@@ -4095,6 +4095,14 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
         resources: &FinaliseSizesResources<'data, '_, P>,
     ) -> Result {
         common.mem_sizes.resize(output_sections.num_parts());
+        P::finalise_object_sizes(
+            self,
+            common,
+            output_sections,
+            per_symbol_flags,
+            resources.symbol_db,
+        );
+
         if !resources.symbol_db.args.should_strip_all() {
             self.allocate_symtab_space(common, resources.symbol_db, per_symbol_flags)?;
         }
@@ -4109,14 +4117,6 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
                 );
             }
         }
-
-        P::finalise_object_sizes(
-            self,
-            common,
-            output_sections,
-            per_symbol_flags,
-            resources.symbol_db,
-        );
 
         Ok(())
     }

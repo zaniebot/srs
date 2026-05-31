@@ -79,15 +79,23 @@ save-dir. A string entry appends one zero byte to the listed file before every t
 entry with `path` and `section` flips the first byte of that ELF section instead, which is useful
 when the benchmark should prove that changed inputs also change the linked output. A table entry
 with `grow` increases the ELF section size by that many bytes, provided there is padding before the
-next object structure. To let the linked output absorb grown sections instead of relying only on
-alignment padding, pass `--incremental-padding-percent=N` in `sld_extra_flags`. The warmup run is
-not mutated, so it seeds the initial incremental state; each timed run then measures a real
-changed-input relink. Use `expect_output_change = true` with section mutations when you want the
-runner to assert that the benchmarked mutation changes the linked output, not just the input file
-metadata. Use a scratch copy of the save-dir, since this intentionally mutates inputs.
+next object structure. Mutations replace their input file atomically, matching how Rust build
+artifacts are published and preserving hardlinked prior-input snapshots used by incremental sld.
+To let the linked output absorb grown sections instead of relying only on alignment padding, pass
+`--incremental-padding-percent=N` in `sld_extra_flags`. The warmup run is not mutated, so it seeds
+the initial incremental state; each timed run then measures a real changed-input relink. Use
+`expect_output_change = true` with section mutations when you want the runner to assert that the
+benchmarked mutation changes the linked output, not just the input file metadata. Use a scratch
+copy of the save-dir, since this intentionally mutates inputs.
 When a table entry has `section` but no `path`, the runner finds the first relocatable ELF input
 with a matching section at runtime. A trailing `*` makes the section name a prefix match, which is
 useful for Rust objects with names like `.text._ZN...`.
+When a table entry has `incremental_patch`, the runner instead reads the incremental state emitted
+by the warmup sld link and finds a recorded directly patchable object or archive-member section
+with matching bytes in the linked output. This is useful for saved links where choosing an
+arbitrary section can silently measure a fallback full relink. It requires an sld benchmark binary.
+The runner resolves the section once per benchmark cohort, then mutates that same byte for every
+timed edit. The usual `expect_sld_log` and `expect_output_change` checks should still be enabled.
 
 ```toml
 [bench.ripgrep-incremental-changed]
@@ -122,6 +130,15 @@ expect_output_change = true
 save = "ripgrep"
 sld_extra_flags = ["--incremental"]
 mutate_files = [{ section = ".text.*" }]
+expect_sld_log = ["patched ", "changed input", "before loading inputs"]
+expect_output_change = true
+```
+
+```toml
+[bench.uv-incremental-recorded-patch]
+save = "uv"
+sld_extra_flags = ["--incremental"]
+mutate_files = [{ incremental_patch = "__const" }]
 expect_sld_log = ["patched ", "changed input", "before loading inputs"]
 expect_output_change = true
 ```
@@ -343,6 +360,10 @@ link.
 To figure out where sld is spending time, the first option is to run with `--time`. It's
 recommended to combine this with `--no-fork`. For example:
 
+For incremental links launched by an outer build system, set `SLD_TIME=1` instead of injecting
+`--time` into build flags. This enables the same default phase report without changing the
+compiler or build-system command line used to produce the incremental link.
+
 ```
 ~/tmp/rustc-link/0/run-with target/release/sld --strip-debug --time --no-fork
 ┌───    3.84 Open input files
@@ -408,6 +429,28 @@ SLD_PERFETTO_OUT=$HOME/tmp/tmp.pftrace ./run-with sld
 
 Open the [perfetto UI](https://ui.perfetto.dev/). Click "Open trace file" and select `tmp.pftrace`.
 Use the keys w, a, s, d to navigate (scroll and zoom).
+
+### Structured timing traces
+
+For programmatic analysis, set `SLD_TIMING_TRACE_OUT` to write a JSON timing trace. This does not
+require the `perfetto` feature and includes both the coarse phases shown by `--time` and
+fine-grained worker spans:
+
+```sh
+SLD_TIMING_TRACE_OUT=$HOME/code/tmp/link.json ./run-with sld --no-fork
+```
+
+The output is versioned as `sld-timing-trace` schema version `1`. All timestamps and durations are
+monotonic nanoseconds relative to the start of tracing. Each span records `id`, `parent_id`,
+`thread_id`, `name`, `detail`, `start_ns`, `duration_ns`, and any span attributes. A `parent_id`
+only identifies nesting in the same tracing execution context; work performed by separate worker
+threads can overlap without sharing a parent span. Consequently, agents should use the outer
+`Invocation` span for measured linker wall time and inspect overlapping detail spans for
+attribution rather than summing all detail durations.
+
+Structured tracing begins after argument parsing and before thread-pool activation. Passing
+`--no-fork` is recommended when collecting a trace for analysis so process handoff does not obscure
+the invocation being measured.
 
 ### Samply
 
