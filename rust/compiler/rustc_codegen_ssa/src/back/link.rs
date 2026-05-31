@@ -62,6 +62,10 @@ use super::{apple, rmeta_link, versioned_llvm_target};
 use crate::base::needs_allocator_shim_for_linking;
 use crate::{CodegenLintLevelSpecs, CompiledModule, CompiledModules, CrateInfo, NativeLib, errors};
 
+const SLD_RUSTC_WORK_PRODUCT_PROVENANCE_ENV: &str = "SLD_RUSTC_WORK_PRODUCT_PROVENANCE";
+const SLD_RUSTC_WORK_PRODUCT_PROVENANCE_FILE_ENV: &str = "SLD_RUSTC_WORK_PRODUCT_PROVENANCE_FILE";
+const SLD_RUSTC_WORK_PRODUCT_PROVENANCE_VERSION: &str = "sld-rustc-work-product-provenance-v1";
+
 pub fn ensure_removed(dcx: DiagCtxtHandle<'_>, path: &Path) {
     if let Err(e) = fs::remove_file(path) {
         if e.kind() != io::ErrorKind::NotFound {
@@ -871,6 +875,45 @@ fn report_linker_output(
     }
 }
 
+fn write_sld_rustc_work_product_provenance(
+    compiled_modules: &CompiledModules,
+    tmpdir: &Path,
+) -> io::Result<Option<PathBuf>> {
+    if env::var_os(SLD_RUSTC_WORK_PRODUCT_PROVENANCE_ENV).as_deref() != Some("1".as_ref()) {
+        return Ok(None);
+    }
+
+    let mut contents = format!("{SLD_RUSTC_WORK_PRODUCT_PROVENANCE_VERSION}\n");
+    for module in &compiled_modules.modules {
+        let Some(object) = &module.object else {
+            continue;
+        };
+        let Some(digest) = &module.object_digest_from_incr_cache else {
+            continue;
+        };
+        contents.push_str(&digest);
+        contents.push('\t');
+        contents.push_str(&hex_encode_path(object));
+        contents.push('\n');
+    }
+
+    let path = tmpdir.join("sld-rustc-work-product-provenance");
+    fs::write(&path, contents)?;
+    Ok(Some(path))
+}
+
+fn hex_encode_path(path: &Path) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let bytes = path.as_os_str().as_encoded_bytes();
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0xf) as usize] as char);
+    }
+    encoded
+}
+
 /// Create a dynamic library or executable.
 ///
 /// This will invoke the system linker/cc to create the resulting file. This links to all upstream
@@ -921,6 +964,16 @@ fn link_natively(
     }
     for k in sess.target.link_env_remove.as_ref() {
         cmd.env_remove(k.as_ref());
+    }
+    cmd.env_remove(SLD_RUSTC_WORK_PRODUCT_PROVENANCE_FILE_ENV);
+    match write_sld_rustc_work_product_provenance(compiled_modules, tmpdir) {
+        Ok(Some(path)) => {
+            cmd.env(SLD_RUSTC_WORK_PRODUCT_PROVENANCE_FILE_ENV, path);
+        }
+        Ok(None) => {}
+        Err(error) => {
+            warn!("failed to write SLD rustc work-product provenance: {error}");
+        }
     }
 
     for print in &sess.opts.prints {

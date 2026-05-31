@@ -491,6 +491,7 @@ fn copy_all_cgu_workproducts_to_incr_comp_cache_dir(
             &module.name,
             files.as_slice(),
             &module.links_from_incr_cache,
+            module.object_digest_from_incr_cache.as_deref(),
         ) {
             work_products.insert(id, product);
         }
@@ -927,9 +928,15 @@ fn execute_copy_from_cache_work_item(
     if should_emit_obj && object.is_none() {
         dcx.emit_fatal(errors::NoSavedObjectFile { cgu_name: &module.name })
     }
+    let object_digest_from_incr_cache = object.as_ref().and_then(|_| {
+        let saved_object_file = module.source.saved_files.get(OutputType::Object.extension())?;
+        let object = in_incr_comp_dir(incr_comp_session_dir, saved_object_file);
+        rustc_incremental::read_sld_cgu_object_digest(&object, &module.source)
+    });
 
     CompiledModule {
         links_from_incr_cache,
+        object_digest_from_incr_cache,
         kind: ModuleKind::Regular,
         name: module.name,
         object,

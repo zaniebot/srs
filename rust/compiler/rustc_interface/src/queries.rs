@@ -96,6 +96,7 @@ impl Linker {
                     "metadata",
                     &[("rmeta", path)],
                     &[],
+                    None,
                 )
         {
             work_products.insert(id, product);
