@@ -313,9 +313,12 @@ fn link_rlib<'a>(
         .filter_map(|m| m.object.as_ref())
         .map(|obj| obj.file_name().unwrap().to_str().unwrap().to_string())
         .collect();
+    let link_content_digest = matches!(flavor, RlibFlavor::Normal)
+        .then(|| rlib_link_content_digest(sess, compiled_modules, crate_info))
+        .flatten();
 
     let metadata_link_file = if matches!(flavor, RlibFlavor::Normal) {
-        let metadata_link = rmeta_link::RmetaLink { rust_object_files };
+        let metadata_link = rmeta_link::RmetaLink { rust_object_files, link_content_digest };
         let metadata_link_data = metadata_link.encode();
         let (wrapper, _) =
             create_wrapper_file(sess, rmeta_link::SECTION.to_string(), &metadata_link_data);
@@ -470,6 +473,28 @@ fn link_rlib<'a>(
     }
 
     ab
+}
+
+fn rlib_link_content_digest(
+    sess: &Session,
+    compiled_modules: &CompiledModules,
+    crate_info: &CrateInfo,
+) -> Option<String> {
+    if env::var_os(SLD_RUSTC_WORK_PRODUCT_PROVENANCE_ENV).as_deref() != Some("1".as_ref())
+        || sess.target.is_like_windows
+        || !crate_info.used_libraries.is_empty()
+        || compiled_modules.modules.iter().any(|module| module.dwarf_object.is_some())
+    {
+        return None;
+    }
+
+    let objects = compiled_modules
+        .modules
+        .iter()
+        .filter(|module| module.object.is_some())
+        .map(|module| Some((module.name.as_str(), module.object_digest.as_deref()?)))
+        .collect::<Option<Vec<_>>>()?;
+    rmeta_link::link_content_digest(objects)
 }
 
 /// Create a static archive.
