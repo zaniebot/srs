@@ -1139,6 +1139,7 @@ pub(crate) fn stabilize_rustc_transient_inputs(args: &mut crate::args::Args) -> 
     let previous = provenance
         .as_ref()
         .and_then(|_| PersistedState::read_metadata(&state_dir).unwrap_or_default());
+    let previous_inputs_by_path = previous_input_files_by_path(previous.as_ref());
     let mut stabilized = 0;
     let mut matched_producer_digests = 0;
     let mut reused_isolated = 0;
@@ -1158,7 +1159,11 @@ pub(crate) fn stabilize_rustc_transient_inputs(args: &mut crate::args::Args) -> 
             matched_producer_digests += 1;
         }
         let reused_producer_digest = producer_digest.is_some_and(|digest| {
-            stable_rustc_input_matches_previous_producer_digest(previous.as_ref(), &target, digest)
+            stable_rustc_input_matches_previous_producer_digest(
+                &previous_inputs_by_path,
+                &target,
+                digest,
+            )
         });
         if reused_producer_digest {
             reused_isolated += 1;
@@ -1315,19 +1320,25 @@ fn is_blake3_hex_digest(digest: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn previous_input_files_by_path(previous: Option<&PersistedState>) -> HashMap<&str, &FileState> {
+    let Some(previous) = previous else {
+        return HashMap::new();
+    };
+    let mut inputs_by_path = HashMap::with_capacity(previous.input_files.len());
+    for input in &previous.input_files {
+        inputs_by_path.entry(input.path.as_str()).or_insert(input);
+    }
+    inputs_by_path
+}
+
 fn stable_rustc_input_matches_previous_producer_digest(
-    previous: Option<&PersistedState>,
+    previous_inputs_by_path: &HashMap<&str, &FileState>,
     target: &Path,
     digest: &str,
 ) -> bool {
     let encoded_target = encode_path(target);
-    previous
-        .and_then(|previous| {
-            previous
-                .input_files
-                .iter()
-                .find(|input| input.path == encoded_target)
-        })
+    previous_inputs_by_path
+        .get(encoded_target.as_str())
         .is_some_and(|input| {
             input.content.hash == digest
                 && input.content.identity_matches_path(target).unwrap_or(false)
@@ -13979,15 +13990,26 @@ mod tests {
         previous.input_files[0].path = encode_path(&target);
         previous.input_files[0].content = FileContentState::from_path(&target).unwrap();
         let digest = hash_bytes(b"codegen");
+        let previous_inputs_by_path = previous_input_files_by_path(Some(&previous));
         assert!(stable_rustc_input_matches_previous_producer_digest(
-            Some(&previous),
+            &previous_inputs_by_path,
             &target,
             &digest
         ));
         assert!(!stable_rustc_input_matches_previous_producer_digest(
-            Some(&previous),
+            &previous_inputs_by_path,
             &target,
             &hash_bytes(b"different")
+        ));
+
+        let mut duplicate_previous = previous.clone();
+        let mut duplicate = duplicate_previous.input_files[0].clone();
+        duplicate.content.hash = hash_bytes(b"different");
+        duplicate_previous.input_files.insert(0, duplicate);
+        assert!(!stable_rustc_input_matches_previous_producer_digest(
+            &previous_input_files_by_path(Some(&duplicate_previous)),
+            &target,
+            &digest
         ));
 
         assert!(std::fs::write(&target, b"changed").is_err());
@@ -13995,7 +14017,7 @@ mod tests {
         std::fs::write(&replacement, b"changed").unwrap();
         std::fs::rename(replacement, &target).unwrap();
         assert!(!stable_rustc_input_matches_previous_producer_digest(
-            Some(&previous),
+            &previous_inputs_by_path,
             &target,
             &digest
         ));
