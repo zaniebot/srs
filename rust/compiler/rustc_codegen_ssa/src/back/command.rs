@@ -75,6 +75,7 @@ impl Command {
     }
 
     fn _env(&mut self, key: &OsStr, value: &OsStr) {
+        self.env_remove.retain(|removed| removed != key);
         self.env.push((key.to_owned(), value.to_owned()));
     }
 
@@ -92,6 +93,7 @@ impl Command {
     }
 
     fn _env_remove(&mut self, key: &OsStr) {
+        self.env.retain(|(existing, _)| existing != key);
         self.env_remove.push(key.to_owned());
     }
 
@@ -209,5 +211,29 @@ impl Command {
 impl fmt::Debug for Command {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.command().fmt(f)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Command;
+
+    #[test]
+    fn environment_changes_use_last_operation() {
+        let mut command = Command::new("echo");
+        command.env_remove("REMOVED_THEN_SET");
+        command.env("REMOVED_THEN_SET", "present");
+        command.env("SET_THEN_REMOVED", "absent");
+        command.env_remove("SET_THEN_REMOVED");
+
+        let command = command.command();
+        assert_eq!(
+            command.get_envs().find(|(key, _)| *key == "REMOVED_THEN_SET"),
+            Some(("REMOVED_THEN_SET".as_ref(), Some("present".as_ref())))
+        );
+        assert_eq!(
+            command.get_envs().find(|(key, _)| *key == "SET_THEN_REMOVED"),
+            Some(("SET_THEN_REMOVED".as_ref(), None))
+        );
     }
 }
