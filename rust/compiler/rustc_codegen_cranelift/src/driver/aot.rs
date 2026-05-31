@@ -80,7 +80,11 @@ impl OngoingCodegen {
                 Ok(module_codegen_result) => module_codegen_result,
                 Err(err) => sess.dcx().fatal(err),
             };
-            let ModuleCodegenResult { module_regular, module_global_asm, existing_work_product } =
+            let ModuleCodegenResult {
+                mut module_regular,
+                module_global_asm,
+                existing_work_product,
+            } =
                 module_codegen_result;
 
             if let Some((work_product_id, work_product)) = existing_work_product {
@@ -108,7 +112,8 @@ impl OngoingCodegen {
                         None,
                     )
                 };
-                if let Some((work_product_id, work_product)) = work_product {
+                if let Some((work_product_id, work_product, object_digest)) = work_product {
+                    module_regular.object_digest = object_digest;
                     work_products.insert(work_product_id, work_product);
                 }
             }
@@ -185,7 +190,7 @@ fn emit_cgu(
             assembly: None,
             llvm_ir: None,
             links_from_incr_cache: Vec::new(),
-            object_digest_from_incr_cache: None,
+            object_digest: None,
         }),
         existing_work_product: None,
     })
@@ -243,7 +248,7 @@ fn emit_module(
         assembly: None,
         llvm_ir: None,
         links_from_incr_cache: Vec::new(),
-        object_digest_from_incr_cache: None,
+        object_digest: None,
     })
 }
 
@@ -296,7 +301,7 @@ fn reuse_workproduct_for_cgu(
             assembly: None,
             llvm_ir: None,
             links_from_incr_cache: vec![source_file_regular.clone()],
-            object_digest_from_incr_cache: rustc_incremental::read_sld_cgu_object_digest(
+            object_digest: rustc_incremental::read_sld_cgu_object_digest(
                 &source_file_regular,
                 &work_product,
             ),
@@ -310,7 +315,7 @@ fn reuse_workproduct_for_cgu(
             assembly: None,
             llvm_ir: None,
             links_from_incr_cache: vec![source_file],
-            object_digest_from_incr_cache: None,
+            object_digest: None,
         }),
         existing_work_product: Some((cgu.work_product_id(), work_product)),
     })

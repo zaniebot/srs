@@ -888,7 +888,7 @@ fn write_sld_rustc_work_product_provenance(
         let Some(object) = &module.object else {
             continue;
         };
-        let Some(digest) = &module.object_digest_from_incr_cache else {
+        let Some(digest) = &module.object_digest else {
             continue;
         };
         contents.push_str(&digest);

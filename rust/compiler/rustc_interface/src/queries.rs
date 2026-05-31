@@ -90,7 +90,7 @@ impl Linker {
 
         if sess.opts.incremental.is_some()
             && let Some(path) = self.metadata.path()
-            && let Some((id, product)) =
+            && let Some((id, product, _)) =
                 rustc_incremental::copy_cgu_workproduct_to_incr_comp_cache_dir(
                     sess,
                     "metadata",

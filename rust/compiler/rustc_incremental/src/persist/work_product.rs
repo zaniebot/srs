@@ -26,11 +26,12 @@ pub fn copy_cgu_workproduct_to_incr_comp_cache_dir(
     files: &[(&'static str, &Path)],
     known_links: &[PathBuf],
     known_object_digest: Option<&str>,
-) -> Option<(WorkProductId, WorkProduct)> {
+) -> Option<(WorkProductId, WorkProduct, Option<String>)> {
     debug!(?cgu_name, ?files);
     sess.opts.incremental.as_ref()?;
 
     let mut saved_files = UnordMap::default();
+    let mut object_digest = None;
     for (ext, path) in files {
         let file_name = format!("{cgu_name}.{ext}");
         let path_in_incr_dir = in_incr_comp_dir_sess(sess, &file_name);
@@ -45,7 +46,7 @@ pub fn copy_cgu_workproduct_to_incr_comp_cache_dir(
         }
         let _ = saved_files.insert(ext.to_string(), file_name);
         if *ext == "o" {
-            track_sld_cgu_object_digest(
+            object_digest = track_sld_cgu_object_digest(
                 cgu_name,
                 &path_in_incr_dir,
                 reused,
@@ -58,7 +59,7 @@ pub fn copy_cgu_workproduct_to_incr_comp_cache_dir(
     let work_product = WorkProduct { cgu_name: cgu_name.to_string(), saved_files };
     debug!(?work_product);
     let work_product_id = WorkProductId::from_cgu_name(cgu_name);
-    Some((work_product_id, work_product))
+    Some((work_product_id, work_product, object_digest))
 }
 
 fn track_sld_cgu_object_digest(
@@ -67,11 +68,11 @@ fn track_sld_cgu_object_digest(
     reused: bool,
     known_digest: Option<&str>,
     saved_files: &mut UnordMap<String, String>,
-) {
+) -> Option<String> {
     let digest_path = sld_cgu_object_digest_path(object_path, cgu_name);
     if env::var_os(SLD_RUSTC_WORK_PRODUCT_PROVENANCE_ENV).as_deref() != Some("1".as_ref()) {
         remove_sld_cgu_object_digest(&digest_path);
-        return;
+        return None;
     }
     let existing_digest = read_sld_cgu_object_digest_file(&digest_path);
     if !can_reuse_sld_cgu_object_digest(reused, existing_digest.as_deref(), known_digest)
@@ -79,14 +80,16 @@ fn track_sld_cgu_object_digest(
     {
         debug!("failed to write SLD CGU object digest for `{}`: {error}", object_path.display());
         remove_sld_cgu_object_digest(&digest_path);
-        return;
+        return None;
     }
-    if read_sld_cgu_object_digest_file(&digest_path).is_some()
+    if let Some(digest) = read_sld_cgu_object_digest_file(&digest_path)
         && let Some(file_name) = digest_path.file_name().and_then(|name| name.to_str())
     {
         let _ = saved_files.insert(SLD_CGU_OBJECT_DIGEST_FILE_ID.to_owned(), file_name.to_owned());
+        Some(digest)
     } else {
         debug!("ignored malformed SLD CGU object digest for `{}`", object_path.display());
+        None
     }
 }
 

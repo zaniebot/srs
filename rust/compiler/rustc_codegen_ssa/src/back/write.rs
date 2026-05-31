@@ -459,7 +459,7 @@ pub(crate) fn start_async_codegen<B: ExtraBackendMethods>(
 
 fn copy_all_cgu_workproducts_to_incr_comp_cache_dir(
     sess: &Session,
-    compiled_modules: &CompiledModules,
+    compiled_modules: &mut CompiledModules,
 ) -> FxIndexMap<WorkProductId, WorkProduct> {
     let mut work_products = FxIndexMap::default();
 
@@ -469,7 +469,7 @@ fn copy_all_cgu_workproducts_to_incr_comp_cache_dir(
 
     let _timer = sess.timer("copy_all_cgu_workproducts_to_incr_comp_cache_dir");
 
-    for module in compiled_modules.modules.iter().filter(|m| m.kind == ModuleKind::Regular) {
+    for module in compiled_modules.modules.iter_mut().filter(|m| m.kind == ModuleKind::Regular) {
         let mut files = Vec::new();
         if let Some(object_file_path) = &module.object {
             files.push((OutputType::Object.extension(), object_file_path.as_path()));
@@ -486,13 +486,14 @@ fn copy_all_cgu_workproducts_to_incr_comp_cache_dir(
         if let Some(path) = &module.bytecode {
             files.push((OutputType::Bitcode.extension(), path.as_path()));
         }
-        if let Some((id, product)) = copy_cgu_workproduct_to_incr_comp_cache_dir(
+        if let Some((id, product, object_digest)) = copy_cgu_workproduct_to_incr_comp_cache_dir(
             sess,
             &module.name,
             files.as_slice(),
             &module.links_from_incr_cache,
-            module.object_digest_from_incr_cache.as_deref(),
+            module.object_digest.as_deref(),
         ) {
+            module.object_digest = object_digest;
             work_products.insert(id, product);
         }
     }
@@ -928,7 +929,7 @@ fn execute_copy_from_cache_work_item(
     if should_emit_obj && object.is_none() {
         dcx.emit_fatal(errors::NoSavedObjectFile { cgu_name: &module.name })
     }
-    let object_digest_from_incr_cache = object.as_ref().and_then(|_| {
+    let object_digest = object.as_ref().and_then(|_| {
         let saved_object_file = module.source.saved_files.get(OutputType::Object.extension())?;
         let object = in_incr_comp_dir(incr_comp_session_dir, saved_object_file);
         rustc_incremental::read_sld_cgu_object_digest(&object, &module.source)
@@ -936,7 +937,7 @@ fn execute_copy_from_cache_work_item(
 
     CompiledModule {
         links_from_incr_cache,
-        object_digest_from_incr_cache,
+        object_digest,
         kind: ModuleKind::Regular,
         name: module.name,
         object,
@@ -2184,7 +2185,7 @@ impl<B: WriteBackendMethods> OngoingCodegen<B> {
         compiled_modules.modules.sort_by(|a, b| a.name.cmp(&b.name));
 
         let work_products =
-            copy_all_cgu_workproducts_to_incr_comp_cache_dir(sess, &compiled_modules);
+            copy_all_cgu_workproducts_to_incr_comp_cache_dir(sess, &mut compiled_modules);
         produce_final_output_artifacts(sess, &compiled_modules, &self.output_filenames);
 
         (compiled_modules, work_products)
