@@ -53,7 +53,8 @@ use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-const STATE_VERSION: &str = "sld-incremental-state-v34";
+const STATE_VERSION: &str = "sld-incremental-state-v35";
+const STATE_VERSION_V34: &str = "sld-incremental-state-v34";
 const STATE_VERSION_V33: &str = "sld-incremental-state-v33";
 const STATE_VERSION_V32: &str = "sld-incremental-state-v32";
 const STATE_VERSION_V31: &str = "sld-incremental-state-v31";
@@ -122,7 +123,7 @@ const GENERATED_RELA_DYN_GENERAL: &str = "generated:.rela.dyn.general";
 const BUILD_ID_HASH_GROUP_CHUNKS: usize = 64;
 const BUILD_ID_HASH_GROUP_LEN: usize = blake3::CHUNK_LEN * BUILD_ID_HASH_GROUP_CHUNKS;
 const BUILD_ID_HASH_PARALLEL_THRESHOLD: usize = BUILD_ID_HASH_GROUP_LEN * 8;
-const PARALLEL_ARCHIVE_PATCH_FINGERPRINT_PREFIX: &str = "parallel-archive-members-v1:";
+const PARALLEL_ARCHIVE_PATCH_FINGERPRINT_PREFIX: &str = "parallel-archive-members-v2:";
 const ABSENT_FIELD: &str = "-";
 const RECORD_TEXT_INTERNER_SHARDS: usize = 64;
 const RECORD_BUFFER_SHARDS: usize = 64;
@@ -435,7 +436,7 @@ struct FilePatchState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ArchiveMemberSetProof {
     raw_ordered_hash: String,
-    normalized_multiset_hash: String,
+    normalized_ordered_hash: String,
     member_count: usize,
     rustc_link_content_digest: Option<String>,
 }
@@ -2191,28 +2192,7 @@ fn patch_changed_inputs(
                     path.display()
                 )));
             };
-            let legacy_fingerprint = if fingerprint != previous_patch.fingerprint
-                && fingerprint.starts_with(PARALLEL_ARCHIVE_PATCH_FINGERPRINT_PREFIX)
-                && !previous_patch
-                    .fingerprint
-                    .starts_with(PARALLEL_ARCHIVE_PATCH_FINGERPRINT_PREFIX)
-            {
-                patch_fingerprint_with_resolver_legacy_archive(
-                    &bytes,
-                    input.path.as_str(),
-                    current_sections.iter().cloned(),
-                    fingerprint_extra_ranges.iter().cloned(),
-                    &current_resolver,
-                    PatchInputLookup::MatchArchiveMember,
-                )?
-            } else {
-                None
-            };
-            if !patch_fingerprint_matches_previous_or_legacy_archive(
-                fingerprint.as_str(),
-                previous_patch.fingerprint.as_str(),
-                legacy_fingerprint.as_deref(),
-            ) {
+            if fingerprint != previous_patch.fingerprint {
                 let previous_snapshot_bytes = {
                     timing_phase!("Read previous incremental input snapshot");
                     previous_snapshot_bytes.get()?
@@ -3018,28 +2998,7 @@ fn classify_normalized_rust_archive_patch_state(
     else {
         return Ok(NormalizedRustArchivePatchState::Unknown);
     };
-    let legacy_fingerprint = if fingerprint != previous_patch.fingerprint
-        && fingerprint.starts_with(PARALLEL_ARCHIVE_PATCH_FINGERPRINT_PREFIX)
-        && !previous_patch
-            .fingerprint
-            .starts_with(PARALLEL_ARCHIVE_PATCH_FINGERPRINT_PREFIX)
-    {
-        patch_fingerprint_with_resolver_legacy_archive(
-            bytes,
-            input.path.as_str(),
-            current_sections.iter().cloned(),
-            std::iter::empty(),
-            &resolver,
-            PatchInputLookup::MatchArchiveMember,
-        )?
-    } else {
-        None
-    };
-    if !patch_fingerprint_matches_previous_or_legacy_archive(
-        fingerprint.as_str(),
-        previous_patch.fingerprint.as_str(),
-        legacy_fingerprint.as_deref(),
-    ) {
+    if fingerprint != previous_patch.fingerprint {
         return Ok(NormalizedRustArchivePatchState::Unknown);
     }
     Ok(NormalizedRustArchivePatchState::Unchanged(FilePatchState {
@@ -4619,6 +4578,7 @@ impl PersistedState {
         let mut lines = contents.lines().peekable();
         let version = lines.next().context("Missing incremental state header")?;
         if version != STATE_VERSION
+            && version != STATE_VERSION_V34
             && version != STATE_VERSION_V33
             && version != STATE_VERSION_V32
             && version != STATE_VERSION_V31
@@ -4732,6 +4692,7 @@ impl PersistedState {
         let mut fdes = Vec::new();
         let mut dynamic_relocations = Vec::new();
         let sections = if version == STATE_VERSION
+            || version == STATE_VERSION_V34
             || version == STATE_VERSION_V33
             || version == STATE_VERSION_V32
             || version == STATE_VERSION_V31
@@ -4767,13 +4728,14 @@ impl PersistedState {
                 .context("Missing incremental section input count")?;
             if first_line.starts_with("indexed-sections-file\t") {
                 if version != STATE_VERSION
+                    && version != STATE_VERSION_V34
                     && version != STATE_VERSION_V33
                     && version != STATE_VERSION_V32
                     && version != STATE_VERSION_V31
                     && version != STATE_VERSION_V30
                 {
                     return Err(crate::error!(
-                        "Indexed incremental sections require incremental state version `{STATE_VERSION}`, `{STATE_VERSION_V33}`, `{STATE_VERSION_V32}`, `{STATE_VERSION_V31}`, or `{STATE_VERSION_V30}`"
+                        "Indexed incremental sections require incremental state version `{STATE_VERSION}`, `{STATE_VERSION_V34}`, `{STATE_VERSION_V33}`, `{STATE_VERSION_V32}`, `{STATE_VERSION_V31}`, or `{STATE_VERSION_V30}`"
                     ));
                 }
                 let file =
@@ -6947,7 +6909,7 @@ fn archive_members_match_snapshot(
     current_bytes: &[u8],
     normalize_rust_archive_patch_inputs: bool,
 ) -> Result<bool> {
-    let mut current_members = if normalize_rust_archive_patch_inputs {
+    let current_members = if normalize_rust_archive_patch_inputs {
         archive_member_patch_identifiers(current_bytes)?
     } else {
         archive_member_identifiers(current_bytes)?
@@ -6958,39 +6920,18 @@ fn archive_members_match_snapshot(
     let Some(previous_bytes) = previous_bytes else {
         return Ok(false);
     };
-    let mut previous_members = if normalize_rust_archive_patch_inputs {
+    let previous_members = if normalize_rust_archive_patch_inputs {
         archive_member_patch_identifiers(previous_bytes)?
     } else {
         archive_member_identifiers(previous_bytes)?
     };
-    if !normalize_rust_archive_patch_inputs {
-        return Ok(previous_members == current_members);
-    }
-    if let Some(members) = current_members.as_mut() {
-        members.sort_unstable();
-    }
-    if let Some(members) = previous_members.as_mut() {
-        members.sort_unstable();
-    }
     let members_match = previous_members == current_members;
     if !members_match {
         if let (Some(previous), Some(current)) = (&previous_members, &current_members) {
-            let missing = previous
-                .iter()
-                .filter(|member| current.binary_search(member).is_err())
-                .take(3)
-                .map(|member| String::from_utf8_lossy(member).into_owned())
-                .collect::<Vec<_>>();
-            let added = current
-                .iter()
-                .filter(|member| previous.binary_search(member).is_err())
-                .take(3)
-                .map(|member| String::from_utf8_lossy(member).into_owned())
-                .collect::<Vec<_>>();
             append_log(
                 state_dir,
                 &format!(
-                    "archive member identifier multiset differed: previous={} current={} missing={missing:?} added={added:?}",
+                    "archive member identifier sequence differed: previous={} current={}",
                     previous.len(),
                     current.len(),
                 ),
@@ -7018,7 +6959,7 @@ fn archive_member_set_proof_matches_current(
     };
     let previous_proof = previous_proof?;
     let hashes_match = if normalize_rust_archive_patch_inputs {
-        previous_proof.normalized_multiset_hash == current_proof.normalized_multiset_hash
+        previous_proof.normalized_ordered_hash == current_proof.normalized_ordered_hash
     } else {
         previous_proof.raw_ordered_hash == current_proof.raw_ordered_hash
     };
@@ -7071,18 +7012,17 @@ fn archive_member_set_proof(bytes: &[u8]) -> Result<Option<ArchiveMemberSetProof
     let Some(raw_members) = archive_member_identifiers(bytes)? else {
         return Ok(None);
     };
-    let mut normalized_members = raw_members
+    let normalized_members = raw_members
         .iter()
         .map(|member| archive_member_patch_identifier(member))
         .collect::<Vec<_>>();
-    normalized_members.sort_unstable();
     Ok(Some(ArchiveMemberSetProof {
         raw_ordered_hash: archive_member_identifier_list_hash(
             b"sld-archive-members-raw-ordered-v1",
             &raw_members,
         ),
-        normalized_multiset_hash: archive_member_identifier_list_hash(
-            b"sld-archive-members-normalized-multiset-v1",
+        normalized_ordered_hash: archive_member_identifier_list_hash(
+            b"sld-archive-members-normalized-ordered-v2",
             &normalized_members,
         ),
         member_count: raw_members.len(),
@@ -7362,8 +7302,6 @@ fn archive_patch_fingerprint(
             ArchiveEntry::Thin(_) => return Ok(None),
         }
     }
-    members.sort_by(|left, right| left.0.cmp(&right.0));
-
     let member_hashes = members
         .par_iter()
         .map(|(identifier, data, data_offset)| {
@@ -7382,7 +7320,7 @@ fn archive_patch_fingerprint(
         .collect::<Vec<_>>();
 
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"sld-parallel-archive-patch-fingerprint-v1");
+    hasher.update(b"sld-parallel-archive-patch-fingerprint-v2");
     for ((identifier, _, _), member_hash) in members.into_iter().zip(member_hashes) {
         let Some(member_hash) = member_hash else {
             continue;
@@ -7395,76 +7333,6 @@ fn archive_patch_fingerprint(
         "{PARALLEL_ARCHIVE_PATCH_FINGERPRINT_PREFIX}{}",
         hasher.finalize().to_hex()
     )))
-}
-
-fn legacy_archive_patch_fingerprint(
-    bytes: &[u8],
-    ranges: &[std::ops::Range<usize>],
-) -> Result<Option<String>> {
-    let Ok(archive) = ArchiveIterator::from_archive_bytes(bytes) else {
-        return Ok(None);
-    };
-    let mut members = Vec::new();
-    let mut is_rust_archive = false;
-    for entry in archive {
-        match entry? {
-            ArchiveEntry::Regular(content) => {
-                let identifier = archive_member_patch_identifier(content.ident.as_slice());
-                is_rust_archive |= identifier != content.ident.as_slice();
-                members.push((identifier, content.entry_data, content.data_offset));
-            }
-            ArchiveEntry::Thin(_) => return Ok(None),
-        }
-    }
-    members.sort_by(|left, right| left.0.cmp(&right.0));
-
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"sld-archive-patch-fingerprint-v1");
-    for (identifier, data, data_offset) in members {
-        if identifier.starts_with(b"__.SYMDEF")
-            || (is_rust_archive
-                && matches!(identifier.as_slice(), b"lib.rmeta" | b"lib.rmeta-link"))
-        {
-            continue;
-        }
-        hasher.update(&(identifier.len() as u64).to_le_bytes());
-        hasher.update(&identifier);
-        hasher.update(&(data.len() as u64).to_le_bytes());
-        update_hash_with_ranges(&mut hasher, data, data_offset, ranges);
-    }
-    Ok(Some(hasher.finalize().to_hex().to_string()))
-}
-
-fn patch_fingerprint_with_resolver_legacy_archive(
-    bytes: &[u8],
-    input_file_path: &str,
-    sections: impl IntoIterator<Item = PatchSection>,
-    extra_ranges: impl IntoIterator<Item = std::ops::Range<usize>>,
-    resolver: &PatchInputResolver<'_>,
-    lookup: PatchInputLookup,
-) -> Result<Option<String>> {
-    let Some(mut ranges) =
-        patch_ranges_with_resolver(bytes, input_file_path, sections, resolver, lookup)?
-    else {
-        return Ok(None);
-    };
-    ranges.extend(extra_ranges);
-    dedup_ranges(&mut ranges);
-    let Some(ranges) = normalize_patch_ranges(ranges, bytes.len()) else {
-        return Ok(None);
-    };
-    legacy_archive_patch_fingerprint(bytes, &ranges)
-}
-
-fn patch_fingerprint_matches_previous_or_legacy_archive(
-    fingerprint: &str,
-    previous_fingerprint: &str,
-    legacy_fingerprint: Option<&str>,
-) -> bool {
-    fingerprint == previous_fingerprint
-        || (fingerprint.starts_with(PARALLEL_ARCHIVE_PATCH_FINGERPRINT_PREFIX)
-            && !previous_fingerprint.starts_with(PARALLEL_ARCHIVE_PATCH_FINGERPRINT_PREFIX)
-            && legacy_fingerprint == Some(previous_fingerprint))
 }
 
 fn update_hash_with_ranges(
@@ -12140,7 +12008,7 @@ fn render_archive_member_set_proof(proof: &ArchiveMemberSetProof) -> String {
     format!(
         "{}:{}:{}:{}",
         proof.raw_ordered_hash,
-        proof.normalized_multiset_hash,
+        proof.normalized_ordered_hash,
         proof.member_count,
         proof
             .rustc_link_content_digest
@@ -12155,7 +12023,7 @@ fn parse_archive_member_set_proof(proof: &str) -> Result<ArchiveMemberSetProof> 
         .next()
         .context("Malformed incremental archive member-set proof")?
         .to_owned();
-    let normalized_multiset_hash = parts
+    let normalized_ordered_hash = parts
         .next()
         .context("Malformed incremental archive member-set proof")?
         .to_owned();
@@ -12183,7 +12051,7 @@ fn parse_archive_member_set_proof(proof: &str) -> Result<ArchiveMemberSetProof> 
     }
     Ok(ArchiveMemberSetProof {
         raw_ordered_hash,
-        normalized_multiset_hash,
+        normalized_ordered_hash,
         member_count,
         rustc_link_content_digest,
     })
@@ -13384,10 +13252,24 @@ fn copy_snapshot_bytes(source: &Path, target: &Path) -> Result {
 }
 
 fn copy_isolated_snapshot_bytes(source: &Path, target: &Path) -> Result {
-    if clone_snapshot_bytes(source, target) {
-        return Ok(());
+    if !clone_snapshot_bytes(source, target) {
+        copy_file_bytes(source, target)?;
     }
-    copy_file_bytes(source, target)
+    let mut permissions = std::fs::metadata(target)
+        .with_context(|| {
+            format!(
+                "Failed to read isolated incremental input snapshot `{}`",
+                target.display()
+            )
+        })?
+        .permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(target, permissions).with_context(|| {
+        format!(
+            "Failed to protect isolated incremental input snapshot `{}`",
+            target.display()
+        )
+    })
 }
 
 fn copy_file_bytes(source: &Path, target: &Path) -> Result {
@@ -14108,7 +13990,10 @@ mod tests {
             &hash_bytes(b"different")
         ));
 
-        std::fs::write(&target, b"changed").unwrap();
+        assert!(std::fs::write(&target, b"changed").is_err());
+        let replacement = target.with_extension("replacement");
+        std::fs::write(&replacement, b"changed").unwrap();
+        std::fs::rename(replacement, &target).unwrap();
         assert!(!stable_rustc_input_matches_previous_producer_digest(
             Some(&previous),
             &target,
@@ -18101,25 +17986,34 @@ mod tests {
             archive_patch_fingerprint(&changed, &[]).unwrap()
         );
         let fingerprint = archive_patch_fingerprint(&previous, &[]).unwrap().unwrap();
-        let legacy_fingerprint = legacy_archive_patch_fingerprint(&previous, &[])
-            .unwrap()
-            .unwrap();
         assert!(fingerprint.starts_with(PARALLEL_ARCHIVE_PATCH_FINGERPRINT_PREFIX));
-        assert_ne!(fingerprint, legacy_fingerprint);
-        assert!(patch_fingerprint_matches_previous_or_legacy_archive(
-            fingerprint.as_str(),
-            legacy_fingerprint.as_str(),
-            Some(legacy_fingerprint.as_str()),
-        ));
-        assert!(!patch_fingerprint_matches_previous_or_legacy_archive(
-            fingerprint.as_str(),
-            legacy_fingerprint.as_str(),
-            None,
-        ));
         assert_ne!(
             patch_fingerprint_from_ranges(&previous, vec![0..1], std::iter::empty(), false)
                 .unwrap(),
             patch_fingerprint_from_ranges(&renamed, vec![0..1], std::iter::empty(), false).unwrap()
+        );
+    }
+
+    #[test]
+    fn archive_patch_fingerprint_preserves_native_member_order() {
+        let archive = |members: &[(&[u8], &[u8])]| {
+            let mut builder = ar::Builder::new(Vec::new());
+            for (identifier, bytes) in members {
+                builder
+                    .append(
+                        &ar::Header::new(identifier.to_vec(), bytes.len() as u64),
+                        *bytes,
+                    )
+                    .unwrap();
+            }
+            builder.into_inner().unwrap()
+        };
+        let previous = archive(&[(b"first.o", b"first"), (b"second.o", b"second")]);
+        let reordered = archive(&[(b"second.o", b"second"), (b"first.o", b"first")]);
+
+        assert_ne!(
+            archive_patch_fingerprint(&previous, &[]).unwrap(),
+            archive_patch_fingerprint(&reordered, &[]).unwrap()
         );
     }
 
@@ -18195,35 +18089,6 @@ mod tests {
             &mismatched_state,
             NormalizedRustArchivePatchState::Unknown
         ));
-
-        let resolver = PatchInputResolver::new(&previous, true).unwrap();
-        let legacy_previous_patch = PreviousPatchState {
-            fingerprint: patch_fingerprint_with_resolver_legacy_archive(
-                &previous,
-                input.path.as_str(),
-                [section.clone()],
-                std::iter::empty(),
-                &resolver,
-                PatchInputLookup::MatchArchiveMember,
-            )
-            .unwrap()
-            .unwrap(),
-            sections: vec![section],
-        };
-        let migrated_state =
-            classify_normalized_rust_archive_patch_state(&input, &current, &legacy_previous_patch)
-                .unwrap();
-        assert!(matches!(
-            &migrated_state,
-            NormalizedRustArchivePatchState::Unchanged(_)
-        ));
-        if let NormalizedRustArchivePatchState::Unchanged(migrated) = migrated_state {
-            assert!(
-                migrated
-                    .fingerprint
-                    .starts_with(PARALLEL_ARCHIVE_PATCH_FINGERPRINT_PREFIX)
-            );
-        }
 
         let mut changed_object = growable_data_elf();
         changed_object[0x40] = 9;
@@ -18359,7 +18224,7 @@ mod tests {
     }
 
     #[test]
-    fn archive_member_set_proofs_distinguish_raw_order_and_normalize_rustc_invocations() {
+    fn archive_member_set_proofs_preserve_order_and_normalize_rustc_invocations() {
         let archive = |members: &[&[u8]]| {
             let mut builder = ar::Builder::new(Vec::new());
             for member in members {
@@ -18373,8 +18238,10 @@ mod tests {
             builder.into_inner().unwrap()
         };
         let previous = archive(&[b"first.o", b"crate-hash.cgu.old.rcgu.o"]);
+        let renamed = archive(&[b"first.o", b"crate-hash.cgu.new.rcgu.o"]);
         let reordered = archive(&[b"crate-hash.cgu.new.rcgu.o", b"first.o"]);
         let previous_proof = archive_member_set_proof(&previous).unwrap().unwrap();
+        let renamed_proof = archive_member_set_proof(&renamed).unwrap().unwrap();
         let reordered_proof = archive_member_set_proof(&reordered).unwrap().unwrap();
         let direct_previous_patch = PreviousPatchState {
             fingerprint: String::new(),
@@ -18386,8 +18253,12 @@ mod tests {
             reordered_proof.raw_ordered_hash
         );
         assert_eq!(
-            previous_proof.normalized_multiset_hash,
-            reordered_proof.normalized_multiset_hash
+            previous_proof.normalized_ordered_hash,
+            renamed_proof.normalized_ordered_hash
+        );
+        assert_ne!(
+            previous_proof.normalized_ordered_hash,
+            reordered_proof.normalized_ordered_hash
         );
         assert_eq!(previous_proof.member_count, 2);
 
@@ -18406,10 +18277,19 @@ mod tests {
             archive_member_set_proof_matches_current(
                 &input,
                 &direct_previous_patch,
-                Some(&reordered_proof),
+                Some(&renamed_proof),
                 true,
             ),
             Some(true)
+        );
+        assert_eq!(
+            archive_member_set_proof_matches_current(
+                &input,
+                &direct_previous_patch,
+                Some(&reordered_proof),
+                true,
+            ),
+            Some(false)
         );
         assert_eq!(
             archive_member_set_proof_matches_current(
@@ -18545,7 +18425,7 @@ mod tests {
         let current_archive = current_builder.into_inner().unwrap();
 
         assert!(
-            archive_members_match_snapshot(
+            !archive_members_match_snapshot(
                 &state_dir,
                 &previous,
                 Some(previous_archive.as_slice()),
@@ -19121,7 +19001,7 @@ mod tests {
             fingerprint: "patch-hash".to_owned(),
             archive_member_set_proof: Some(ArchiveMemberSetProof {
                 raw_ordered_hash: "raw-hash".to_owned(),
-                normalized_multiset_hash: "normalized-hash".to_owned(),
+                normalized_ordered_hash: "normalized-hash".to_owned(),
                 member_count: 3,
                 rustc_link_content_digest: Some("a".repeat(blake3::OUT_LEN * 2)),
             }),
@@ -19148,7 +19028,7 @@ mod tests {
             fingerprint: "patch-hash".to_owned(),
             archive_member_set_proof: Some(ArchiveMemberSetProof {
                 raw_ordered_hash: "raw-hash".to_owned(),
-                normalized_multiset_hash: "normalized-hash".to_owned(),
+                normalized_ordered_hash: "normalized-hash".to_owned(),
                 member_count: 3,
                 rustc_link_content_digest: None,
             }),
@@ -20019,7 +19899,7 @@ mod tests {
             fingerprint: "new-patch-hash".to_owned(),
             archive_member_set_proof: Some(ArchiveMemberSetProof {
                 raw_ordered_hash: "raw-hash".to_owned(),
-                normalized_multiset_hash: "normalized-hash".to_owned(),
+                normalized_ordered_hash: "normalized-hash".to_owned(),
                 member_count: 2,
                 rustc_link_content_digest: None,
             }),
