@@ -1750,56 +1750,34 @@ fn patch_changed_inputs(
     let mut patched_input_count = 0;
     let mut patched_section_count = 0;
     let mut previous_output = LazyOutputBytes::new(|| read_output_bytes(args.output()));
-    let preloaded_changed_inputs = {
-        timing_phase!("Preload changed incremental inputs");
-        changed_inputs
-            .par_iter()
-            .map(|(input_index, path)| {
-                if previous.input_files[*input_index].patch.is_none() {
-                    return Ok(None);
-                }
+    for (input_index, path) in changed_inputs {
+        let mut loaded_input = None;
+        if previous.input_files[*input_index].patch.is_some() {
+            let Some((bytes, input_content)) = ({
                 timing_phase!("Read changed incremental input");
-                read_file_with_stable_identity(path)
-                    .with_context(|| {
-                        format!(
-                            "Failed to read changed incremental input `{}`",
-                            path.display()
-                        )
-                    })
-                    .map(Some)
-            })
-            .collect::<Result<Vec<_>>>()?
-    };
-    for ((input_index, path), preloaded_input) in
-        changed_inputs.iter().zip(preloaded_changed_inputs)
-    {
-        let loaded_input = match preloaded_input {
-            Some(Some(loaded_input)) => Some(loaded_input),
-            Some(None) => {
+                read_file_with_stable_identity(path).with_context(|| {
+                    format!(
+                        "Failed to read changed incremental input `{}`",
+                        path.display()
+                    )
+                })?
+            }) else {
                 return Ok(ChangedInputPatchResult::Unsupported(format!(
                     "changed input changed while being read: {}",
                     path.display()
                 )));
-            }
-            None => None,
-        };
-        if previous.input_files[*input_index].patch.is_some() {
-            let Some((_, input_content)) = loaded_input.as_ref() else {
-                return Ok(ChangedInputPatchResult::Unsupported(format!(
-                    "changed input preload unavailable: {}",
-                    path.display()
-                )));
             };
-            expected_changed_inputs.push(ExpectedInputContent::from_content(path, input_content));
+            expected_changed_inputs.push(ExpectedInputContent::from_content(path, &input_content));
             if content_state_matches_previous(
                 &previous.input_files[*input_index].content,
-                input_content,
+                &input_content,
             ) {
-                previous.input_files[*input_index].content = input_content.clone();
+                previous.input_files[*input_index].content = input_content;
                 previous.input_files[*input_index].snapshot_identity = None;
                 rewritten_input_count += 1;
                 continue;
             }
+            loaded_input = Some((bytes, input_content));
         }
         if previous.input_files[*input_index].patch.is_none()
             && previous
