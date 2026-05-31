@@ -12,6 +12,7 @@
 //#TestIncrementalChangedSection:generated:.eh_frame
 //#TestIncrementalChangedExpectPatch:true
 //#TestIncrementalChangedFallbackReason:relocation target moved
+//#TestIncrementalChangedFallbackReason:changed x86-64 ELF GOT relaxation context
 //#TestIncrementalChangedPatchedSectionCount:1
 //#TestIncrementalChangedPatchedSectionCount:2
 //#TestIncrementalChangedCompareFull:false
