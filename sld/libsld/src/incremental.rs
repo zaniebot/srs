@@ -729,7 +729,10 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
         return Ok(false);
     }
 
-    let Some(mut previous) = PersistedState::read_metadata(&state_dir).unwrap_or_default() else {
+    let Some(mut previous) = ({
+        timing_phase!("Read incremental fast-path metadata");
+        PersistedState::read_metadata(&state_dir).unwrap_or_default()
+    }) else {
         return Ok(false);
     };
 
@@ -753,48 +756,56 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
             }
         }
     }
-    if !output_content_matches_previous(
-        &previous.output,
-        args.output(),
-        args.should_trust_persistent_output_data_identity(),
-    )? {
+    if !{
+        timing_phase!("Validate incremental fast-path output content");
+        output_content_matches_previous(
+            &previous.output,
+            args.output(),
+            args.should_trust_persistent_output_data_identity(),
+        )?
+    } {
         return Ok(false);
     }
 
     let mut changed_inputs = Vec::new();
     let mut rewritten_inputs = Vec::new();
     let mut checked_ambiguous_inputs = false;
-    let input_checks = previous
-        .input_files
-        .par_iter()
-        .enumerate()
-        .map(|(index, input)| {
-            let path = decode_path(&input.path)?;
-            if input.content.identity_matches_path(&path)? {
-                if input_content_is_anchored_before_link_start(input, previous.link_start.as_ref())
-                    || !input
+    let input_checks = {
+        timing_phase!("Check incremental fast-path input contents");
+        previous
+            .input_files
+            .par_iter()
+            .enumerate()
+            .map(|(index, input)| {
+                let path = decode_path(&input.path)?;
+                if input.content.identity_matches_path(&path)? {
+                    if input_content_is_anchored_before_link_start(
+                        input,
+                        previous.link_start.as_ref(),
+                    ) || !input
                         .content
                         .identity_is_ambiguous_since(previous.link_start.as_ref())
-                {
-                    return Ok((None, None, false));
+                    {
+                        return Ok((None, None, false));
+                    }
+                    if input_content_matches_previous(&state_dir, input, &path)? {
+                        return Ok((None, None, true));
+                    }
+                    return Ok((Some((index, path)), None, true));
+                }
+                if args.should_patch_changed_inputs_before_loading() && input.patch.is_some() {
+                    // The patcher must read a changed input under a stable identity anyway. Let it
+                    // classify patchable identity replacements during that read instead of hashing
+                    // the same large archive first.
+                    return Ok((Some((index, path)), None, false));
                 }
                 if input_content_matches_previous(&state_dir, input, &path)? {
-                    return Ok((None, None, true));
+                    return Ok((None, Some((index, path)), false));
                 }
-                return Ok((Some((index, path)), None, true));
-            }
-            if args.should_patch_changed_inputs_before_loading() && input.patch.is_some() {
-                // The patcher must read a changed input under a stable identity anyway. Let it
-                // classify patchable identity replacements during that read instead of hashing
-                // the same large archive first.
-                return Ok((Some((index, path)), None, false));
-            }
-            if input_content_matches_previous(&state_dir, input, &path)? {
-                return Ok((None, Some((index, path)), false));
-            }
-            Ok((Some((index, path)), None, false))
-        })
-        .collect::<Result<Vec<_>>>()?;
+                Ok((Some((index, path)), None, false))
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
     for (changed_input, rewritten_input, checked_ambiguous_input) in input_checks {
         if let Some(changed_input) = changed_input {
             changed_inputs.push(changed_input);
@@ -806,6 +817,7 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
     }
 
     if !rewritten_inputs.is_empty() {
+        timing_phase!("Snapshot rewritten incremental inputs");
         snapshot_input_paths(
             &state_dir,
             rewritten_inputs.iter().map(|(_, path)| path.as_path()),
@@ -838,6 +850,7 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
                 .as_ref()
                 .is_some_and(|patch| patch.sections.is_empty() && patch.raw_sections.is_none())
         }) {
+            timing_phase!("Read changed-input patch metadata");
             previous.read_patch_metadata_for_input_indices(&state_dir, &changed_input_indices)?;
         }
         let should_filter_records = previous.patch_records_file.is_some()
@@ -1085,6 +1098,7 @@ pub(crate) fn stabilize_rustc_transient_inputs(args: &mut crate::args::Args) -> 
     };
 
     let state_dir = state_dir_for_output(&output);
+    timing_phase!("Stabilize rustc transient inputs");
     let stable_dir = state_dir.join(STABLE_RUSTC_INPUT_DIR);
     let mut stabilized = 0;
     for input in &mut common.inputs {
