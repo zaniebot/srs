@@ -820,14 +820,17 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
         timing_phase!("Snapshot rewritten incremental inputs");
         snapshot_input_paths(
             &state_dir,
-            rewritten_inputs.iter().map(|(_, path)| path.as_path()),
+            rewritten_inputs
+                .iter()
+                .filter(|(input_index, _)| {
+                    previous
+                        .input_files
+                        .get(*input_index)
+                        .is_none_or(|input| input.snapshot_identity.is_none())
+                })
+                .map(|(_, path)| path.as_path()),
         )?;
-        refresh_rewritten_input_identities(&mut previous, &rewritten_inputs);
-        refresh_input_snapshot_identities_at_indices(
-            &state_dir,
-            &mut previous.input_files,
-            rewritten_inputs.iter().map(|(input_index, _)| *input_index),
-        );
+        refresh_snapshotted_rewritten_input_metadata(&state_dir, &mut previous, &rewritten_inputs);
     }
 
     if !changed_inputs.is_empty() {
@@ -881,7 +884,11 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
                 let Some(mut previous) = PersistedState::read_metadata(&state_dir)? else {
                     return Ok(false);
                 };
-                refresh_rewritten_input_identities(&mut previous, &rewritten_inputs);
+                refresh_snapshotted_rewritten_input_metadata(
+                    &state_dir,
+                    &mut previous,
+                    &rewritten_inputs,
+                );
                 previous
                     .read_patch_metadata_for_input_indices(&state_dir, &changed_input_indices)?;
                 let changed_input_files = changed_inputs
@@ -933,7 +940,11 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
                 && changed_input_patch_retry_may_benefit_from_complete_records(&reason)
                 && let Some(mut full_previous) = PersistedState::read(&state_dir)?
             {
-                refresh_rewritten_input_identities(&mut full_previous, &rewritten_inputs);
+                refresh_snapshotted_rewritten_input_metadata(
+                    &state_dir,
+                    &mut full_previous,
+                    &rewritten_inputs,
+                );
                 patch_changed_inputs(
                     args,
                     &state_dir,
@@ -980,7 +991,7 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
     if (!rewritten_inputs.is_empty() || checked_ambiguous_inputs)
         && let Some(mut metadata) = PersistedState::read_metadata(&state_dir)?
     {
-        refresh_rewritten_input_identities(&mut metadata, &rewritten_inputs);
+        refresh_snapshotted_rewritten_input_metadata(&state_dir, &mut metadata, &rewritten_inputs);
         metadata.link_start = current_link_start;
         metadata.write_metadata_update(&state_dir)?;
     }
@@ -996,6 +1007,19 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
     }
     append_log(&state_dir, "reused existing output before loading inputs")?;
     Ok(true)
+}
+
+fn refresh_snapshotted_rewritten_input_metadata(
+    state_dir: &Path,
+    previous: &mut PersistedState,
+    rewritten_inputs: &[(usize, PathBuf)],
+) {
+    refresh_rewritten_input_identities(previous, rewritten_inputs);
+    refresh_input_snapshot_identities_at_indices(
+        state_dir,
+        &mut previous.input_files,
+        rewritten_inputs.iter().map(|(input_index, _)| *input_index),
+    );
 }
 
 fn maybe_reuse_output_during_publication(
@@ -20028,6 +20052,86 @@ mod tests {
             std::fs::read_to_string(state_dir.join(LOG_FILE))
                 .unwrap()
                 .contains("restored missing output from retained snapshot")
+        );
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn preloading_preserves_snapshot_for_same_content_input_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out");
+        let input = dir.path().join("libarchive.rlib");
+        std::fs::write(&output, b"output").unwrap();
+        std::fs::write(&input, b"unchanged").unwrap();
+
+        let mut args = crate::args::elf::ElfArgs::default();
+        args.common.incremental = true;
+        args.output = Arc::from(output.as_path());
+        let state_dir = state_dir_for_output(&output);
+        let mut state = publishing_metadata_state(&args, &output, &input);
+        state.output = FileContentState::from_path(&output).unwrap();
+        snapshot_input_paths(&state_dir, [input.as_path()]).unwrap();
+        let snapshot = input_snapshot_path(&state_dir, &input);
+        state.input_files[0].snapshot_identity = FileIdentity::from_path(&snapshot).unwrap();
+        state.write(&state_dir).unwrap();
+
+        let replacement = dir.path().join("replacement.rlib");
+        std::fs::write(&replacement, b"unchanged").unwrap();
+        std::fs::rename(&replacement, &input).unwrap();
+        let retained_snapshot_identity = FileIdentity::from_path(&snapshot).unwrap();
+
+        assert!(maybe_reuse_output_before_loading(&args).unwrap());
+        let metadata = PersistedState::read_metadata(&state_dir).unwrap().unwrap();
+        let retained_snapshot_identity = retained_snapshot_identity.unwrap();
+        assert!(
+            FileIdentity::from_path(&snapshot)
+                .unwrap()
+                .is_some_and(|snapshot_identity| snapshot_identity
+                    .matches_same_data_ignoring_change_time(&retained_snapshot_identity))
+        );
+        assert!(
+            metadata.input_files[0]
+                .snapshot_identity
+                .as_ref()
+                .is_some_and(|snapshot_identity| snapshot_identity
+                    .matches_same_data_ignoring_change_time(&retained_snapshot_identity))
+        );
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn preloading_installs_missing_snapshot_for_same_content_input_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out");
+        let input = dir.path().join("libarchive.rlib");
+        std::fs::write(&output, b"output").unwrap();
+        std::fs::write(&input, b"unchanged").unwrap();
+
+        let mut args = crate::args::elf::ElfArgs::default();
+        args.common.incremental = true;
+        args.output = Arc::from(output.as_path());
+        let state_dir = state_dir_for_output(&output);
+        let mut state = publishing_metadata_state(&args, &output, &input);
+        state.output = FileContentState::from_path(&output).unwrap();
+        state.write(&state_dir).unwrap();
+
+        let replacement = dir.path().join("replacement.rlib");
+        std::fs::write(&replacement, b"unchanged").unwrap();
+        std::fs::rename(&replacement, &input).unwrap();
+
+        assert!(maybe_reuse_output_before_loading(&args).unwrap());
+        let metadata = PersistedState::read_metadata(&state_dir).unwrap().unwrap();
+        let snapshot = input_snapshot_path(&state_dir, &input);
+        assert!(snapshot.exists());
+        let snapshot_identity = FileIdentity::from_path(&snapshot).unwrap().unwrap();
+        assert!(
+            metadata.input_files[0]
+                .snapshot_identity
+                .as_ref()
+                .is_some_and(|metadata_snapshot_identity| {
+                    metadata_snapshot_identity
+                        .matches_same_data_ignoring_change_time(&snapshot_identity)
+                })
         );
     }
 
