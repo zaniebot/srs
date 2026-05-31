@@ -6404,6 +6404,128 @@ fn renamed_uplifted_artifact_remains_unmodified_after_rebuild() {
     assert!(not_the_same, "renamed uplifted artifact must be unmodified");
 }
 
+#[cargo_test]
+fn sld_native_incremental_scopes_root_linker_environment() {
+    if rustc_host() != "aarch64-apple-darwin" {
+        return;
+    }
+
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                bar = { path = "bar" }
+            "#,
+        )
+        .file("src/main.rs", "fn main() { assert_eq!(bar::value(), 42); }")
+        .file("bar/Cargo.toml", &basic_manifest("bar", "0.1.0"))
+        .file(
+            "bar/build.rs",
+            r#"
+                fn main() {
+                    for variable in [
+                        "SLD_INCREMENTAL",
+                        "SLD_INCREMENTAL_PADDING_PERCENT",
+                        "SLD_STABILIZE_RUSTC_TRANSIENT_INPUTS",
+                        "SLD_EXPERIMENT_PRIVATE_PERSISTENT_OUTPUT",
+                        "SLD_EXPERIMENT_UNSIGNED_PERSISTENT_OUTPUT",
+                    ] {
+                        assert!(std::env::var_os(variable).is_none());
+                    }
+                }
+            "#,
+        )
+        .file("bar/src/lib.rs", "pub fn value() -> u8 { 42 }")
+        .build();
+
+    let wrapper_project = project()
+        .at("sld-env-wrapper")
+        .file("Cargo.toml", &basic_bin_manifest("sld-env-wrapper"))
+        .file(
+            "src/main.rs",
+            r#"
+                use std::ffi::OsStr;
+
+                fn main() {
+                    let args: Vec<_> = std::env::args().collect();
+                    let crate_name = args
+                        .windows(2)
+                        .find(|args| args[0] == "--crate-name")
+                        .map(|args| args[1].as_str());
+                    let variables = [
+                        "SLD_INCREMENTAL",
+                        "SLD_INCREMENTAL_PADDING_PERCENT",
+                        "SLD_STABILIZE_RUSTC_TRANSIENT_INPUTS",
+                        "SLD_EXPERIMENT_PRIVATE_PERSISTENT_OUTPUT",
+                        "SLD_EXPERIMENT_UNSIGNED_PERSISTENT_OUTPUT",
+                    ];
+                    match crate_name {
+                        Some("foo") => {
+                            for (variable, value) in [
+                                ("SLD_INCREMENTAL", "1"),
+                                ("SLD_INCREMENTAL_PADDING_PERCENT", "set"),
+                                ("SLD_STABILIZE_RUSTC_TRANSIENT_INPUTS", "set"),
+                                ("SLD_EXPERIMENT_PRIVATE_PERSISTENT_OUTPUT", "1"),
+                            ] {
+                                assert_eq!(
+                                    std::env::var_os(variable).as_deref(),
+                                    Some(OsStr::new(value))
+                                );
+                            }
+                            assert!(
+                                std::env::var_os("SLD_EXPERIMENT_UNSIGNED_PERSISTENT_OUTPUT")
+                                    .is_none()
+                            );
+                        }
+                        Some("bar" | "build_script_build") => {
+                            for variable in variables {
+                                assert!(std::env::var_os(variable).is_none());
+                            }
+                        }
+                        _ => {}
+                    }
+                    let status = std::process::Command::new(&args[1])
+                        .args(&args[2..])
+                        .status()
+                        .unwrap();
+                    std::process::exit(status.code().unwrap_or(1));
+                }
+            "#,
+        )
+        .build();
+    wrapper_project.cargo("build").run();
+
+    p.cargo("build -Z sld-native-incremental -Z unstable-options --artifact-dir out")
+        .masquerade_as_nightly_cargo(&["sld-native-incremental", "artifact-dir"])
+        .env("RUSTC_WRAPPER", wrapper_project.bin("sld-env-wrapper"))
+        .env("SLD_INCREMENTAL", "poison")
+        .env("SLD_INCREMENTAL_PADDING_PERCENT", "set")
+        .env("SLD_STABILIZE_RUSTC_TRANSIENT_INPUTS", "set")
+        .env("SLD_EXPERIMENT_PRIVATE_PERSISTENT_OUTPUT", "poison")
+        .env("SLD_EXPERIMENT_UNSIGNED_PERSISTENT_OUTPUT", "poison")
+        .enable_mac_dsym()
+        .run();
+
+    let private_binary = p
+        .glob("target/debug/deps/foo-*")
+        .filter_map(Result::ok)
+        .find(|path| path.is_file() && path.extension().is_none())
+        .unwrap();
+    for public_binary in [p.bin("foo"), p.root().join("out/foo")] {
+        assert!(
+            !same_file::is_same_file(public_binary, &private_binary).unwrap(),
+            "public SLD root output must be copied out of the deps directory"
+        );
+    }
+    assert!(p.target_debug_dir().join("foo.dSYM").is_dir());
+}
+
 #[cargo_test(nightly, reason = "-Zno-embed-metadata is nightly only")]
 fn no_embed_metadata() {
     let p = project()

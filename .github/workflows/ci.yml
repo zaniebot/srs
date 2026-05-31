@@ -54,6 +54,40 @@ jobs:
           cargo test --test testsuite rustup::artifact_cache -- --test-threads=1
           cargo test --test testsuite freshness::workspace_member_dependency_stays_fresh_when_selected_directly -- --exact
 
+      - name: Verify native SLD incremental regressions
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target/sld-incremental-tests
+        run: |
+          trap 'cargo +stable clean --manifest-path sld/Cargo.toml' EXIT
+          cargo +stable test --manifest-path sld/Cargo.toml -p libsld --lib
+          case "$RUNNER_OS" in
+            Linux)
+              cargo +stable test --manifest-path sld/Cargo.toml -p sld-linker --test integration_tests elf/x86_64/incremental
+              cargo +stable test --manifest-path sld/Cargo.toml -p sld-linker --test integration_tests elf/x86_64/custom-section/incremental-padding -- --exact
+              ;;
+            macOS)
+              cargo +stable test --manifest-path sld/Cargo.toml -p sld-linker --test integration_tests macho/aarch64/incremental
+              ;;
+          esac
+
+      - name: Verify unsupported native SLD Cargo warning
+        if: runner.os == 'Linux'
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target/cargo-native-incremental-tests
+        run: |
+          trap 'cargo +stable clean --manifest-path rust/src/tools/cargo/Cargo.toml' EXIT
+          cargo +stable test --manifest-path rust/src/tools/cargo/Cargo.toml --test testsuite sld_native_incremental_warns_on_unsupported_host
+
+      - name: Verify Cargo native incremental regressions
+        if: runner.os == 'macOS'
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/target/cargo-native-incremental-tests
+        run: |
+          trap 'cargo +stable clean --manifest-path rust/src/tools/cargo/Cargo.toml' EXIT
+          rustup target add --toolchain stable x86_64-apple-darwin
+          cargo +stable test --manifest-path rust/src/tools/cargo/Cargo.toml --test testsuite sld_native_incremental
+          cargo +stable test --manifest-path rust/src/tools/cargo/Cargo.toml --test testsuite srs_target_rustflags_
+
       - name: Build SRS
         # Standard macOS arm64 runners are tight on storage for rustc stage2 builds.
         run: ./build.sh --ci false --set=rust.incremental=false --set=rust.debuginfo-level=0
@@ -61,11 +95,23 @@ jobs:
       - name: Install SRS
         run: ./install.sh
 
+      - name: Verify Rust SRS regressions
+        working-directory: rust
+        run: |
+          ./x test --config ../bootstrap.toml --ci false \
+            --set=rust.incremental=false --set=rust.debuginfo-level=0 \
+            --stage 2 \
+            tests/run-make/separate-link-fail \
+            tests/codegen-llvm/preserve_duplicate_constants.rs
+
       - name: Verify SRS default backend
         run: |
           rustc +srs -Vv
           rustc +srs -Z unstable-options --print target-spec-json \
             | grep -q '"default-codegen-backend": "cranelift"'
+
+      - name: Verify cargo +srs installed dependency-edit replay
+        run: ./scripts/test-cargo-srs-native-incremental.sh
 
       - uses: actions/checkout@v6
         with:

@@ -26,7 +26,8 @@ the patched Cranelift backend needed to compile Astral workloads on macOS arm64.
   per-name snapshot, attaches copied SRS Cargo plus `sld`, and links that
   snapshot into rustup under a custom name.
 - `cargo-srs.sh`: the installed Cargo wrapper that keeps build scripts, proc
-  macros, and their host-side dependencies on LLVM.
+  macros, and their host-side dependencies on LLVM, and starts the macOS arm64
+  incremental-link lane with LLVM target artifacts.
 - `with-sld.sh`: runs a command with the macOS Rust flags needed to link
   through SRS's built `sld` binary.
 
@@ -36,8 +37,11 @@ macOS arm64 and Linux x86_64 compilers prefer Cranelift for normal SRS target
 artifacts. The installed Cargo wrapper keeps build scripts, proc macros, and
 their host-side dependencies on LLVM because those helpers run during the
 build and can exercise host intrinsics that Cranelift does not support yet.
-LLVM stays available in the toolchain for explicit overrides. For macOS arm64,
-SRS bakes `sld` in as rustc's default linker.
+For the first integrated macOS arm64 incremental-link lane, the wrapper also
+selects LLVM for ordinary target artifacts. Set
+`SRS_TARGET_CODEGEN_BACKEND=cranelift` to exercise the composed backend path
+explicitly. Linux target behavior remains unchanged. For macOS arm64, SRS bakes
+`sld` in as rustc's default linker.
 
 ## Quick Start
 
@@ -77,7 +81,14 @@ copy-on-write filesystem clones where available and a portable copy fallback
 otherwise. It also copies the Cargo wrapper, Cargo binary, and `sld`, so an
 installed name continues to work after later rebuilds or source-worktree
 cleanup. Mutable bootstrap `rust-src` symlinks back into the source checkout
-are intentionally omitted from the installed snapshot.
+are intentionally omitted from the installed snapshot. Explicit sysroots with
+copied `rust-src` directories keep those sources. A normal bootstrap snapshot
+remains suitable for normal `rustc`, Cargo, and `sld` development builds after
+source-worktree cleanup, but is not a `rust-src`-bearing toolchain. Workflows
+that require compiler sources inside the sysroot, such as Cargo `-Z build-std`,
+must use the task worktree's stage 2 sysroot instead. If that worktree has
+already been removed, recreate and rebuild one; replacing an installed
+snapshot intentionally does not restore the mutable `rust-src` symlinks.
 
 On Apple silicon macOS, use Apple containers to exercise the Linux x86_64 build
 lane locally:
@@ -98,23 +109,50 @@ run.
 
 ## Usage
 
-The SRS toolchain uses Cranelift by default for target artifacts and still has
-LLVM available. Its Cargo wrapper uses LLVM for host build helpers. On macOS
-arm64 it links through the `sld` binary attached to the installed toolchain:
+The SRS compiler still has Cranelift available. Its Cargo wrapper uses LLVM for
+host build helpers and, on macOS arm64, for ordinary target artifacts in the
+first integrated incremental-link lane. On macOS arm64 it links through the
+`sld` binary attached to the installed toolchain:
 
 ```bash
 cargo +srs build
 ```
 
 The installed Cargo wrapper sets `SLD_INCREMENTAL=1` by default so `sld` can
-reuse link state across development builds. It also enables Cargo's verified
-ordinary-library artifact cache at
+reuse link state across development builds. On Apple silicon macOS, it also
+requests signed private root-executable outputs and transient-input
+stabilization from the patched Cargo binary. Rustc also supplies SLD with
+persisted work-product digests so unchanged root objects can retain isolated
+stable aliases without rereading their contents. Public artifacts remain detached
+copies, while dependencies and build scripts do not inherit the root-link
+environment. For target artifacts the macOS arm64 wrapper also enables
+`-Zpreserve-duplicate-constants=yes`, preventing LLVM builds from coalescing
+distinct string constants into a layout change that cannot be incrementally
+patched. This intentionally trades some target object size for stable link
+layout. Linux incremental-link behavior is unchanged. Set `SLD_INCREMENTAL=0`
+for a full-link comparison or when diagnosing incremental-link behavior, set
+`SRS_PRESERVE_DUPLICATE_LLVM_CONSTANTS=0` to compare LLVM without
+compiler-side preservation, or set
+`SRS_TARGET_CODEGEN_BACKEND=cranelift` for an explicit Cranelift composition
+run.
+
+The private-output mode assumes root executable links resolve to `sld`; the
+installed toolchain default satisfies that contract. Cargo does not verify
+linker identity. When deliberately selecting another linker through Cargo
+configuration, environment rustflags, or `cargo rustc` arguments, set
+`SLD_INCREMENTAL=0` so the wrapper does not enable private-output preservation.
+
+The wrapper also enables Cargo's verified ordinary-library artifact cache at
 `${CARGO_HOME:-$HOME/.cargo}/srs-artifact-cache-v2`. Dependencies compiled from
 a shared source location, such as registry packages, can be restored by
 hardlink across SRS worktrees on macOS and Linux; separate local checkouts
 remain distinct when their source location can affect output. Restoration
 copies automatically when the cache and build directory are on different
 filesystems.
+
+The wrapper's macOS duplicate-constant preservation flag and SLD
+provenance-bearing dependency rlibs participate in cache keys. Root
+executables remain outside the shared cache.
 
 Cargo detaches restored hardlinks before rebuilding them, but tools outside
 Cargo must not overwrite restored `.rlib` or `.rmeta` files in place: in
@@ -128,9 +166,6 @@ previously restored by hardlink.
 See [Shared Cargo artifact cache](context/shared-cargo-artifact-cache.md) for
 the cache admission rules, compiler identity model, concurrency behavior, and
 operational details.
-
-Set `SLD_INCREMENTAL=0` for a full-link comparison or when diagnosing
-incremental-link behavior.
 
 Set `SRS_CARGO_ARTIFACT_CACHE=0` to disable shared artifact restoration and
 publication.
@@ -179,8 +214,8 @@ Use a separate rustup toolchain name when keeping multiple SRS builds linked:
 cargo +srs-dev build
 ```
 
-Installed names are immutable snapshots. The installer refuses to overwrite an
-existing name unless replacement is explicitly requested:
+Installed names are immutable snapshots. After rebuilding, refresh an existing
+name by explicitly replacing its snapshot:
 
 ```bash
 SRS_INSTALL_REPLACE=1 ./install.sh srs-dev
