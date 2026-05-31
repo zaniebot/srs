@@ -31,11 +31,34 @@ else
 fi
 
 # Build scripts and proc macros execute on the build host. Keep those helpers
-# on LLVM while SRS target artifacts follow rustc's Cranelift default.
+# on LLVM while SRS target artifacts follow rustc's Cranelift default. On
+# Apple silicon, keep host-loadable artifacts off the experimental linker and
+# request root-only signed incremental links for normal target executables.
+sld_native_incremental_args=()
+host_rustflags='["-Zcodegen-backend=llvm"]'
+if [[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "arm64" ]]; then
+    host_rustflags='["-Zcodegen-backend=llvm","-C","linker=/usr/bin/clang"]'
+    if [[ "$SLD_INCREMENTAL" != "0" ]]; then
+        export SLD_INCREMENTAL_PADDING_PERCENT="${SLD_INCREMENTAL_PADDING_PERCENT:-1}"
+        export SLD_STABILIZE_RUSTC_TRANSIENT_INPUTS="${SLD_STABILIZE_RUSTC_TRANSIENT_INPUTS:-1}"
+        sld_native_incremental_args=(-Z sld-native-incremental)
+    fi
+fi
+
+if [[ "${#sld_native_incremental_args[@]}" -gt 0 ]]; then
+    exec "$real_cargo" \
+        "${sld_native_incremental_args[@]}" \
+        -Z host-config \
+        -Z target-applies-to-host \
+        --config 'target-applies-to-host=false' \
+        --config "host.rustflags=$host_rustflags" \
+        "$@"
+fi
+
 exec "$real_cargo" \
     "${artifact_cache_args[@]}" \
     -Z host-config \
     -Z target-applies-to-host \
     --config 'target-applies-to-host=false' \
-    --config 'host.rustflags=["-Zcodegen-backend=llvm"]' \
+    --config "host.rustflags=$host_rustflags" \
     "$@"

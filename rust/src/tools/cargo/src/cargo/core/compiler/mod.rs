@@ -124,6 +124,203 @@ use cargo_util_terminal::Verbosity;
 use rustfix::diagnostics::Applicability;
 
 const RUSTDOC_CRATE_VERSION_FLAG: &str = "--crate-version";
+const SLD_PRIVATE_PERSISTENT_OUTPUT_ENV: &str = "SLD_EXPERIMENT_PRIVATE_PERSISTENT_OUTPUT";
+const SLD_LEGACY_UNSIGNED_PERSISTENT_OUTPUT_ENV: &str = "SLD_EXPERIMENT_UNSIGNED_PERSISTENT_OUTPUT";
+const SLD_NATIVE_INCREMENTAL_ENVS: [&str; 5] = [
+    "SLD_INCREMENTAL",
+    "SLD_INCREMENTAL_PADDING_PERCENT",
+    "SLD_RUSTC_WORK_PRODUCT_PROVENANCE",
+    "SLD_RUSTC_WORK_PRODUCT_PROVENANCE_FILE",
+    "SLD_STABILIZE_RUSTC_TRANSIENT_INPUTS",
+];
+
+fn sld_native_incremental_requested(build_runner: &BuildRunner<'_, '_>) -> bool {
+    build_runner.bcx.gctx.cli_unstable().sld_native_incremental
+        && sld_native_incremental_supported(&build_runner.bcx.host_triple())
+}
+
+fn sld_native_incremental_supported(host_triple: &str) -> bool {
+    host_triple == "aarch64-apple-darwin"
+}
+
+fn warn_if_sld_native_incremental_unsupported(
+    build_runner: &BuildRunner<'_, '_>,
+) -> CargoResult<()> {
+    if build_runner.bcx.gctx.cli_unstable().sld_native_incremental
+        && build_runner.compiled.is_empty()
+    {
+        if !sld_native_incremental_supported(&build_runner.bcx.host_triple()) {
+            build_runner.bcx.gctx.shell().warn(
+                "`-Z sld-native-incremental` is ignored because it only supports \
+                 aarch64-apple-darwin hosts and targets",
+            )?;
+        } else if build_runner
+            .bcx
+            .target_data
+            .requested_kinds()
+            .iter()
+            .any(|kind| build_runner.bcx.target_data.short_name(kind) != "aarch64-apple-darwin")
+        {
+            build_runner.bcx.gctx.shell().warn(
+                "`-Z sld-native-incremental` is only enabled for aarch64-apple-darwin targets; \
+                 unsupported targets are ignored",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn sld_native_incremental_root_output(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> bool {
+    sld_native_incremental_requested(build_runner)
+        && build_runner.bcx.target_data.short_name(&unit.kind) == "aarch64-apple-darwin"
+        && build_runner.bcx.roots.contains(unit)
+        && unit.target.is_executable()
+        && unit.mode == CompileMode::Build
+}
+
+// Rustc forwards provenance to native linkers, so publish it only for pure rlib builds.
+fn sld_native_incremental_rlib_producer(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> bool {
+    sld_native_incremental_requested(build_runner)
+        && build_runner.bcx.target_data.short_name(&unit.kind) == "aarch64-apple-darwin"
+        && unit.mode == CompileMode::Build
+        && !unit.requires_upstream_objects()
+}
+
+fn sld_native_incremental_root_environment(
+    gctx: &crate::GlobalContext,
+) -> CargoResult<[Option<OsString>; 3]> {
+    let env_config = gctx.env_config()?;
+    Ok([
+        "SLD_INCREMENTAL_PADDING_PERCENT",
+        "SLD_RUSTC_WORK_PRODUCT_PROVENANCE",
+        "SLD_STABILIZE_RUSTC_TRANSIENT_INPUTS",
+    ]
+    .map(|variable| {
+        env_config
+            .get(variable)
+            .cloned()
+            .or_else(|| gctx.get_env_os(variable).map(OsString::from))
+    }))
+}
+
+fn remove_sld_native_incremental_env(command: &mut ProcessBuilder) {
+    command.env_remove(SLD_PRIVATE_PERSISTENT_OUTPUT_ENV);
+    command.env_remove(SLD_LEGACY_UNSIGNED_PERSISTENT_OUTPUT_ENV);
+    for variable in SLD_NATIVE_INCREMENTAL_ENVS {
+        command.env_remove(variable);
+    }
+}
+
+fn configure_sld_native_incremental_rlib_producer(command: &mut ProcessBuilder) {
+    remove_sld_native_incremental_env(command);
+    command.env("SLD_RUSTC_WORK_PRODUCT_PROVENANCE", "1");
+}
+
+fn configure_sld_native_incremental_root(
+    command: &mut ProcessBuilder,
+    padding_percent: Option<&OsStr>,
+    rustc_work_product_provenance: Option<&OsStr>,
+    stabilize_rustc_transient_inputs: Option<&OsStr>,
+) {
+    remove_sld_native_incremental_env(command);
+    command.env(SLD_PRIVATE_PERSISTENT_OUTPUT_ENV, "1");
+    command.env("SLD_INCREMENTAL", "1");
+    command.env(
+        "SLD_RUSTC_WORK_PRODUCT_PROVENANCE",
+        rustc_work_product_provenance.unwrap_or_else(|| OsStr::new("1")),
+    );
+    command.env(
+        "SLD_STABILIZE_RUSTC_TRANSIENT_INPUTS",
+        stabilize_rustc_transient_inputs.unwrap_or_else(|| OsStr::new("1")),
+    );
+    if let Some(value) = padding_percent {
+        command.env("SLD_INCREMENTAL_PADDING_PERCENT", value);
+    }
+}
+
+fn copy_sld_native_incremental_artifact(src: &Path, dst: &Path) -> CargoResult<()> {
+    if fs::symlink_metadata(dst).is_ok() {
+        paths::remove_file(dst)?;
+    }
+    let mut retries = 10;
+    loop {
+        match fs::copy(src, dst) {
+            Ok(_) => return Ok(()),
+            Err(error)
+                if cfg!(target_os = "macos")
+                    && error.raw_os_error() == Some(35 /* libc::EAGAIN */)
+                    && retries > 0 =>
+            {
+                tracing::info!("copy failed {error:?}. retrying fs::copy");
+                retries -= 1;
+                if fs::symlink_metadata(dst).is_ok() {
+                    paths::remove_file(dst)?;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to copy persistent SLD root output `{}` to `{}`",
+                        src.display(),
+                        dst.display()
+                    )
+                });
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn sld_native_incremental_artifact_has_multiple_links(path: &Path) -> CargoResult<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "failed to inspect persistent SLD root output `{}`",
+            path.display()
+        )
+    })?;
+    Ok(metadata.nlink() > 1)
+}
+
+#[cfg(not(unix))]
+fn sld_native_incremental_artifact_has_multiple_links(_path: &Path) -> CargoResult<bool> {
+    Ok(false)
+}
+
+fn sld_native_incremental_artifact_is_regular_file(path: &Path) -> CargoResult<bool> {
+    Ok(fs::symlink_metadata(path)
+        .with_context(|| {
+            format!(
+                "failed to inspect persistent SLD root output `{}`",
+                path.display()
+            )
+        })?
+        .file_type()
+        .is_file())
+}
+
+fn isolate_sld_native_incremental_artifact(path: &Path) -> CargoResult<()> {
+    let parent = path.parent().ok_or_else(|| {
+        internal(format!(
+            "persistent SLD root output `{}` has no parent directory",
+            path.display()
+        ))
+    })?;
+    let temporary = tempfile::Builder::new()
+        .prefix(".cargo-sld-detach")
+        .tempfile_in(parent)?;
+    copy_sld_native_incremental_artifact(path, temporary.path())?;
+    fs::rename(temporary.path(), path).with_context(|| {
+        format!(
+            "failed to isolate persistent SLD root output `{}`",
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
 const ARTIFACT_CACHE_PUBLISH_DELAY_MS_FOR_TESTS: &str =
     "__CARGO_TEST_ARTIFACT_CACHE_PUBLISH_DELAY_MS";
 const ARTIFACT_CACHE_PUBLISH_READY_FILE_FOR_TESTS: &str =
@@ -164,6 +361,8 @@ const ARTIFACT_CACHE_CROSS_DEVICE_HARDLINK_FAILURE_FOR_TESTS: &str =
 const ARTIFACT_CACHE_SIZE_STATE: &str = ".cargo-artifact-cache-size";
 const ARTIFACT_CACHE_SIZE_STATE_VERSION: &str = "v2";
 pub(super) const ARTIFACT_CACHE_FRESHNESS_STAMP: &str = "artifact-cache-complete.timestamp";
+pub(super) const SLD_NATIVE_INCREMENTAL_FRESHNESS_STAMP: &str =
+    "sld-native-incremental-complete.timestamp";
 static ARTIFACT_CACHE_PUBLICATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// A glorified callback for executing calls to rustc. Rather than calling rustc
@@ -231,6 +430,7 @@ fn compile<'gctx>(
     unit: &Unit,
     exec: &Arc<dyn Executor>,
 ) -> CargoResult<()> {
+    warn_if_sld_native_incremental_unsupported(build_runner)?;
     if !build_runner.compiled.insert(unit.clone()) {
         return Ok(());
     }
@@ -366,6 +566,14 @@ fn rustc(
     let package_id = unit.pkg.package_id();
     let target = Target::clone(&unit.target);
     let mode = unit.mode;
+    let preserve_sld_root_output = sld_native_incremental_root_output(build_runner, unit);
+    let publish_sld_rlib_link_content_digest =
+        sld_native_incremental_rlib_producer(build_runner, unit);
+    let scope_sld_native_incremental_env = sld_native_incremental_requested(build_runner);
+    let sld_native_incremental_padding_percent = rustc.get_env("SLD_INCREMENTAL_PADDING_PERCENT");
+    let sld_rustc_work_product_provenance = rustc.get_env("SLD_RUSTC_WORK_PRODUCT_PROVENANCE");
+    let stabilize_sld_rustc_transient_inputs =
+        rustc.get_env("SLD_STABILIZE_RUSTC_TRANSIENT_INPUTS");
 
     exec.init(build_runner, unit);
     let exec = exec.clone();
@@ -490,6 +698,21 @@ fn rustc(
             add_custom_flags(&mut rustc, &script_outputs, script_metadatas)?;
         }
 
+        if scope_sld_native_incremental_env {
+            remove_sld_native_incremental_env(&mut rustc);
+        }
+        if publish_sld_rlib_link_content_digest {
+            configure_sld_native_incremental_rlib_producer(&mut rustc);
+        }
+        if preserve_sld_root_output {
+            configure_sld_native_incremental_root(
+                &mut rustc,
+                sld_native_incremental_padding_percent.as_deref(),
+                sld_rustc_work_product_provenance.as_deref(),
+                stabilize_sld_rustc_transient_inputs.as_deref(),
+            );
+        }
+
         // Record the invocation before reading cache-discovered inputs so edits
         // racing a restore leave the restored output dirty for the next build.
         let timestamp = paths::set_invocation_time(&fingerprint_dir)?;
@@ -580,7 +803,13 @@ fn rustc(
             )?;
         } else {
             for output in outputs.iter() {
-                prepare_materialized_rlib_output_for_write(&output.path)?;
+                let preserve_sld_output =
+                    preserve_sld_root_output && output.flavor == FileFlavor::Normal;
+                // Only the normal private executable is SLD-owned. Sidecars still
+                // need Cargo's usual pre-write cleanup.
+                if !preserve_sld_output {
+                    prepare_materialized_rlib_output_for_write(&output.path)?;
+                }
 
                 // If there is both an rmeta and rlib, rustc will prefer to use the
                 // rlib, even if it is older. Therefore, we must delete the rlib to
@@ -596,13 +825,22 @@ fn rustc(
                 // That results in the old hard-link being modified even after renamed.
                 // We delete the old artifact here to prevent this behavior from confusing users.
                 // See rust-lang/cargo#8348.
-                if output.hardlink.is_some() && output.path.exists() {
-                    _ = paths::remove_file(&output.path).map_err(|e| {
-                        tracing::debug!(
-                            "failed to delete previous output file `{:?}`: {e:?}",
-                            output.path
-                        );
-                    });
+                if output.hardlink.is_some() && fs::symlink_metadata(&output.path).is_ok() {
+                    if preserve_sld_output {
+                        if !sld_native_incremental_artifact_is_regular_file(&output.path)? {
+                            paths::remove_file(&output.path)?;
+                        } else if sld_native_incremental_artifact_has_multiple_links(&output.path)?
+                        {
+                            isolate_sld_native_incremental_artifact(&output.path)?;
+                        }
+                    } else {
+                        _ = paths::remove_file(&output.path).map_err(|e| {
+                            tracing::debug!(
+                                "failed to delete previous output file `{:?}`: {e:?}",
+                                output.path
+                            );
+                        });
+                    }
                 }
             }
 
@@ -710,6 +948,13 @@ fn rustc(
             for output in outputs.iter() {
                 paths::set_file_time_no_err(&output.path, timestamp);
             }
+        }
+        // SLD owns the retained private output's identity, including its mtime.
+        // Record Cargo's successful completion without mutating that output.
+        if preserve_sld_root_output {
+            let stamp = fingerprint_dir.join(SLD_NATIVE_INCREMENTAL_FRESHNESS_STAMP);
+            drop(paths::create(&stamp)?);
+            paths::set_file_time_no_err(stamp, timestamp);
         }
 
         if artifact_cache_freshness_stamp {
@@ -841,6 +1086,14 @@ fn modeled_sysroot_codegen_backend_flag(arg: &str) -> bool {
         .is_some_and(|backend| !backend.contains('.'))
 }
 
+fn modeled_unstable_flag(arg: &str) -> bool {
+    modeled_sysroot_codegen_backend_flag(arg)
+        || matches!(
+            arg,
+            "preserve-duplicate-constants=yes" | "preserve-duplicate-constants=no"
+        )
+}
+
 fn unmodeled_codegen_backend_environment(rustc: &ProcessBuilder) -> bool {
     rustc
         .get_envs()
@@ -850,6 +1103,11 @@ fn unmodeled_codegen_backend_environment(rustc: &ProcessBuilder) -> bool {
             key.to_str()
                 .is_some_and(|key| key.starts_with("CG_GCCJIT_") && rustc.get_env(key).is_some())
         })
+}
+
+fn unmodeled_sld_provenance_environment(rustc: &ProcessBuilder) -> bool {
+    let key = "SLD_RUSTC_WORK_PRODUCT_PROVENANCE";
+    !rustc.get_envs().contains_key(key) && rustc.get_env(key).is_some()
 }
 
 fn custom_target_spec_flag(arg: &str) -> bool {
@@ -932,6 +1190,7 @@ fn rlib_action_is_cacheable_with_search_paths(
             .iter()
             .any(|key| rustc.get_env(key).is_some())
         && !unmodeled_codegen_backend_environment(rustc)
+        && !unmodeled_sld_provenance_environment(rustc)
         // Windows GNU raw-dylib rlibs may embed output from a PATH-selected
         // or explicitly configured dlltool, which is outside this cache key.
         && !windows_gnu_target(action_target)
@@ -1020,11 +1279,11 @@ fn rlib_action_is_cacheable_with_search_paths(
                 || (arg != "-Z"
                     && arg
                         .strip_prefix("-Z")
-                        .is_some_and(|arg| !modeled_sysroot_codegen_backend_flag(arg)))
+                        .is_some_and(|arg| !modeled_unstable_flag(arg)))
         })
         && !args
             .windows(2)
-            .any(|pair| pair[0] == "-Z" && !modeled_sysroot_codegen_backend_flag(&pair[1]))
+            .any(|pair| pair[0] == "-Z" && !modeled_unstable_flag(&pair[1]))
 }
 
 #[cfg(test)]
@@ -1267,6 +1526,72 @@ mod artifact_cache_admission_tests {
             output_root,
             compiler,
             host
+        ));
+    }
+
+    #[test]
+    fn duplicate_constant_preservation_is_cacheable_only_with_modeled_values() {
+        let output_root = Path::new("target/debug/deps");
+        let compiler = Path::new("rustc");
+        let host = "aarch64-apple-darwin";
+        for value in ["yes", "no"] {
+            let mut compact = ordinary_rlib_command();
+            compact.arg(format!("-Zpreserve-duplicate-constants={value}"));
+            assert!(rlib_action_is_cacheable(
+                &compact,
+                output_root,
+                compiler,
+                host
+            ));
+
+            let mut split = ordinary_rlib_command();
+            split
+                .arg("-Z")
+                .arg(format!("preserve-duplicate-constants={value}"));
+            assert!(rlib_action_is_cacheable(
+                &split,
+                output_root,
+                compiler,
+                host
+            ));
+        }
+
+        for option in [
+            "preserve-duplicate-constants",
+            "preserve-duplicate-constants=maybe",
+        ] {
+            let mut compact = ordinary_rlib_command();
+            compact.arg(format!("-Z{option}"));
+            assert!(!rlib_action_is_cacheable(
+                &compact,
+                output_root,
+                compiler,
+                host
+            ));
+
+            let mut split = ordinary_rlib_command();
+            split.arg("-Z").arg(option);
+            assert!(!rlib_action_is_cacheable(
+                &split,
+                output_root,
+                compiler,
+                host
+            ));
+        }
+    }
+
+    #[test]
+    fn sld_provenance_with_duplicate_constant_preservation_is_cacheable() {
+        let mut command = ordinary_rlib_command();
+        command
+            .arg("-Zpreserve-duplicate-constants=yes")
+            .env("SLD_RUSTC_WORK_PRODUCT_PROVENANCE", "1");
+
+        assert!(rlib_action_is_cacheable(
+            &command,
+            Path::new("target/debug/deps"),
+            Path::new("rustc"),
+            "aarch64-apple-darwin"
         ));
     }
 
@@ -2209,14 +2534,17 @@ fn materialize_rlib_cache_file(
 }
 
 fn prepare_materialized_rlib_output_for_write(output: &Path) -> CargoResult<()> {
-    if fs::symlink_metadata(output).is_err() {
+    let Ok(metadata) = fs::symlink_metadata(output) else {
+        return Ok(());
+    };
+    if !metadata.file_type().is_file() {
         return Ok(());
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
 
-        if fs::metadata(output)?.nlink() > 1 {
+        if metadata.nlink() > 1 {
             paths::remove_file(output)?;
             debug!(
                 "detached hardlinked cached artifact before rebuild {}",
@@ -3237,6 +3565,22 @@ mod artifact_cache_size_tests {
     }
 }
 
+#[cfg(test)]
+mod artifact_cache_output_tests {
+    use super::prepare_materialized_rlib_output_for_write;
+
+    #[test]
+    fn output_preparation_ignores_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("output.dSYM");
+        std::fs::create_dir(&directory).unwrap();
+
+        prepare_materialized_rlib_output_for_write(&directory).unwrap();
+
+        assert!(directory.is_dir());
+    }
+}
+
 fn artifact_cache_entry_size(path: &Path) -> CargoResult<u64> {
     if !path_is_directory_no_follow(path) {
         anyhow::bail!(
@@ -3330,6 +3674,7 @@ fn link_targets(
     let features = unit.features.iter().map(|s| s.to_string()).collect();
     let json_messages = bcx.build_config.emit_json();
     let executable = build_runner.get_executable(unit)?;
+    let preserve_sld_root_output = sld_native_incremental_root_output(build_runner, unit);
     let mut target = Target::clone(&unit.target);
     if let TargetSourcePath::Metabuild = target.src_path() {
         // Give it something to serialize.
@@ -3358,12 +3703,22 @@ fn link_targets(
                 continue;
             };
             destinations.push(dst.clone());
-            paths::link_or_copy(src, dst)?;
+            let detach_sld_root_output =
+                preserve_sld_root_output && output.flavor == FileFlavor::Normal;
+            if detach_sld_root_output {
+                copy_sld_native_incremental_artifact(src, dst)?;
+            } else {
+                paths::link_or_copy(src, dst)?;
+            }
             if let Some(ref path) = output.export_path {
                 let export_dir = export_dir.as_ref().unwrap();
                 paths::create_dir_all(export_dir)?;
 
-                paths::link_or_copy(src, path)?;
+                if detach_sld_root_output {
+                    copy_sld_native_incremental_artifact(src, path)?;
+                } else {
+                    paths::link_or_copy(src, path)?;
+                }
             }
         }
 

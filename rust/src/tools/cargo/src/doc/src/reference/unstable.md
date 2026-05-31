@@ -68,6 +68,7 @@ Each new feature described below should explain how to use it.
     * [Metabuild](#metabuild) --- Provides declarative build scripts.
     * [Multiple Build Scripts](#multiple-build-scripts) --- Allows use of multiple build scripts.
     * [Any Build Script Metadata](#any-build-script-metadata) --- Allow any build script to specify env vars via `cargo::metadata=key=value`
+    * [sld native incremental links](#sld-native-incremental-links) --- Preserve macOS arm64 root executable outputs for incremental relinks.
 * Resolver and features
     * [no-index-update](#no-index-update) --- Prevents cargo from updating the index cache.
     * [avoid-dev-deps](#avoid-dev-deps) --- Prevents the resolver from including dev-dependencies during resolution.
@@ -250,6 +251,18 @@ This can also be specified in `.cargo/config.toml` files.
 ```toml
 [build]
 artifact-dir = "out"
+```
+
+## sld native incremental links
+
+The `sld-native-incremental` feature preserves private macOS arm64 root
+executable outputs so `sld` can update them in place during incremental
+development builds. Cargo copies the public root artifact out of the private
+output location and keeps the linker environment scoped away from
+dependencies, rustdoc, and build-script processes.
+
+```console
+cargo +nightly build -Z sld-native-incremental
 ```
 
 ## root-dir
