@@ -6421,9 +6421,13 @@ fn sld_native_incremental_scopes_root_linker_environment() {
 
                 [dependencies]
                 bar = { path = "bar" }
+                baz = { path = "baz" }
             "#,
         )
-        .file("src/main.rs", "fn main() { assert_eq!(bar::value(), 42); }")
+        .file(
+            "src/main.rs",
+            "fn main() { assert_eq!(bar::value(), 42); assert_eq!(baz::value(), 7); }",
+        )
         .file("bar/Cargo.toml", &basic_manifest("bar", "0.1.0"))
         .file(
             "bar/build.rs",
@@ -6444,6 +6448,18 @@ fn sld_native_incremental_scopes_root_linker_environment() {
             "#,
         )
         .file("bar/src/lib.rs", "pub fn value() -> u8 { 42 }")
+        .file(
+            "baz/Cargo.toml",
+            r#"
+                [package]
+                name = "baz"
+                version = "0.1.0"
+
+                [lib]
+                crate-type = ["rlib", "cdylib"]
+            "#,
+        )
+        .file("baz/src/lib.rs", "pub fn value() -> u8 { 7 }")
         .build();
 
     let wrapper_project = project()
@@ -6474,7 +6490,7 @@ fn sld_native_incremental_scopes_root_linker_environment() {
                             for (variable, value) in [
                                 ("SLD_INCREMENTAL", "1"),
                                 ("SLD_INCREMENTAL_PADDING_PERCENT", "set"),
-                                ("SLD_RUSTC_WORK_PRODUCT_PROVENANCE", "1"),
+                                ("SLD_RUSTC_WORK_PRODUCT_PROVENANCE", "poison"),
                                 ("SLD_STABILIZE_RUSTC_TRANSIENT_INPUTS", "set"),
                                 ("SLD_EXPERIMENT_PRIVATE_PERSISTENT_OUTPUT", "1"),
                             ] {
@@ -6488,7 +6504,23 @@ fn sld_native_incremental_scopes_root_linker_environment() {
                                     .is_none()
                             );
                         }
-                        Some("bar" | "build_script_build") => {
+                        Some("bar") => {
+                            assert_eq!(
+                                std::env::var_os("SLD_RUSTC_WORK_PRODUCT_PROVENANCE").as_deref(),
+                                Some(OsStr::new("1"))
+                            );
+                            for variable in variables {
+                                if variable != "SLD_RUSTC_WORK_PRODUCT_PROVENANCE" {
+                                    assert!(std::env::var_os(variable).is_none());
+                                }
+                            }
+                        }
+                        Some("build_script_build") => {
+                            for variable in variables {
+                                assert!(std::env::var_os(variable).is_none());
+                            }
+                        }
+                        Some("baz") => {
                             for variable in variables {
                                 assert!(std::env::var_os(variable).is_none());
                             }
