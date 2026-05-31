@@ -3525,7 +3525,7 @@ pub(crate) fn refresh_code_signature(
     output: &mut [u8],
     changed_ranges: &[Range<usize>],
     should_invalidate_cache: bool,
-) -> Result<Range<usize>> {
+) -> Result<Vec<Range<usize>>> {
     timing_phase!("Refresh Mach-O code signature");
     let code_signature_range = {
         verbose_timing_phase!("Read Mach-O code signature range");
@@ -3646,6 +3646,11 @@ pub(crate) fn refresh_code_signature(
     let hashes = code_signature
         .get_mut(hashes_start..hashes_end)
         .ok_or_else(|| error!("Invalid Mach-O code signature hash range"))?;
+    let output_hashes_start = code_signature_range
+        .start
+        .checked_add(hashes_start)
+        .ok_or_else(|| error!("Mach-O code signature hash range overflow"))?;
+    let mut changed_hash_ranges = Vec::with_capacity(calculated_hashes.len());
     {
         verbose_timing_phase!(
             "Write changed Mach-O code signature hashes",
@@ -3655,13 +3660,20 @@ pub(crate) fn refresh_code_signature(
             let hash_start = page_index * CS_HASH_SIZE as usize;
             let hash_end = hash_start + CS_HASH_SIZE as usize;
             hashes[hash_start..hash_end].copy_from_slice(&calculated_hash);
+            let output_hash_start = output_hashes_start
+                .checked_add(hash_start)
+                .ok_or_else(|| error!("Mach-O code signature hash range overflow"))?;
+            let output_hash_end = output_hashes_start
+                .checked_add(hash_end)
+                .ok_or_else(|| error!("Mach-O code signature hash range overflow"))?;
+            changed_hash_ranges.push(output_hash_start..output_hash_end);
         }
     }
 
     if should_invalidate_cache {
         invalidate_code_signature_cache(output, code_signature_range.end);
     }
-    Ok(code_signature_range)
+    Ok(changed_hash_ranges)
 }
 
 #[cfg(target_os = "macos")]
