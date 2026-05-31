@@ -1756,6 +1756,7 @@ fn patch_changed_inputs(
     let mut normalized_unchanged_input_count = 0;
     let mut rustc_link_content_digest_unchanged_input_count = 0;
     let mut rustc_link_content_digest_unchanged_input_indices = HashSet::new();
+    let mut deferred_loaded_input_content_hashes = Vec::new();
     let mut patched_input_count = 0;
     let mut patched_section_count = 0;
     let mut previous_output = LazyOutputBytes::new(|| read_output_bytes(args.output()));
@@ -1891,7 +1892,12 @@ fn patch_changed_inputs(
             NormalizedRustArchivePatchState::MatchedButNotUnchanged(matched) => Some(matched),
             NormalizedRustArchivePatchState::Unknown => None,
         };
-        ensure_loaded_input_content_hash(&bytes, &mut input_content);
+        let defer_loaded_input_content_hash =
+            normalized_rust_archive_matched_sections.is_some() && input_content.hash.is_empty();
+        if !defer_loaded_input_content_hash {
+            ensure_loaded_input_content_hash(&bytes, &mut input_content);
+        }
+        let expected_changed_input_index = expected_changed_inputs.len();
         expected_changed_inputs.push(ExpectedInputContent::from_content(path, &input_content));
         patched_input_count += 1;
 
@@ -2519,6 +2525,13 @@ fn patch_changed_inputs(
         patches.extend(resolved_patches);
         eh_frame_hdr_changes.extend(fde_eh_frame_hdr_changes);
         fde_add_candidates.extend(input_fde_add_candidates);
+        if defer_loaded_input_content_hash {
+            deferred_loaded_input_content_hashes.push((
+                *input_index,
+                expected_changed_input_index,
+                bytes,
+            ));
+        }
     }
 
     if patched_input_count == 0 {
@@ -2750,28 +2763,53 @@ fn patch_changed_inputs(
         flush_ranges.push(range.clone());
         write_fast_build_id_from_state(&mut output, range, previous_hashes, tree, &patched_ranges)?;
     }
-    let changed_input_snapshot_result =
+    let (changed_input_snapshot_result, deferred_loaded_input_content_hashes) =
         if args.should_snapshot_changed_inputs_while_finalizing_direct_patches() {
-            let (finalization_result, snapshot_result) = rayon::join(
-                || args.finalize_directly_patched_output(&mut output, &mut flush_ranges),
-                || {
-                    timing_phase!("Snapshot changed incremental inputs");
-                    snapshot_input_paths(
-                        state_dir,
-                        changed_inputs_requiring_snapshot(
-                            changed_inputs,
-                            &rustc_link_content_digest_unchanged_input_indices,
-                        )
-                        .map(|(_, path)| path.as_path()),
-                    )
-                },
-            );
-            finalization_result?;
-            Some(snapshot_result)
+            let (deferred_loaded_input_content_hashes, snapshot_result) =
+                std::thread::scope(|scope| -> Result<_> {
+                    let background = std::thread::Builder::new()
+                        .name("sld-input-snapshot".to_owned())
+                        .spawn_scoped(scope, || {
+                            let snapshot_result = {
+                                timing_phase!("Snapshot changed incremental inputs");
+                                snapshot_input_paths(
+                                    state_dir,
+                                    changed_inputs_requiring_snapshot(
+                                        changed_inputs,
+                                        &rustc_link_content_digest_unchanged_input_indices,
+                                    )
+                                    .map(|(_, path)| path.as_path()),
+                                )
+                            };
+                            let deferred_loaded_input_content_hashes =
+                                hash_deferred_loaded_input_contents(
+                                    &deferred_loaded_input_content_hashes,
+                                    false,
+                                );
+                            (deferred_loaded_input_content_hashes, snapshot_result)
+                        })
+                        .context("Failed to spawn incremental input snapshot thread")?;
+                    let finalization_result =
+                        args.finalize_directly_patched_output(&mut output, &mut flush_ranges);
+                    let background_result = background
+                        .join()
+                        .map_err(|_| crate::error!("Incremental input snapshot thread panicked"))?;
+                    finalization_result?;
+                    Ok(background_result)
+                })?;
+            (Some(snapshot_result), deferred_loaded_input_content_hashes)
         } else {
             args.finalize_directly_patched_output(&mut output, &mut flush_ranges)?;
-            None
+            (
+                None,
+                hash_deferred_loaded_input_contents(&deferred_loaded_input_content_hashes, true),
+            )
         };
+    install_deferred_loaded_input_content_hashes(
+        &mut previous.input_files,
+        &mut expected_changed_inputs,
+        deferred_loaded_input_content_hashes,
+    )?;
 
     {
         timing_phase!("Flush changed incremental output ranges");
@@ -13044,6 +13082,42 @@ fn ensure_loaded_input_content_hash(bytes: &[u8], content: &mut FileContentState
     }
 }
 
+fn hash_deferred_loaded_input_contents(
+    inputs: &[(usize, usize, Vec<u8>)],
+    allow_parallel_hashing: bool,
+) -> Vec<(usize, usize, String)> {
+    inputs
+        .iter()
+        .map(|(input_index, expected_input_index, bytes)| {
+            verbose_timing_phase!("Hash stable input bytes");
+            let hash = if allow_parallel_hashing {
+                hash_loaded_input_bytes(bytes)
+            } else {
+                hash_bytes(bytes)
+            };
+            (*input_index, *expected_input_index, hash)
+        })
+        .collect()
+}
+
+fn install_deferred_loaded_input_content_hashes(
+    input_files: &mut [FileState],
+    expected_inputs: &mut [ExpectedInputContent],
+    hashes: Vec<(usize, usize, String)>,
+) -> Result {
+    for (input_index, expected_input_index, hash) in hashes {
+        let input = input_files
+            .get_mut(input_index)
+            .context("Missing deferred incremental input hash target")?;
+        input.content.hash.clone_from(&hash);
+        let expected = expected_inputs
+            .get_mut(expected_input_index)
+            .context("Missing deferred incremental input validation target")?;
+        expected.hash = hash;
+    }
+    Ok(())
+}
+
 fn input_content_mismatch_reason(
     expected_inputs: &[ExpectedInputContent],
     installed_snapshot_state_dir: Option<&Path>,
@@ -15069,6 +15143,42 @@ mod tests {
             read_verified_input_snapshot(&state_dir, &input_files[0]).unwrap(),
             Some(b"object".to_vec())
         );
+    }
+
+    #[test]
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have threads")]
+    fn deferred_loaded_input_hashes_fill_identity_only_content() {
+        let bytes = vec![b'x'; 256 * 1024 + 1];
+        let expected_hash = hash_bytes(&bytes);
+        let mut input_files = vec![FileState {
+            path: encode_path(Path::new("libcrate.rlib")),
+            content: FileContentState {
+                len: bytes.len() as u64,
+                hash: String::new(),
+                identity: None,
+            },
+            snapshot_identity: None,
+            patch: None,
+        }];
+
+        let mut expected_inputs = vec![ExpectedInputContent::from_content(
+            Path::new("libcrate.rlib"),
+            &input_files[0].content,
+        )];
+        let hashes = std::thread::spawn(move || {
+            hash_deferred_loaded_input_contents(&[(0, 0, bytes)], false)
+        })
+        .join()
+        .unwrap();
+        install_deferred_loaded_input_content_hashes(
+            &mut input_files,
+            &mut expected_inputs,
+            hashes,
+        )
+        .unwrap();
+
+        assert_eq!(input_files[0].content.hash, expected_hash);
+        assert_eq!(expected_inputs[0].hash, expected_hash);
     }
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
