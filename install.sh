@@ -7,6 +7,25 @@ rust_dir="${SRS_RUST_DIR:-$root/rust}"
 toolchain_dir="${2:-}"
 cargo_bin="${3:-}"
 sld_bin="${SRS_SLD_BIN:-$root/target/sld/opt/sld}"
+install_root="${SRS_INSTALL_ROOT:-$HOME/code/tmp/srs-toolchains}"
+snapshot_dir="$install_root/$name"
+rustup_bin="${SRS_RUSTUP_BIN:-rustup}"
+replace="${SRS_INSTALL_REPLACE:-0}"
+
+if [[ -z "$name" || "$name" == */* || "$name" == *\\* || "$name" == "." || "$name" == ".." ]]; then
+    printf 'invalid SRS toolchain name %s: use a single path component\n' "$name" >&2
+    exit 2
+fi
+
+if [[ "$replace" != "0" && "$replace" != "1" ]]; then
+    printf 'SRS_INSTALL_REPLACE must be 0 or 1, got %s\n' "$replace" >&2
+    exit 2
+fi
+
+if [[ -e "$snapshot_dir" || -L "$snapshot_dir" ]] && [[ "$replace" != "1" ]]; then
+    printf 'SRS toolchain snapshot already exists at %s; set SRS_INSTALL_REPLACE=1 to replace it\n' "$snapshot_dir" >&2
+    exit 2
+fi
 
 if [[ -z "$toolchain_dir" ]]; then
     host_stage2="$rust_dir/build/host/stage2"
@@ -72,20 +91,92 @@ if [[ ! -x "$sld_bin" ]]; then
     exit 2
 fi
 
-# A linked Rust bootstrap sysroot does not include Cargo by default. Keep the
-# built Cargo binary next to an SRS wrapper that separates host helpers from
-# normal Cranelift target artifacts.
-ln -sf "$cargo_bin" "$toolchain_dir/bin/cargo-srs-real"
-ln -sf "$root/cargo-srs.sh" "$toolchain_dir/bin/cargo"
+mkdir -p "$install_root"
+staging_dir="$(mktemp -d "$install_root/.${name}.tmp.XXXXXX")"
+replaced_snapshot=""
+snapshot_published=0
+install_complete=0
+cleanup() {
+    if [[ -n "${staging_dir:-}" ]] && [[ -e "$staging_dir" || -L "$staging_dir" ]]; then
+        rm -rf "$staging_dir"
+    fi
+    if [[ "$install_complete" == "1" ]]; then
+        if [[ -n "$replaced_snapshot" ]] && [[ -e "$replaced_snapshot" || -L "$replaced_snapshot" ]]; then
+            rm -rf "$replaced_snapshot"
+        fi
+        return
+    fi
+    if [[ "$snapshot_published" == "1" ]] && [[ -e "$snapshot_dir" || -L "$snapshot_dir" ]]; then
+        rm -rf "$snapshot_dir"
+    fi
+    if [[ -n "$replaced_snapshot" ]] && [[ -e "$replaced_snapshot" || -L "$replaced_snapshot" ]]; then
+        mv "$replaced_snapshot" "$snapshot_dir"
+    fi
+}
+trap cleanup EXIT
+
+# Prefer copy-on-write filesystem clones where the host supports them. The
+# portable fallback keeps installed names independent from mutable build
+# outputs even when clones are unavailable.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    cp -cR "$toolchain_dir/." "$staging_dir" 2>/dev/null || cp -pR "$toolchain_dir/." "$staging_dir"
+elif [[ "$(uname -s)" == "Linux" ]]; then
+    cp --reflink=auto -a "$toolchain_dir/." "$staging_dir"
+else
+    cp -pR "$toolchain_dir/." "$staging_dir"
+fi
+
+# Bootstrap stage 2 sysroots link rust-src back into the mutable checkout.
+# Omit those optional sources instead of publishing a snapshot that stops
+# being self-contained when its source worktree is removed.
+rm -f "$staging_dir/lib/rustlib/rustc-src/rust" "$staging_dir/lib/rustlib/src/rust"
+
+# A Rust bootstrap sysroot does not include Cargo by default. Keep copied Cargo
+# and linker binaries next to a copied SRS wrapper so the snapshot survives
+# later rebuilds and source-worktree cleanup.
+rm -f "$staging_dir/bin/cargo-srs-real" "$staging_dir/bin/cargo"
+install -m 755 "$cargo_bin" "$staging_dir/bin/cargo-srs-real"
+install -m 755 "$root/cargo-srs.sh" "$staging_dir/bin/cargo"
 
 # Rustc prepends this per-target tools directory to PATH before spawning the
 # configured linker. Keep the baked-in default linker name relocatable.
-host="$("$toolchain_dir/bin/rustc" --print host-tuple)"
-tools_bin="$toolchain_dir/lib/rustlib/$host/bin"
+host="$("$staging_dir/bin/rustc" --print host-tuple)"
+tools_bin="$staging_dir/lib/rustlib/$host/bin"
 mkdir -p "$tools_bin"
-ln -sf "$sld_bin" "$tools_bin/sld"
+rm -f "$tools_bin/sld"
+install -m 755 "$sld_bin" "$tools_bin/sld"
 
-rustup toolchain link "$name" "$toolchain_dir"
-printf 'linked rustup toolchain %s -> %s\n' "$name" "$toolchain_dir"
-printf 'attached Cargo wrapper %s -> %s\n' "$toolchain_dir/bin/cargo" "$root/cargo-srs.sh"
-printf 'attached sld linker %s -> %s\n' "$tools_bin/sld" "$sld_bin"
+external_symlink_found=0
+while IFS= read -r -d '' symlink; do
+    target="$(readlink "$symlink")"
+    if [[ "$target" == /* ]]; then
+        printf 'refusing absolute symlink in SRS toolchain snapshot: %s -> %s\n' "$symlink" "$target" >&2
+        external_symlink_found=1
+    fi
+done < <(find "$staging_dir" -type l -print0)
+if [[ "$external_symlink_found" == "1" ]]; then
+    exit 2
+fi
+
+if [[ -e "$snapshot_dir" || -L "$snapshot_dir" ]]; then
+    if [[ "$replace" != "1" ]]; then
+        printf 'SRS toolchain snapshot already exists at %s; set SRS_INSTALL_REPLACE=1 to replace it\n' "$snapshot_dir" >&2
+        exit 2
+    fi
+    replaced_snapshot="$snapshot_dir.replaced.$$"
+    mv "$snapshot_dir" "$replaced_snapshot"
+fi
+
+mv "$staging_dir" "$snapshot_dir"
+staging_dir=""
+snapshot_published=1
+
+if ! "$rustup_bin" toolchain link "$name" "$snapshot_dir"; then
+    exit 1
+fi
+
+install_complete=1
+
+printf 'linked rustup toolchain %s -> %s\n' "$name" "$snapshot_dir"
+printf 'installed copied Cargo wrapper at %s\n' "$snapshot_dir/bin/cargo"
+printf 'installed copied sld linker at %s\n' "$snapshot_dir/lib/rustlib/$host/bin/sld"

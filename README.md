@@ -22,8 +22,9 @@ the patched Cranelift backend needed to compile Astral workloads on macOS arm64.
   from their upstream repositories for review.
 - `scripts/build-apple-containers.sh`: builds the Linux x86_64 SRS lane from
   macOS through Apple containers.
-- `install.sh`: links the built stage 2 toolchain into rustup under a custom
-  name and attaches SRS Cargo plus `sld` to that linked sysroot.
+- `install.sh`: clones or copies the built stage 2 toolchain into an immutable
+  per-name snapshot, attaches copied SRS Cargo plus `sld`, and links that
+  snapshot into rustup under a custom name.
 - `cargo-srs.sh`: the installed Cargo wrapper that keeps build scripts, proc
   macros, and their host-side dependencies on LLVM.
 - `with-sld.sh`: runs a command with the macOS Rust flags needed to link
@@ -70,8 +71,13 @@ cg_clif, Cranelift, or the linker default. It builds `sld` with `stable` first s
 installer can attach the built binary. Rust bootstrap stays on the system
 compiler driver while the installed SRS compiler defaults to `sld`; set
 `SRS_SLD_BOOTSTRAP_TOOLCHAIN` to choose another existing rustup toolchain for
-that step. `./install.sh` relinks the resulting stage 2 sysroot; it does not
-copy the toolchain.
+that step. `./install.sh` snapshots the resulting stage 2 sysroot under
+`${SRS_INSTALL_ROOT:-$HOME/code/tmp/srs-toolchains}/srs`. The installer uses
+copy-on-write filesystem clones where available and a portable copy fallback
+otherwise. It also copies the Cargo wrapper, Cargo binary, and `sld`, so an
+installed name continues to work after later rebuilds or source-worktree
+cleanup. Mutable bootstrap `rust-src` symlinks back into the source checkout
+are intentionally omitted from the installed snapshot.
 
 On Apple silicon macOS, use Apple containers to exercise the Linux x86_64 build
 lane locally:
@@ -172,6 +178,15 @@ Use a separate rustup toolchain name when keeping multiple SRS builds linked:
 ./install.sh srs-dev
 cargo +srs-dev build
 ```
+
+Installed names are immutable snapshots. The installer refuses to overwrite an
+existing name unless replacement is explicitly requested:
+
+```bash
+SRS_INSTALL_REPLACE=1 ./install.sh srs-dev
+```
+
+Set `SRS_INSTALL_ROOT=/path/to/snapshots` to store the snapshots elsewhere.
 
 The installer also accepts an explicit stage 2 sysroot and Cargo binary:
 

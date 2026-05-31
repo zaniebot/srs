@@ -38,6 +38,9 @@ jobs:
           persist-credentials: false
           submodules: recursive
 
+      - name: Verify immutable installer snapshot
+        run: ./scripts/test-install-snapshot.sh
+
       - name: Verify SRS Cargo wrapper
         run: ./scripts/test-cargo-srs-wrapper.sh
 
