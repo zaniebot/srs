@@ -205,7 +205,8 @@
 //!
 //! TestIncrementalChangedFallbackReason:{string} Substring expected in the logged fallback reason.
 //! When TestIncrementalChangedExpectPatch is false, the fallback is required. When it is true, the
-//! fallback is accepted as an explicitly allowed alternative to the patch fast path.
+//! fallback is accepted as an explicitly allowed alternative to the patch fast path. Can be
+//! repeated to accept compiler-dependent fallback alternatives.
 //!
 //! TestIncrementalChangedPatchedSectionCount:{count} Acceptable changed-section patch count for a
 //! changed-input relink. Can be repeated. Defaults to the exact count implied by
@@ -874,7 +875,7 @@ struct Config {
     test_incremental_removed_input: Option<String>,
     test_incremental_reordered_inputs: bool,
     test_incremental_changed_expect_patch: bool,
-    test_incremental_changed_fallback_reason: Option<String>,
+    test_incremental_changed_fallback_reasons: Vec<String>,
     test_incremental_changed_patched_section_counts: Vec<usize>,
     test_incremental_changed_expect_reuse: bool,
     test_incremental_changed_inputs: Vec<String>,
@@ -1611,7 +1612,7 @@ impl Config {
             test_incremental_removed_input: None,
             test_incremental_reordered_inputs: false,
             test_incremental_changed_expect_patch: true,
-            test_incremental_changed_fallback_reason: None,
+            test_incremental_changed_fallback_reasons: Vec::new(),
             test_incremental_changed_patched_section_counts: Vec::new(),
             test_incremental_changed_expect_reuse: false,
             test_incremental_changed_inputs: Vec::new(),
@@ -2151,7 +2152,9 @@ fn process_directive(
             config.test_incremental_changed_expect_patch = arg.to_lowercase().parse()?;
         }
         "TestIncrementalChangedFallbackReason" => {
-            config.test_incremental_changed_fallback_reason = Some(arg.to_owned());
+            config
+                .test_incremental_changed_fallback_reasons
+                .push(arg.to_owned());
         }
         "TestIncrementalChangedPatchedSectionCount" => {
             config.test_incremental_changed_patched_section_counts.push(
@@ -3008,9 +3011,9 @@ impl ProgramInputs {
                 log.contains(fallback_message) && log.contains("full relink: input file changed:");
             let allowed_fallback_recorded = fallback_recorded
                 && config
-                    .test_incremental_changed_fallback_reason
-                    .as_ref()
-                    .is_some_and(|reason| log.contains(reason));
+                    .test_incremental_changed_fallback_reasons
+                    .iter()
+                    .any(|reason| log.contains(reason));
             if config.platform == PlatformKind::MachO
                 && !config.test_incremental_unsigned_macho_output
                 && !config.test_incremental_private_signed_macho_output
@@ -3088,10 +3091,11 @@ impl ProgramInputs {
                     log
                 );
             } else if !fallback_recorded
-                || config
-                    .test_incremental_changed_fallback_reason
-                    .as_ref()
-                    .is_some_and(|reason| !log.contains(reason))
+                || (!config.test_incremental_changed_fallback_reasons.is_empty()
+                    && !config
+                        .test_incremental_changed_fallback_reasons
+                        .iter()
+                        .any(|reason| log.contains(reason)))
             {
                 bail!(
                     "Incremental test failed for {}: changed-input relink did not record the \
