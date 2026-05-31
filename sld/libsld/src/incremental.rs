@@ -3373,8 +3373,11 @@ impl DirectlyPatchedOutput {
         generation.push(format!(".{}.sld-direct-patch.tmp", std::process::id()));
         let generation = PathBuf::from(generation);
         let _ = std::fs::remove_file(&generation);
-        if !clone_snapshot_bytes(output, &generation) {
-            return None;
+        {
+            verbose_timing_phase!("Clone directly patched output generation");
+            if !clone_snapshot_bytes(output, &generation) {
+                return None;
+            }
         }
         Some(Self {
             path: generation,
@@ -3398,6 +3401,7 @@ impl DirectlyPatchedOutput {
         let Some(published_path) = self.published_path.as_ref() else {
             return Ok(());
         };
+        verbose_timing_phase!("Install directly patched output generation");
         std::fs::rename(&self.path, published_path).with_context(|| {
             format!(
                 "Failed to install directly patched output generation `{}` as `{}`",
@@ -3442,7 +3446,13 @@ fn write_output_ranges(
     file: &mut std::fs::File,
     output_path: &Path,
 ) -> Result {
-    for range in merged_output_ranges(ranges) {
+    let ranges = merged_output_ranges(ranges);
+    verbose_timing_phase!(
+        "Write output generation ranges",
+        range_count = ranges.len(),
+        byte_count = ranges.iter().map(std::ops::Range::len).sum::<usize>()
+    );
+    for range in ranges {
         let Some(output_range) = output.get(range.clone()) else {
             return Err(crate::error!(
                 "Incrementally patched output range {range:?} is out of bounds for `{}`",
