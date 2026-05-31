@@ -1132,6 +1132,7 @@ pub(crate) fn stabilize_rustc_transient_inputs(args: &mut crate::args::Args) -> 
         .as_ref()
         .and_then(|_| PersistedState::read_metadata(&state_dir).unwrap_or_default());
     let mut stabilized = 0;
+    let mut matched_producer_digests = 0;
     let mut reused_isolated = 0;
     for input in &mut common.inputs {
         let InputSpec::File(source) = &input.spec else {
@@ -1142,16 +1143,15 @@ pub(crate) fn stabilize_rustc_transient_inputs(args: &mut crate::args::Args) -> 
         };
         let source = source.to_path_buf();
         let target = stable_dir.join(stable_name);
-        let reused_producer_digest = provenance
+        let producer_digest = provenance
             .as_ref()
-            .and_then(|provenance| provenance.get(&source))
-            .is_some_and(|digest| {
-                stable_rustc_input_matches_previous_producer_digest(
-                    previous.as_ref(),
-                    &target,
-                    digest,
-                )
-            });
+            .and_then(|provenance| provenance.get(&source));
+        if producer_digest.is_some() {
+            matched_producer_digests += 1;
+        }
+        let reused_producer_digest = producer_digest.is_some_and(|digest| {
+            stable_rustc_input_matches_previous_producer_digest(previous.as_ref(), &target, digest)
+        });
         if reused_producer_digest {
             reused_isolated += 1;
         }
@@ -1209,6 +1209,24 @@ pub(crate) fn stabilize_rustc_transient_inputs(args: &mut crate::args::Args) -> 
             &format!(
                 "reused {reused_isolated} isolated rustc work-product input{} by producer digest",
                 if reused_isolated == 1 { "" } else { "s" }
+            ),
+        )?;
+    }
+    if let Some(provenance) = provenance {
+        append_log(
+            &state_dir,
+            &format!(
+                "loaded {} rustc work-product producer digest record{}; matched \
+                 {matched_producer_digests} stabilized input{}; reused {reused_isolated} isolated \
+                 input{}",
+                provenance.len(),
+                if provenance.len() == 1 { "" } else { "s" },
+                if matched_producer_digests == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+                if reused_isolated == 1 { "" } else { "s" },
             ),
         )?;
     }
