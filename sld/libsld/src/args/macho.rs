@@ -238,14 +238,24 @@ impl platform::Args for MachOArgs {
         !self.should_emit_code_signature || self.has_private_persistent_output_contract
     }
 
+    fn should_replace_directly_patched_output(&self) -> bool {
+        cfg!(target_os = "macos")
+            && self.should_emit_code_signature
+            && self.has_private_persistent_output_contract
+    }
+
     fn finalize_directly_patched_output(
         &self,
         output: &mut [u8],
         flush_ranges: &mut Vec<std::ops::Range<usize>>,
+        should_invalidate_code_signature_cache: bool,
     ) -> Result {
         if self.should_emit_code_signature && self.has_private_persistent_output_contract {
-            let code_signature_range =
-                crate::macho_writer::refresh_code_signature(output, flush_ranges)?;
+            let code_signature_range = crate::macho_writer::refresh_code_signature(
+                output,
+                flush_ranges,
+                should_invalidate_code_signature_cache,
+            )?;
             flush_ranges.push(code_signature_range);
         }
         Ok(())
@@ -1240,6 +1250,7 @@ mod tests {
     fn macho_incremental_state_is_published_synchronously() {
         let mut args = MachOArgs::default();
         assert!(!args.should_patch_changed_inputs_before_loading());
+        assert!(!args.should_replace_directly_patched_output());
         assert!(!args.should_snapshot_changed_inputs_while_finalizing_direct_patches());
         assert!(args.should_hash_directly_patched_output());
         assert!(!args.should_trust_persistent_output_data_identity());
@@ -1251,6 +1262,7 @@ mod tests {
 
         args.should_emit_code_signature = false;
         assert!(args.should_patch_changed_inputs_before_loading());
+        assert!(!args.should_replace_directly_patched_output());
         assert!(!args.should_snapshot_changed_inputs_while_finalizing_direct_patches());
         assert!(args.should_hash_directly_patched_output());
         assert!(!args.should_trust_persistent_output_data_identity());
@@ -1276,6 +1288,10 @@ mod tests {
         );
         assert!(args.should_mmap_output_file(FileWriteMode::UpdateInPlaceWithFallback));
         assert!(args.should_patch_changed_inputs_before_loading());
+        assert_eq!(
+            args.should_replace_directly_patched_output(),
+            cfg!(target_os = "macos")
+        );
         assert!(args.should_snapshot_changed_inputs_while_finalizing_direct_patches());
         assert!(!args.should_hash_directly_patched_output());
         assert!(args.should_trust_persistent_output_data_identity());
@@ -1293,6 +1309,7 @@ mod tests {
         assert!(!args.should_adhoc_codesign);
         assert!(!args.should_emit_code_signature);
         assert!(args.should_mmap_output_file(FileWriteMode::UnlinkAndReplace));
+        assert!(!args.should_replace_directly_patched_output());
         assert!(!args.should_snapshot_changed_inputs_while_finalizing_direct_patches());
         assert!(!args.should_hash_directly_patched_output());
         assert!(args.should_trust_persistent_output_data_identity());

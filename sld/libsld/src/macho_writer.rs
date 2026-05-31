@@ -3524,6 +3524,7 @@ fn write_code_signature(layout: &MachOLayout, sized_output: &mut SizedOutput) ->
 pub(crate) fn refresh_code_signature(
     output: &mut [u8],
     changed_ranges: &[Range<usize>],
+    should_invalidate_cache: bool,
 ) -> Result<Range<usize>> {
     timing_phase!("Refresh Mach-O code signature");
     let code_signature_range = {
@@ -3657,7 +3658,9 @@ pub(crate) fn refresh_code_signature(
         }
     }
 
-    invalidate_code_signature_cache(output, code_signature_range.end);
+    if should_invalidate_cache {
+        invalidate_code_signature_cache(output, code_signature_range.end);
+    }
     Ok(code_signature_range)
 }
 

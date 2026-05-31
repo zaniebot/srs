@@ -2614,20 +2614,36 @@ fn patch_changed_inputs(
         return Ok(ChangedInputPatchResult::Unsupported(reason));
     }
 
-    let file = OpenOptions::new()
+    let Some(mut directly_patched_output) =
+        DirectlyPatchedOutput::new(args.output(), args.should_replace_directly_patched_output())
+    else {
+        return Ok(ChangedInputPatchResult::Unsupported(
+            "could not clone directly patched output generation".to_owned(),
+        ));
+    };
+    let should_invalidate_code_signature_cache =
+        directly_patched_output.should_invalidate_code_signature_cache();
+    let mut file = OpenOptions::new()
         .read(true)
         .write(true)
-        .open(args.output())
+        .open(directly_patched_output.path())
         .with_context(|| {
             format!(
                 "Failed to open output `{}` for incremental patching",
-                args.output().display()
+                directly_patched_output.path().display()
             )
         })?;
-    let mut output = unsafe { MmapOptions::new().map_mut(&file) }.with_context(|| {
+    let mut output = if directly_patched_output.is_generation() {
+        // A shared writable mapping can leave the kernel's code-signing cache stale even after an
+        // atomic rename. Patch private pages, then publish them with ordinary file writes.
+        unsafe { MmapOptions::new().map_copy(&file) }
+    } else {
+        unsafe { MmapOptions::new().map_mut(&file) }
+    }
+    .with_context(|| {
         format!(
             "Failed to mmap output `{}` for incremental patching",
-            args.output().display()
+            directly_patched_output.path().display()
         )
     })?;
     match output_symbol_value_patches(&output, &output_symbol_patches)? {
@@ -2780,8 +2796,11 @@ fn patch_changed_inputs(
                             (deferred_loaded_input_content_hashes, snapshot_result)
                         })
                         .context("Failed to spawn incremental input snapshot thread")?;
-                    let finalization_result =
-                        args.finalize_directly_patched_output(&mut output, &mut flush_ranges);
+                    let finalization_result = args.finalize_directly_patched_output(
+                        &mut output,
+                        &mut flush_ranges,
+                        should_invalidate_code_signature_cache,
+                    );
                     let background_result = background
                         .join()
                         .map_err(|_| crate::error!("Incremental input snapshot thread panicked"))?;
@@ -2790,7 +2809,11 @@ fn patch_changed_inputs(
                 })?;
             (Some(snapshot_result), deferred_loaded_input_content_hashes)
         } else {
-            args.finalize_directly_patched_output(&mut output, &mut flush_ranges)?;
+            args.finalize_directly_patched_output(
+                &mut output,
+                &mut flush_ranges,
+                should_invalidate_code_signature_cache,
+            )?;
             (
                 None,
                 hash_deferred_loaded_input_contents(&deferred_loaded_input_content_hashes, true),
@@ -2804,10 +2827,20 @@ fn patch_changed_inputs(
 
     {
         timing_phase!("Flush changed incremental output ranges");
-        flush_output_ranges(&output, &flush_ranges, args.output())?;
+        if directly_patched_output.is_generation() {
+            write_output_ranges(
+                &output,
+                &flush_ranges,
+                &mut file,
+                directly_patched_output.path(),
+            )?;
+        } else {
+            flush_output_ranges(&output, &flush_ranges, directly_patched_output.path())?;
+        }
     }
     drop(output);
     drop(file);
+    directly_patched_output.install()?;
 
     let output = if args.should_hash_directly_patched_output() {
         FileContentState::from_path(args.output())
@@ -3322,11 +3355,118 @@ fn materialize_deferred_relocation_patch(
         .map_err(|error| format!("failed to encode deferred relocation patch: {error:#}"))
 }
 
+struct DirectlyPatchedOutput {
+    path: PathBuf,
+    published_path: Option<PathBuf>,
+}
+
+impl DirectlyPatchedOutput {
+    fn new(output: &Path, should_replace: bool) -> Option<Self> {
+        if !should_replace {
+            return Some(Self {
+                path: output.to_path_buf(),
+                published_path: None,
+            });
+        }
+
+        let mut generation = output.as_os_str().to_os_string();
+        generation.push(format!(".{}.sld-direct-patch.tmp", std::process::id()));
+        let generation = PathBuf::from(generation);
+        let _ = std::fs::remove_file(&generation);
+        if !clone_snapshot_bytes(output, &generation) {
+            return None;
+        }
+        Some(Self {
+            path: generation,
+            published_path: Some(output.to_path_buf()),
+        })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn is_generation(&self) -> bool {
+        self.published_path.is_some()
+    }
+
+    fn should_invalidate_code_signature_cache(&self) -> bool {
+        !self.is_generation()
+    }
+
+    fn install(&mut self) -> Result {
+        let Some(published_path) = self.published_path.as_ref() else {
+            return Ok(());
+        };
+        std::fs::rename(&self.path, published_path).with_context(|| {
+            format!(
+                "Failed to install directly patched output generation `{}` as `{}`",
+                self.path.display(),
+                published_path.display()
+            )
+        })?;
+        self.published_path = None;
+        Ok(())
+    }
+}
+
+impl Drop for DirectlyPatchedOutput {
+    fn drop(&mut self) {
+        if self.published_path.is_some() {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 fn flush_output_ranges(
     output: &memmap2::MmapMut,
     ranges: &[std::ops::Range<usize>],
     output_path: &Path,
 ) -> Result {
+    for range in merged_output_ranges(ranges) {
+        output
+            .flush_range(range.start, range.end - range.start)
+            .with_context(|| {
+                format!(
+                    "Failed to flush incrementally patched output `{}`",
+                    output_path.display()
+                )
+            })?;
+    }
+    Ok(())
+}
+
+fn write_output_ranges(
+    output: &[u8],
+    ranges: &[std::ops::Range<usize>],
+    file: &mut std::fs::File,
+    output_path: &Path,
+) -> Result {
+    for range in merged_output_ranges(ranges) {
+        let Some(output_range) = output.get(range.clone()) else {
+            return Err(crate::error!(
+                "Incrementally patched output range {range:?} is out of bounds for `{}`",
+                output_path.display()
+            ));
+        };
+        file.seek(SeekFrom::Start(range.start as u64))
+            .with_context(|| {
+                format!(
+                    "Failed to seek incrementally patched output `{}`",
+                    output_path.display()
+                )
+            })?;
+        file.write_all(output_range).with_context(|| {
+            format!(
+                "Failed to write incrementally patched output `{}`",
+                output_path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn merged_output_ranges(ranges: &[std::ops::Range<usize>]) -> Vec<std::ops::Range<usize>> {
     let mut ranges = ranges
         .iter()
         .filter(|range| !range.is_empty())
@@ -3344,18 +3484,7 @@ fn flush_output_ranges(
         }
         merged.push(range);
     }
-
-    for range in merged {
-        output
-            .flush_range(range.start, range.end - range.start)
-            .with_context(|| {
-                format!(
-                    "Failed to flush incrementally patched output `{}`",
-                    output_path.display()
-                )
-            })?;
-    }
-    Ok(())
+    merged
 }
 
 #[derive(Clone)]
@@ -14898,6 +15027,45 @@ mod tests {
 
         std::fs::write(&input, b"changed").unwrap();
         assert_eq!(std::fs::read(&snapshot).unwrap(), b"object");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn directly_patched_output_generation_installs_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("app");
+        std::fs::write(&output, b"original").unwrap();
+        let original_identity = FileIdentity::from_path(&output).unwrap().unwrap();
+
+        let in_place = DirectlyPatchedOutput::new(&output, false).unwrap();
+        assert_eq!(in_place.path(), output);
+        assert!(!in_place.is_generation());
+        assert!(in_place.should_invalidate_code_signature_cache());
+        drop(in_place);
+
+        let aborted = DirectlyPatchedOutput::new(&output, true).unwrap();
+        let aborted_path = aborted.path().to_path_buf();
+        assert_ne!(aborted.path(), output);
+        assert!(aborted.is_generation());
+        assert!(!aborted.should_invalidate_code_signature_cache());
+        std::fs::write(aborted.path(), b"aborted").unwrap();
+        drop(aborted);
+        assert_eq!(std::fs::read(&output).unwrap(), b"original");
+        assert!(!aborted_path.exists());
+
+        let mut installed = DirectlyPatchedOutput::new(&output, true).unwrap();
+        let installed_path = installed.path().to_path_buf();
+        std::fs::write(installed.path(), b"changed").unwrap();
+        let installed_identity = FileIdentity::from_path(&installed_path).unwrap().unwrap();
+        installed.install().unwrap();
+        assert!(!installed.is_generation());
+        drop(installed);
+
+        assert_eq!(std::fs::read(&output).unwrap(), b"changed");
+        let output_identity = FileIdentity::from_path(&output).unwrap().unwrap();
+        assert_eq!(output_identity.ino, installed_identity.ino);
+        assert_ne!(output_identity.ino, original_identity.ino);
+        assert!(!installed_path.exists());
     }
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]

@@ -1379,11 +1379,18 @@ pub(crate) trait Args: std::fmt::Debug + Send + Sync + 'static {
         true
     }
 
+    /// Whether direct incremental output patches should be written to a sibling generation and
+    /// atomically installed after platform-specific finalization completes.
+    fn should_replace_directly_patched_output(&self) -> bool {
+        false
+    }
+
     /// Finalize platform-specific data derived from bytes modified by a direct incremental patch.
     fn finalize_directly_patched_output(
         &self,
         _output: &mut [u8],
         _flush_ranges: &mut Vec<std::ops::Range<usize>>,
+        _should_invalidate_code_signature_cache: bool,
     ) -> Result {
         Ok(())
     }
