@@ -239,6 +239,9 @@
 //! incremental link intentionally reserves capacity and the changed incremental output should
 //! preserve that older layout.
 //!
+//! TestIncrementalChangedRun:{bool} Whether to execute the changed-input incremental output before
+//! a fresh full relink can overwrite it. Defaults to false.
+//!
 //! TestIncrementalChangedRestore:{bool} Whether the changed-input test should restore the changed
 //! input object, then check that a second incremental update returns to the original output.
 //! Defaults to false.
@@ -290,6 +293,9 @@
 //!
 //! BsdArchive:{source-filename}[:extra-compilation-args] Builds the specified filename as a bsd
 //! archive and adds it to the link.
+//!
+//! Rlib:{source-filename}[:extra-compilation-args] Builds the specified Rust filename as an rlib
+//! and adds it to the link.
 //!
 //! Shared:{source-filename}[:extra-compilation-args] Builds the specified filename as a shared
 //! object and adds it to the link.
@@ -886,6 +892,7 @@ struct Config {
     test_incremental_changed_grow_section: Option<u64>,
     test_incremental_changed_append_archive_member: bool,
     test_incremental_changed_compare_full: bool,
+    test_incremental_changed_run: bool,
     test_incremental_changed_restore: bool,
     test_incremental_changed_section_prefix: Option<ExpectedSectionBytes>,
     test_incremental_changed_symbol_bytes: Option<ExpectedSymbolBytes>,
@@ -1521,6 +1528,7 @@ enum InputType {
     Archive,
     ThinArchive,
     BsdArchive,
+    Rlib,
     #[strum(serialize = "Shared")]
     SharedObject,
     LinkerScript,
@@ -1623,6 +1631,7 @@ impl Config {
             test_incremental_changed_grow_section: None,
             test_incremental_changed_append_archive_member: false,
             test_incremental_changed_compare_full: true,
+            test_incremental_changed_run: false,
             test_incremental_changed_restore: false,
             test_incremental_changed_section_prefix: None,
             test_incremental_changed_symbol_bytes: None,
@@ -2027,7 +2036,7 @@ fn process_directive(
         ),
         "AutoAddObjects" => config.auto_add_objects = parse_bool(arg, "AutoAddObjects")?,
         input_type @ ("Object" | "Relocatable" | "Archive" | "ThinArchive" | "BsdArchive"
-        | "Shared" | "LinkerScript") => {
+        | "Rlib" | "Shared" | "LinkerScript") => {
             let input_type = InputType::from_str(input_type)?;
 
             let mut arg = arg;
@@ -2196,6 +2205,9 @@ fn process_directive(
         }
         "TestIncrementalChangedCompareFull" => {
             config.test_incremental_changed_compare_full = arg.to_lowercase().parse()?;
+        }
+        "TestIncrementalChangedRun" => {
+            config.test_incremental_changed_run = arg.to_lowercase().parse()?;
         }
         "TestIncrementalChangedRestore" => {
             config.test_incremental_changed_restore = arg.to_lowercase().parse()?;
@@ -2911,6 +2923,14 @@ impl ProgramInputs {
                 && !config.test_incremental_unsigned_macho_output
             {
                 verify_macho_signature(&link_output_3.binary)?;
+            }
+            if config.test_incremental_changed_run {
+                run_binary(&link_output_3.binary, cross_arch).with_context(|| {
+                    format!(
+                        "Failed to run changed incremental output `{}`",
+                        link_output_3.binary.display()
+                    )
+                })?;
             }
 
             if let Some(expected) = &config.test_incremental_changed_section_prefix {
@@ -4055,65 +4075,7 @@ const EXIT_SUCCESS: i32 = 42;
 
 impl Program<'_> {
     fn run(&self, cross_arch: Option<Architecture>) -> Result {
-        let mut command = if let Some(arch) = cross_arch {
-            let mut c = Command::new(format!("qemu-{arch}"));
-            c.arg("-L");
-            c.arg(arch.get_cross_sysroot_path());
-
-            let extra_lib_paths = arch.qemu_extra_lib_paths();
-            if !extra_lib_paths.is_empty() {
-                c.arg("-E");
-                c.arg(format!("LD_LIBRARY_PATH={}", extra_lib_paths.join(":")));
-            }
-
-            c.arg(&self.link_output.binary);
-            c
-        } else {
-            Command::new(&self.link_output.binary)
-        };
-
-        // Similarly to cargo test, capture all the run-time output, since it may contain useful
-        // error messages. We only show it if the exit status is a failure since otherwise messages
-        // that are expected, e.g. panic messages, would be potentially confusing to see.
-        let (mut recv, send) = std::io::pipe()?;
-        command.stdout(send.try_clone()?).stderr(send);
-
-        let spawn_result = spawn_with_retry(&mut command, 10);
-
-        let mut child = spawn_result.with_context(|| {
-            format!(
-                "Command `{}` failed",
-                command.get_program().to_string_lossy()
-            )
-        })?;
-
-        // We need to drop command here since it holds a copy or two of our send pipe. While they
-        // are open, our `recv_to_end` call below can't finish.
-        drop(command);
-
-        let mut output = Vec::new();
-
-        let status = std::thread::scope(|scope| -> Result<ExitStatus> {
-            scope.spawn(|| {
-                let _ = recv.read_to_end(&mut output);
-            });
-
-            match child.wait_timeout(test_binary_timeout())? {
-                Some(s) => Ok(s),
-                None => {
-                    child.kill()?;
-                    bail!("Binary ran for too long");
-                }
-            }
-        })?;
-
-        let output = String::from_utf8_lossy(&output);
-
-        if status.code() != Some(EXIT_SUCCESS) {
-            bail!("Binary exited with unexpected {status}: {output}");
-        }
-
-        Ok(())
+        run_binary(&self.link_output.binary, cross_arch)
     }
 
     fn run_as_dynlib(&self, entry_sym: &str) -> Result {
@@ -4139,6 +4101,68 @@ impl Program<'_> {
 
         Ok(())
     }
+}
+
+fn run_binary(binary: &Path, cross_arch: Option<Architecture>) -> Result {
+    let mut command = if let Some(arch) = cross_arch {
+        let mut c = Command::new(format!("qemu-{arch}"));
+        c.arg("-L");
+        c.arg(arch.get_cross_sysroot_path());
+
+        let extra_lib_paths = arch.qemu_extra_lib_paths();
+        if !extra_lib_paths.is_empty() {
+            c.arg("-E");
+            c.arg(format!("LD_LIBRARY_PATH={}", extra_lib_paths.join(":")));
+        }
+
+        c.arg(binary);
+        c
+    } else {
+        Command::new(binary)
+    };
+
+    // Similarly to cargo test, capture all the run-time output, since it may contain useful
+    // error messages. We only show it if the exit status is a failure since otherwise messages
+    // that are expected, e.g. panic messages, would be potentially confusing to see.
+    let (mut recv, send) = std::io::pipe()?;
+    command.stdout(send.try_clone()?).stderr(send);
+
+    let spawn_result = spawn_with_retry(&mut command, 10);
+
+    let mut child = spawn_result.with_context(|| {
+        format!(
+            "Command `{}` failed",
+            command.get_program().to_string_lossy()
+        )
+    })?;
+
+    // We need to drop command here since it holds a copy or two of our send pipe. While they
+    // are open, our `recv_to_end` call below can't finish.
+    drop(command);
+
+    let mut output = Vec::new();
+
+    let status = std::thread::scope(|scope| -> Result<ExitStatus> {
+        scope.spawn(|| {
+            let _ = recv.read_to_end(&mut output);
+        });
+
+        match child.wait_timeout(test_binary_timeout())? {
+            Some(s) => Ok(s),
+            None => {
+                child.kill()?;
+                bail!("Binary ran for too long");
+            }
+        }
+    })?;
+
+    let output = String::from_utf8_lossy(&output);
+
+    if status.code() != Some(EXIT_SUCCESS) {
+        bail!("Binary exited with unexpected {status}: {output}");
+    }
+
+    Ok(())
 }
 
 /// Attempts to spawn `command`. If that fails due to ETXTBSY, then retries until we've tried
@@ -4297,7 +4321,7 @@ fn build_linker_input(
             }
             LinkerInput::new(archive_path)
         }
-        InputType::Object => {
+        InputType::Object | InputType::Rlib => {
             if objects.len() > 1 {
                 bail!(
                     "Multiple source files on a single line is only supported with Shared/Archive"
@@ -4416,13 +4440,18 @@ fn build_obj_impl(
             inputs,
         });
     };
+    ensure!(
+        input_type != InputType::Rlib || compiler_kind == CompilerKind::Rust,
+        "Rlib input requires a Rust source file"
+    );
 
     // For Rust programs, we don't have an easy way to separate compilation from linking, so we
     // output Rust compilation to a directory containing copies of the object files and a script to
     // perform the link step.
-    let suffix = match compiler_kind {
-        CompilerKind::C => ".o",
-        CompilerKind::Rust => ".d",
+    let suffix = match (&compiler_kind, input_type) {
+        (CompilerKind::C, _) => ".o",
+        (CompilerKind::Rust, InputType::Rlib) => ".rlib",
+        (CompilerKind::Rust, _) => ".d",
     };
 
     let mut command = Command::new(&compiler);
@@ -4474,13 +4503,18 @@ fn build_obj_impl(
             command.arg("-MD");
         }
         CompilerKind::Rust => {
-            let sld = sld_path().to_str().context("Need UTF-8 path")?.to_owned();
+            if input_type == InputType::Rlib {
+                command.args(config.rustc_channel.as_arg());
+                command.args(["--crate-type", "rlib"]);
+            } else {
+                let sld = sld_path().to_str().context("Need UTF-8 path")?.to_owned();
 
-            command
-                .env("SLD_SAVE_SKIP_LINKING", "1")
-                .args(config.rustc_channel.as_arg())
-                .args(["-C", "linker=clang"])
-                .args(["-C", &format!("link-arg=--ld-path={sld}")]);
+                command
+                    .env("SLD_SAVE_SKIP_LINKING", "1")
+                    .args(config.rustc_channel.as_arg())
+                    .args(["-C", "linker=clang"])
+                    .args(["-C", &format!("link-arg=--ld-path={sld}")]);
+            }
 
             if let Some(arch) = cross_arch {
                 // Debian sets sysroot to `/` and uses real paths for libraries in linker scripts.
@@ -4541,6 +4575,9 @@ fn build_obj_impl(
 
     match compiler_kind {
         CompilerKind::C => {
+            command.arg("-o").arg(&output_path);
+        }
+        CompilerKind::Rust if input_type == InputType::Rlib => {
             command.arg("-o").arg(&output_path);
         }
         CompilerKind::Rust => {
@@ -6518,6 +6555,7 @@ impl Display for InputType {
             InputType::Archive => write!(f, "archive"),
             InputType::ThinArchive => write!(f, "thin archive"),
             InputType::BsdArchive => write!(f, "bsd archive"),
+            InputType::Rlib => write!(f, "rlib"),
             InputType::SharedObject => write!(f, "shared"),
             InputType::LinkerScript => write!(f, "linker script"),
         }
