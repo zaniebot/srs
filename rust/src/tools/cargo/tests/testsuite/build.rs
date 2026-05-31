@@ -6432,6 +6432,8 @@ fn sld_native_incremental_scopes_root_linker_environment() {
                     for variable in [
                         "SLD_INCREMENTAL",
                         "SLD_INCREMENTAL_PADDING_PERCENT",
+                        "SLD_RUSTC_WORK_PRODUCT_PROVENANCE",
+                        "SLD_RUSTC_WORK_PRODUCT_PROVENANCE_FILE",
                         "SLD_STABILIZE_RUSTC_TRANSIENT_INPUTS",
                         "SLD_EXPERIMENT_PRIVATE_PERSISTENT_OUTPUT",
                         "SLD_EXPERIMENT_UNSIGNED_PERSISTENT_OUTPUT",
@@ -6461,6 +6463,8 @@ fn sld_native_incremental_scopes_root_linker_environment() {
                     let variables = [
                         "SLD_INCREMENTAL",
                         "SLD_INCREMENTAL_PADDING_PERCENT",
+                        "SLD_RUSTC_WORK_PRODUCT_PROVENANCE",
+                        "SLD_RUSTC_WORK_PRODUCT_PROVENANCE_FILE",
                         "SLD_STABILIZE_RUSTC_TRANSIENT_INPUTS",
                         "SLD_EXPERIMENT_PRIVATE_PERSISTENT_OUTPUT",
                         "SLD_EXPERIMENT_UNSIGNED_PERSISTENT_OUTPUT",
@@ -6470,6 +6474,7 @@ fn sld_native_incremental_scopes_root_linker_environment() {
                             for (variable, value) in [
                                 ("SLD_INCREMENTAL", "1"),
                                 ("SLD_INCREMENTAL_PADDING_PERCENT", "set"),
+                                ("SLD_RUSTC_WORK_PRODUCT_PROVENANCE", "1"),
                                 ("SLD_STABILIZE_RUSTC_TRANSIENT_INPUTS", "set"),
                                 ("SLD_EXPERIMENT_PRIVATE_PERSISTENT_OUTPUT", "1"),
                             ] {
@@ -6506,6 +6511,8 @@ fn sld_native_incremental_scopes_root_linker_environment() {
         .env("RUSTC_WRAPPER", wrapper_project.bin("sld-env-wrapper"))
         .env("SLD_INCREMENTAL", "poison")
         .env("SLD_INCREMENTAL_PADDING_PERCENT", "set")
+        .env("SLD_RUSTC_WORK_PRODUCT_PROVENANCE", "poison")
+        .env("SLD_RUSTC_WORK_PRODUCT_PROVENANCE_FILE", "poison")
         .env("SLD_STABILIZE_RUSTC_TRANSIENT_INPUTS", "set")
         .env("SLD_EXPERIMENT_PRIVATE_PERSISTENT_OUTPUT", "poison")
         .env("SLD_EXPERIMENT_UNSIGNED_PERSISTENT_OUTPUT", "poison")
