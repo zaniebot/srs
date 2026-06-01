@@ -12,6 +12,7 @@ cargo_bin="$scratch/cargo"
 sld_bin="$scratch/sld"
 rustup_bin="$scratch/rustup"
 rustup_links="$scratch/rustup-links"
+physical_install_root="$scratch/physical-install-root"
 install_root="$scratch/install-root"
 name="srs-snapshot-smoke"
 snapshot_dir="$install_root/$name"
@@ -22,7 +23,9 @@ mkdir -p \
     "$toolchain_dir/lib/rustlib/rustc-src" \
     "$toolchain_dir/lib/rustlib/src" \
     "$rustup_links" \
+    "$physical_install_root" \
     "$scratch/rust-source"
+ln -s "$physical_install_root" "$install_root"
 ln -s "$scratch/rust-source" "$toolchain_dir/lib/rustlib/rustc-src/rust"
 ln -s "$scratch/rust-source" "$toolchain_dir/lib/rustlib/src/rust"
 

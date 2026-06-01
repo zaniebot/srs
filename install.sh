@@ -93,6 +93,7 @@ fi
 
 mkdir -p "$install_root"
 staging_dir="$(mktemp -d "$install_root/.${name}.tmp.XXXXXX")"
+staging_dir_physical="$(cd -P "$staging_dir" && pwd)"
 replaced_snapshot=""
 snapshot_published=0
 install_complete=0
@@ -166,7 +167,7 @@ while IFS= read -r -d '' symlink; do
     else
         resolved_target="$target_parent/$target_name"
     fi
-    if [[ "$resolved_target" != "$staging_dir" && "$resolved_target" != "$staging_dir/"* ]]; then
+    if [[ "$resolved_target" != "$staging_dir_physical" && "$resolved_target" != "$staging_dir_physical/"* ]]; then
         printf 'refusing external relative symlink in SRS toolchain snapshot: %s -> %s\n' "$symlink" "$target" >&2
         external_symlink_found=1
     fi
