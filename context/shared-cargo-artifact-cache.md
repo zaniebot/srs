@@ -87,7 +87,8 @@ eviction immediately reclaims storage while target-directory hardlinks remain.
 Concurrent restores use shared cache locks. Publication, cleanup, and eviction
 use an exclusive cache lock. When the filesystem does not provide reliable
 locking, Cargo executes normally without restoring or publishing shared
-artifacts.
+artifacts. Conflicting cache locks also fall back to an opportunistic ordinary
+compilation rather than delaying the build.
 
 Cache descendants and modeled generated-input trees are traversed without
 following symlinks. A symlinked or otherwise unsupported tree falls back to an
@@ -98,9 +99,14 @@ ordinary compilation rather than participating in shared restoration.
 Set `SRS_CARGO_ARTIFACT_CACHE=0` to disable shared artifact restoration.
 
 Set `SRS_CARGO_ARTIFACT_CACHE_DIR` to choose a different central cache root.
+The wrapper exports its per-user default directory, so this alias or the
+lower-level environment setting should be used to override that default for
+`cargo +srs`; a TOML `artifact-cache-dir` setting has lower precedence.
 
 Set `SRS_CARGO_ARTIFACT_CACHE_MATERIALIZATION=copy` to retain cache reuse
-without hardlink materialization.
+without hardlink materialization. When no alias or lower-level environment
+setting is present, Cargo's normal `hardlink` default applies and a TOML
+`artifact-cache-materialization` setting remains effective.
 
 Set `SRS_CARGO_ARTIFACT_CACHE_MAX_SIZE` to a human-readable cache limit such as
 `100GiB`. The cache is unbounded when this variable is unset.
