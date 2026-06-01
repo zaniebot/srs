@@ -386,6 +386,29 @@ fn is_runtime_library(path: &Path) -> bool {
     })
 }
 
+fn directory_runtime_library_files(path: &Path) -> Option<Vec<PathBuf>> {
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
+        Err(_) => return None,
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry.ok()?;
+        let path = entry.path();
+        let file_type = entry.file_type().ok()?;
+        if file_type.is_symlink() {
+            if is_runtime_library(&path) {
+                return None;
+            }
+        } else if file_type.is_file() && is_runtime_library(&path) {
+            files.push(path);
+        }
+    }
+    files.sort();
+    Some(files)
+}
+
 fn is_codegen_backend(path: &Path) -> bool {
     path.components()
         .any(|component| component.as_os_str() == "codegen-backends")
@@ -525,11 +548,7 @@ fn artifact_cache_identity_for_program(path: &Path) -> Option<ArtifactCacheIdent
     }
 
     let mut modeled_files = directory_files(&sysroot.join("lib"), false)?;
-    modeled_files.extend(
-        directory_files(&sysroot.join("bin"), false)?
-            .into_iter()
-            .filter(|path| is_runtime_library(path)),
-    );
+    modeled_files.extend(directory_runtime_library_files(&sysroot.join("bin"))?);
     let rustlib = sysroot.join("lib").join("rustlib");
     for target in std::fs::read_dir(&rustlib).ok()? {
         let target = target.ok()?;
@@ -776,6 +795,44 @@ mod artifact_cache_identity_tests {
 
         assert!(first.witness.is_current());
         assert_eq!(first.digest, second.digest);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sysroot_bin_non_runtime_symlinks_do_not_disable_compiler_identity() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let sysroot = temp.path().join("toolchain");
+        let rustc = sysroot.join("bin").join("rustc");
+        let rustlib = sysroot.join("lib").join("rustlib");
+        let wrapper = temp.path().join("cargo-srs.sh");
+        std::fs::create_dir_all(rustc.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&rustlib).unwrap();
+        std::fs::write(&rustc, b"rustc").unwrap();
+        std::fs::write(&wrapper, b"wrapper").unwrap();
+        symlink(&wrapper, sysroot.join("bin").join("cargo")).unwrap();
+
+        assert!(artifact_cache_identity_for_program(&rustc).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sysroot_bin_runtime_library_symlinks_disable_compiler_identity() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let sysroot = temp.path().join("toolchain");
+        let rustc = sysroot.join("bin").join("rustc");
+        let rustlib = sysroot.join("lib").join("rustlib");
+        let runtime = temp.path().join("librustc_driver.dylib");
+        std::fs::create_dir_all(rustc.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&rustlib).unwrap();
+        std::fs::write(&rustc, b"rustc").unwrap();
+        std::fs::write(&runtime, b"driver").unwrap();
+        symlink(&runtime, sysroot.join("bin").join("librustc_driver.dylib")).unwrap();
+
+        assert!(artifact_cache_identity_for_program(&rustc).is_none());
     }
 
     #[cfg(unix)]
