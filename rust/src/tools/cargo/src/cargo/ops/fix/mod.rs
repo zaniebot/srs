@@ -87,6 +87,11 @@ const IDIOMS_ENV_INTERNAL: &str = "__CARGO_FIX_IDIOMS";
 const YOLO_ENV_INTERNAL: &str = "__CARGO_FIX_YOLO";
 /// The maximum number of rustfix iterations for suggestions that overlap.
 const MAX_RETRIES_ENV: &str = "CARGO_FIX_MAX_RETRIES";
+/// Schema version for the stable Cargo-as-rustc proxy artifact identity.
+///
+/// Bump this whenever proxy behavior changes in a way that can affect the
+/// contents written by `cargo fix`, even if there is no new user-facing option.
+const FIX_PROXY_METADATA_SCHEMA_VERSION: u32 = 2;
 /// **Internal only.**
 /// The sysroot path.
 ///
@@ -250,8 +255,8 @@ fn format_fix_proxy_metadata(
 ) -> String {
     let edition = edition.map(EditionFixMode::to_string).unwrap_or_default();
     format!(
-        "cargo-fix:edition={edition}:idioms={}:broken-code={}:yolo={}:max-retries={}",
-        idioms, broken_code, yolo, max_retries,
+        "cargo-fix:v{FIX_PROXY_METADATA_SCHEMA_VERSION}:edition={edition}:idioms={}:broken-code={}:yolo={}:max-retries={}",
+        idioms, broken_code, yolo, max_retries
     )
 }
 
@@ -808,9 +813,9 @@ pub fn fix_exec_rustc(gctx: &GlobalContext, lock_addr: &str) -> CargoResult<()> 
     let fixes = rustfix_crate(&lock_addr, &rustc, &args.file, &args, gctx)?;
 
     if fixes.last_output.status.success() {
-        for (path, file) in fixes.files.iter() {
+        for file in fixes.files.values() {
             Message::Fixed {
-                file: path.clone(),
+                file: file.display_name.clone(),
                 fixes: file.fixes_applied,
             }
             .post(gctx)?;
@@ -880,7 +885,7 @@ fn emit_output(output: &Output) -> CargoResult<()> {
 
 struct FixedCrate {
     /// Map of file path to some information about modifications made to that file.
-    files: HashMap<String, FixedFile>,
+    files: HashMap<PathBuf, FixedFile>,
     /// The output from rustc from the first time it was called.
     ///
     /// This is needed when fixes fail to apply, so that it can display the
@@ -899,9 +904,15 @@ struct FixedCrate {
 
 #[derive(Debug)]
 struct FixedFile {
+    display_name: String,
     errors_applying_fixes: Vec<String>,
     fixes_applied: u32,
     original_code: String,
+}
+
+struct FileSuggestions {
+    display_name: String,
+    suggestions: Vec<rustfix::Suggestion>,
 }
 
 /// Attempts to apply fixes to a single crate.
@@ -1051,10 +1062,10 @@ fn rustfix_crate(
 
     // Any errors still remaining at this point need to be reported as probably
     // bugs in Cargo and/or rustfix.
-    for (path, file) in files.iter_mut() {
+    for file in files.values_mut() {
         for error in file.errors_applying_fixes.drain(..) {
             Message::ReplaceFailed {
-                file: path.clone(),
+                file: file.display_name.clone(),
                 message: error,
             }
             .post(gctx)?;
@@ -1074,7 +1085,7 @@ fn collect_file_suggestions(
     filename: &Path,
     args: &FixArgs,
     gctx: &GlobalContext,
-) -> CargoResult<HashMap<String, Vec<rustfix::Suggestion>>> {
+) -> CargoResult<HashMap<PathBuf, FileSuggestions>> {
     // If rustc didn't succeed for whatever reasons then we're very likely to be
     // looking at otherwise broken code. Let's not make things accidentally
     // worse by applying fixes where a bug could cause *more* broken code.
@@ -1110,14 +1121,21 @@ fn collect_file_suggestions(
     // Collect suggestions by file so we can apply them one at a time later.
     let mut file_map = HashMap::new();
     let mut num_suggestion = 0;
-    // It's safe since we won't read any content under home dir.
-    let home_path = gctx.home().as_path_unlocked();
+    // Reject protected lexical descendants, then keep using the resolved target
+    // for containment checks, snapshots, and writes. This collapses relative
+    // and symlink aliases while still allowing legitimate shared sources such
+    // as cross-workspace `#[path]` references. Requiring the source to exist is
+    // deliberate:
+    // rustfix can only edit existing files, and skipping an unresolvable path
+    // is safer than applying a suggestion through an unchecked alias.
+    let protected_roots =
+        ProtectedSourceRoots::new(gctx.home().as_path_unlocked(), args.sysroot.as_deref())?;
     for suggestion in suggestions {
         trace!("suggestion");
         // Make sure we've got a file associated with this suggestion and all
         // snippets point to the same file. Right now it's not clear what
         // we would do with multiple files.
-        let file_names = suggestion
+        let mut file_names = suggestion
             .solutions
             .iter()
             .flat_map(|s| s.replacements.iter())
@@ -1129,28 +1147,35 @@ fn collect_file_suggestions(
             trace!("rejecting as it has no solutions {:?}", suggestion);
             continue;
         };
-
-        let file_path = Path::new(&file_name);
-        // Do not write into registry cache. See rust-lang/cargo#9857.
-        if file_path.starts_with(home_path) {
-            continue;
-        }
-        // Do not write into standard library source. See rust-lang/cargo#9857.
-        if let Some(sysroot) = args.sysroot.as_deref() {
-            if file_path.starts_with(sysroot) {
+        let file_path =
+            if let Some(file_path) = protected_roots.resolve_unprotected(&file_name, gctx.cwd()) {
+                file_path
+            } else {
+                trace!(
+                    "rejecting as it has no unprotected resolvable solutions {:?}",
+                    suggestion
+                );
                 continue;
-            }
-        }
+            };
 
-        if !file_names.clone().all(|f| f == &file_name) {
+        if !file_names.all(|file_name| {
+            protected_roots
+                .resolve_unprotected(file_name, gctx.cwd())
+                .as_ref()
+                == Some(&file_path)
+        }) {
             trace!("rejecting as it changes multiple files: {:?}", suggestion);
             continue;
         }
 
-        trace!("adding suggestion for {:?}: {:?}", file_name, suggestion);
+        trace!("adding suggestion for {:?}: {:?}", file_path, suggestion);
         file_map
-            .entry(file_name)
-            .or_insert_with(Vec::new)
+            .entry(file_path)
+            .or_insert_with(|| FileSuggestions {
+                display_name: file_name,
+                suggestions: Vec::new(),
+            })
+            .suggestions
             .push(suggestion);
         num_suggestion += 1;
     }
@@ -1163,19 +1188,116 @@ fn collect_file_suggestions(
     Ok(file_map)
 }
 
+struct ProtectedSourceRoots {
+    home: ProtectedSourceRoot,
+    cached_sources: [ProtectedSourceRoot; 2],
+    sysroot: Option<ProtectedSourceRoot>,
+}
+
+struct ProtectedSourceRoot {
+    normalized: PathBuf,
+    canonical: Option<PathBuf>,
+}
+
+impl ProtectedSourceRoots {
+    fn new(home: &Path, sysroot: Option<&Path>) -> CargoResult<Self> {
+        let cached_sources = [
+            ProtectedSourceRoot::new(&home.join("registry"), "registry cache")?,
+            ProtectedSourceRoot::new(&home.join("git"), "Git cache")?,
+        ];
+        let home = ProtectedSourceRoot::new(home, "Cargo home")?;
+        let sysroot = sysroot
+            .map(|sysroot| ProtectedSourceRoot::new(sysroot, "sysroot"))
+            .transpose()?;
+        Ok(Self {
+            home,
+            cached_sources,
+            sysroot,
+        })
+    }
+
+    fn resolve_unprotected(&self, file_name: &str, cwd: &Path) -> Option<PathBuf> {
+        let file_path = Path::new(file_name);
+        let is_absolute = file_path.is_absolute();
+        let file_path = if is_absolute {
+            file_path.to_owned()
+        } else {
+            cwd.join(file_path)
+        };
+        let normalized = paths::normalize_path(&file_path);
+        let file_path = match fs::canonicalize(&file_path) {
+            Ok(file_path) => file_path,
+            Err(error) => {
+                trace!("rejecting unresolvable source path {normalized:?}: {error}");
+                return None;
+            }
+        };
+
+        // Do not write into registry cache. See rust-lang/cargo#9857.
+        //
+        // Preserve the historical behavior for absolute paths anywhere below
+        // Cargo home, while allowing a workspace below a custom Cargo home to
+        // use the usual relative rustc diagnostics. Cache roots remain
+        // protected for both relative paths and aliases.
+        if (is_absolute && self.home.contains(&normalized, &file_path))
+            || self
+                .cached_sources
+                .iter()
+                .any(|root| root.contains(&normalized, &file_path))
+        {
+            return None;
+        }
+        // Do not write into standard library source. See rust-lang/cargo#9857.
+        if self
+            .sysroot
+            .as_ref()
+            .is_some_and(|sysroot| sysroot.contains(&normalized, &file_path))
+        {
+            return None;
+        }
+        Some(file_path)
+    }
+}
+
+impl ProtectedSourceRoot {
+    fn new(path: &Path, name: &str) -> CargoResult<Self> {
+        let normalized = paths::normalize_path(path);
+        let canonical = match fs::canonicalize(path) {
+            Ok(canonical) => Some(canonical),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to resolve {name} `{}`", path.display()));
+            }
+        };
+        Ok(Self {
+            normalized,
+            canonical,
+        })
+    }
+
+    fn contains(&self, normalized: &Path, canonical: &Path) -> bool {
+        normalized.starts_with(&self.normalized)
+            || self
+                .canonical
+                .as_deref()
+                .is_some_and(|root| canonical.starts_with(root))
+    }
+}
+
 fn snapshot_sources(
-    file_map: &HashMap<String, Vec<rustfix::Suggestion>>,
-) -> Option<HashMap<String, String>> {
+    file_map: &HashMap<PathBuf, FileSuggestions>,
+) -> Option<HashMap<PathBuf, String>> {
     file_map
         .keys()
-        .map(|file| Some((file.clone(), paths::read(file.as_ref()).ok()?)))
+        .map(|file| Some((file.clone(), paths::read(file).ok()?)))
         .collect()
 }
 
-fn sources_match(snapshots: &HashMap<String, String>) -> bool {
+fn sources_match(snapshots: &HashMap<PathBuf, String>) -> bool {
     snapshots
         .iter()
-        .all(|(file, expected)| paths::read(file.as_ref()).is_ok_and(|source| source == *expected))
+        .all(|(file, expected)| paths::read(file).is_ok_and(|source| source == *expected))
 }
 
 /// Executes `rustc` to apply one round of suggestions to the crate in question.
@@ -1183,7 +1305,7 @@ fn sources_match(snapshots: &HashMap<String, String>) -> bool {
 /// This will fill in the `fixes` map with original code, suggestions applied,
 /// and any errors encountered while fixing files.
 fn rustfix_and_fix(
-    files: &mut HashMap<String, FixedFile>,
+    files: &mut HashMap<PathBuf, FixedFile>,
     rustc: &ProcessBuilder,
     filename: &Path,
     args: &FixArgs,
@@ -1196,30 +1318,35 @@ fn rustfix_and_fix(
 }
 
 fn apply_suggestions(
-    files: &mut HashMap<String, FixedFile>,
+    files: &mut HashMap<PathBuf, FixedFile>,
     output: Output,
-    file_map: HashMap<String, Vec<rustfix::Suggestion>>,
+    file_map: HashMap<PathBuf, FileSuggestions>,
 ) -> CargoResult<(Output, bool)> {
     let mut made_changes = false;
-    for (file, suggestions) in file_map {
+    for (file, file_suggestions) in file_map {
+        let FileSuggestions {
+            display_name,
+            suggestions,
+        } = file_suggestions;
         // Attempt to read the source code for this file. If this fails then
         // that'd be pretty surprising, so log a message and otherwise keep
         // going.
-        let code = match paths::read(file.as_ref()) {
+        let code = match paths::read(&file) {
             Ok(s) => s,
             Err(e) => {
-                warn!("failed to read `{}`: {}", file, e);
+                warn!("failed to read `{}`: {}", file.display(), e);
                 continue;
             }
         };
         let num_suggestions = suggestions.len();
-        debug!("applying {} fixes to {}", num_suggestions, file);
+        debug!("applying {} fixes to {}", num_suggestions, file.display());
 
         // If this file doesn't already exist then we just read the original
         // code, so save it. If the file already exists then the original code
         // doesn't need to be updated as we've just read an interim state with
         // some fixes but perhaps not all.
         let fixed_file = files.entry(file.clone()).or_insert_with(|| FixedFile {
+            display_name,
             errors_applying_fixes: Vec::new(),
             fixes_applied: 0,
             original_code: code.clone(),
@@ -1512,7 +1639,7 @@ impl FixArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::{EditionFixMode, FixArgs, format_fix_proxy_metadata};
+    use super::{EditionFixMode, FixArgs, ProtectedSourceRoots, format_fix_proxy_metadata};
     use crate::core::Edition;
     use std::ffi::OsString;
     use std::io::Write as _;
@@ -1521,6 +1648,10 @@ mod tests {
     #[test]
     fn fix_proxy_metadata_distinguishes_behavioral_modes() {
         let plain = format_fix_proxy_metadata(None, false, false, false, 4);
+        assert_eq!(
+            plain,
+            "cargo-fix:v2:edition=:idioms=false:broken-code=false:yolo=false:max-retries=4"
+        );
         let variants = [
             format_fix_proxy_metadata(Some(&EditionFixMode::NextRelative), false, false, false, 4),
             format_fix_proxy_metadata(None, true, false, false, 4),
@@ -1540,6 +1671,202 @@ mod tests {
         for variant in variants {
             assert_ne!(plain, variant);
         }
+    }
+
+    #[test]
+    fn protected_sources_reject_relative_aliases() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let source = home.join("registry/src/lib.rs");
+        let cwd = temp.path().join("workspace/src");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(&source, "fn main() {}").unwrap();
+
+        let roots = ProtectedSourceRoots::new(&home, None).unwrap();
+        assert!(
+            roots
+                .resolve_unprotected("../../home/registry/src/lib.rs", &cwd)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn protected_sources_allow_missing_cargo_home() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("missing-home");
+        let source = temp.path().join("workspace/src/lib.rs");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "fn main() {}").unwrap();
+
+        let roots = ProtectedSourceRoots::new(&home, None).unwrap();
+        assert_eq!(
+            roots.resolve_unprotected(source.to_str().unwrap(), temp.path()),
+            Some(std::fs::canonicalize(source).unwrap())
+        );
+    }
+
+    #[test]
+    fn protected_sources_allow_relative_workspace_below_cargo_home() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let workspace = home.join("workspace");
+        let source = workspace.join("src/lib.rs");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "fn main() {}").unwrap();
+
+        let roots = ProtectedSourceRoots::new(&home, None).unwrap();
+        assert_eq!(
+            roots.resolve_unprotected("src/lib.rs", &workspace),
+            Some(std::fs::canonicalize(source).unwrap())
+        );
+    }
+
+    #[test]
+    fn protected_sources_reject_relative_sysroot_aliases() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let sysroot = temp.path().join("sysroot");
+        let source = sysroot.join("library/core/src/lib.rs");
+        let cwd = temp.path().join("workspace/src");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(&source, "fn main() {}").unwrap();
+
+        let roots = ProtectedSourceRoots::new(&home, Some(&sysroot)).unwrap();
+        assert!(
+            roots
+                .resolve_unprotected("../../sysroot/library/core/src/lib.rs", &cwd)
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_sources_reject_symlink_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let source = home.join("registry/src/lib.rs");
+        let alias = temp.path().join("home-alias");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "fn main() {}").unwrap();
+        symlink(&home, &alias).unwrap();
+
+        let roots = ProtectedSourceRoots::new(&home, None).unwrap();
+        assert!(
+            roots
+                .resolve_unprotected(
+                    alias.join("registry/src/lib.rs").to_str().unwrap(),
+                    temp.path()
+                )
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_sources_reject_cargo_home_symlinks_pointing_outward() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let external = temp.path().join("external");
+        let source = external.join("src/lib.rs");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "fn main() {}").unwrap();
+        symlink(&external, home.join("registry")).unwrap();
+
+        let roots = ProtectedSourceRoots::new(&home, None).unwrap();
+        assert!(
+            roots
+                .resolve_unprotected(
+                    home.join("registry/src/lib.rs").to_str().unwrap(),
+                    temp.path()
+                )
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_sources_reject_sysroot_symlinks_pointing_outward() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let sysroot = temp.path().join("sysroot");
+        let external = temp.path().join("external");
+        let source = external.join("core/src/lib.rs");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&sysroot).unwrap();
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "fn main() {}").unwrap();
+        symlink(&external, sysroot.join("library")).unwrap();
+
+        let roots = ProtectedSourceRoots::new(&home, Some(&sysroot)).unwrap();
+        assert!(
+            roots
+                .resolve_unprotected(
+                    sysroot.join("library/core/src/lib.rs").to_str().unwrap(),
+                    temp.path()
+                )
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_sources_preserve_symlink_parent_semantics() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let workspace = temp.path().join("workspace");
+        let external = temp.path().join("external");
+        let source = external.join("lib.rs");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(external.join("nested")).unwrap();
+        std::fs::write(&source, "fn main() {}").unwrap();
+        std::fs::write(workspace.join("lib.rs"), "compile_error!();").unwrap();
+        symlink(external.join("nested"), workspace.join("link")).unwrap();
+
+        let roots = ProtectedSourceRoots::new(&home, None).unwrap();
+        assert_eq!(
+            roots.resolve_unprotected(
+                workspace.join("link/../lib.rs").to_str().unwrap(),
+                temp.path()
+            ),
+            Some(source)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_sources_preserve_cargo_home_symlink_parent_semantics() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let external = temp.path().join("external");
+        let home = external.join("cargo-home");
+        let source = home.join("registry/src/lib.rs");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(external.join("nested")).unwrap();
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "fn main() {}").unwrap();
+        symlink(external.join("nested"), workspace.join("link")).unwrap();
+
+        let roots = ProtectedSourceRoots::new(&workspace.join("link/../cargo-home"), None).unwrap();
+        assert!(
+            roots
+                .resolve_unprotected("src/lib.rs", &home.join("registry"))
+                .is_none()
+        );
     }
 
     #[test]
