@@ -511,11 +511,13 @@ to non-proc-macro library builds without build scripts, compiler wrappers,
 explicitly configured compiler drivers, SBOM side outputs, profiling side
 outputs, rustc tracing output, `RUSTC_BOOTSTRAP` builds, forced rustc version
 identity overrides, profile-guided compiler inputs, arbitrary LLVM backend
-arguments, external codegen backend libraries, custom target specifications or
-target search paths, explicit sysroot overrides, Windows GNU-family targets
-whose raw-dylib support can invoke unmodeled `dlltool` programs, unmodeled
-unstable rustc options, unmodeled dynamic loader overrides, unmodeled
-dependency search paths, or unsupported native-link or extra-output inputs.
+arguments, host CPU auto-detection such as `-Ctarget-cpu=native`, external
+codegen backend libraries, runtime Cranelift backend controls, custom target
+specifications or target search paths, explicit sysroot overrides, Windows
+GNU-family targets whose raw-dylib support can invoke unmodeled `dlltool`
+programs, unmodeled unstable rustc options, unmodeled dynamic loader overrides,
+unmodeled dependency search paths, or unsupported native-link or extra-output
+inputs.
 Cache keys preserve source-location and a content identity for modeled
 Cargo-selected compiler paths, installed sysroot compiler and target library
 file identity, installed codegen backend contents, and compiler-visible
@@ -585,7 +587,9 @@ bytes reachable under completed entries; it is not a bound on physical blocks
 or a guarantee that eviction immediately reclaims storage while target
 directory hardlinks remain. Cargo allows concurrent restorations under shared
 cache locks and protects publication, size accounting, cleanup of aborted
-publications, and eviction with an exclusive cache lock.
+publications, and eviction with an exclusive cache lock. Conflicting cache locks
+fall back to an opportunistic ordinary compilation rather than delaying the
+build.
 
 ## update-breaking
 
