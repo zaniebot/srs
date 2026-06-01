@@ -1626,7 +1626,7 @@ fn calculate_normal(
         && build_runner.sbom_output_files(unit)?.is_empty()
     {
         // Cached hardlinks stay immutable; this target-local completion stamp
-        // records a successful restore after freshly built dependencies.
+        // records a successful cache-eligible build, including fallback builds.
         outputs.push(
             build_runner
                 .files()
@@ -1682,6 +1682,13 @@ fn calculate_normal(
         .gctx
         .cli_unstable()
         .no_embed_metadata
+        .hash(&mut config);
+    build_runner
+        .bcx
+        .build_config
+        .artifact_cache
+        .as_ref()
+        .map(|cache| cache.materialization)
         .hash(&mut config);
 
     let compile_kind = unit.kind.fingerprint_hash();

@@ -370,6 +370,12 @@ fn rustc(
     let artifact = unit.artifact;
     let sbom_files = build_runner.sbom_output_files(unit)?;
     let sbom = build_sbom(build_runner, unit)?;
+    let artifact_cache_freshness_stamp = build_runner.bcx.build_config.artifact_cache.is_some()
+        && unit.target.is_lib()
+        && !unit.target.proc_macro()
+        && matches!(unit.mode, CompileMode::Build)
+        && !unit.pkg.has_custom_build()
+        && sbom_files.is_empty();
     let artifact_cache = build_runner
         .bcx
         .build_config
@@ -684,7 +690,7 @@ fn rustc(
             }
         }
 
-        if artifact_cache.is_some() {
+        if artifact_cache_freshness_stamp {
             let stamp = fingerprint_dir.join(ARTIFACT_CACHE_FRESHNESS_STAMP);
             drop(paths::create(&stamp)?);
             paths::set_file_time_no_err(stamp, timestamp);

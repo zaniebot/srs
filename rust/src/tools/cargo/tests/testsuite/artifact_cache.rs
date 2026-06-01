@@ -85,6 +85,14 @@ fn contains_cache_entry_with_marker(path: &Path, marker: &str) -> bool {
     })
 }
 
+fn contains_file_named(path: &Path, name: &str) -> bool {
+    fs::read_dir(path).unwrap().any(|entry| {
+        let path = entry.unwrap().path();
+        path.file_name().is_some_and(|file_name| file_name == name)
+            || (path.is_dir() && contains_file_named(&path, name))
+    })
+}
+
 fn visit_rlibs(path: &Path, rlibs: &mut Vec<PathBuf>) {
     if !path.exists() {
         return;
@@ -503,7 +511,6 @@ fn copy_restore_detaches_existing_hardlink() {
     let cache = paths::root().join("shared-cache");
     let project = project_with_cache("project", &cache, "hardlink", 42);
     let before_target = project.root().join("before-target");
-    let after_target = project.root().join("after-target");
     let consumer_target = project.root().join("consumer-target");
     project.change_file(
         "src/lib.rs",
@@ -515,12 +522,6 @@ fn copy_restore_detaches_existing_hardlink() {
         &before_target,
         "ARTIFACT_CACHE_TEST_VALUE",
         "before",
-    );
-    build_in_target_with_env(
-        &project,
-        &after_target,
-        "ARTIFACT_CACHE_TEST_VALUE",
-        "after",
     );
     build_in_target_with_env(
         &project,
@@ -554,11 +555,12 @@ fn copy_restore_detaches_existing_hardlink() {
         &project,
         &consumer_target,
         "ARTIFACT_CACHE_TEST_VALUE",
-        "after",
+        "before",
     );
 
     let after_output = cached_rlib(&consumer_target.join("debug").join("deps"));
     assert_eq!(fs::read(&before_cached).unwrap(), before_bytes);
+    assert_eq!(fs::read(&after_output).unwrap(), before_bytes);
     assert_ne!(
         fs::metadata(&before_cached).unwrap().ino(),
         fs::metadata(&after_output).unwrap().ino()
@@ -1126,6 +1128,24 @@ fn unmodeled_unix_dynamic_loader_override_is_not_cacheable() {
         .run();
 
     assert!(cached_rlibs(&cache).is_empty());
+    assert!(contains_file_named(
+        &target,
+        "artifact-cache-complete.timestamp"
+    ));
+
+    project
+        .cargo("-Zartifact-cache build --lib")
+        .arg("--target-dir")
+        .arg(&target)
+        .masquerade_as_nightly_cargo(&["artifact-cache"])
+        .env(
+            cargo_util::paths::dylib_path_envvar(),
+            isolated_loader_path(),
+        )
+        .env("LD_ARTIFACT_CACHE_TEST_OVERRIDE", "1")
+        .env("CARGO_INCREMENTAL", "1")
+        .with_stderr_does_not_contain("[COMPILING]")
+        .run();
 }
 
 #[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
@@ -2372,7 +2392,6 @@ fn disabling_cache_still_detaches_previously_restored_hardlink() {
     );
     let stored_before = fs::read(&stored).unwrap();
 
-    project.change_file("src/lib.rs", "pub fn value() -> u32 { 43 }\n");
     project
         .cargo("build --lib")
         .arg("--target-dir")
@@ -2440,4 +2459,44 @@ fn max_size_requires_cache_directory() {
 
 "#]])
         .run();
+}
+
+#[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
+#[cfg(unix)]
+fn config_override_can_disable_cache() {
+    use std::os::unix::fs::MetadataExt;
+
+    let cache = paths::root().join("shared-cache");
+    let project = project_with_cache("project", &cache, "hardlink", 42);
+    let producer_target = project.root().join("producer-build");
+    let consumer_target = project.root().join("consumer-build");
+
+    build_in_target(&project, &producer_target);
+    build_in_target(&project, &consumer_target);
+    let stored = cached_rlib(&cache);
+    let restored = cached_rlib(&consumer_target.join("debug").join("deps"));
+    assert_eq!(
+        fs::metadata(&stored).unwrap().ino(),
+        fs::metadata(&restored).unwrap().ino()
+    );
+    let stored_before = fs::read(&stored).unwrap();
+
+    project
+        .cargo("-Zartifact-cache --config build.artifact-cache=false build --lib")
+        .arg("--target-dir")
+        .arg(&consumer_target)
+        .masquerade_as_nightly_cargo(&["artifact-cache"])
+        .env(
+            cargo_util::paths::dylib_path_envvar(),
+            isolated_loader_path(),
+        )
+        .env("CARGO_INCREMENTAL", "1")
+        .run();
+
+    let rebuilt = cached_rlib(&consumer_target.join("debug").join("deps"));
+    assert_ne!(
+        fs::metadata(&stored).unwrap().ino(),
+        fs::metadata(&rebuilt).unwrap().ino()
+    );
+    assert_eq!(stored_before, fs::read(&stored).unwrap());
 }

@@ -553,6 +553,13 @@ artifact-cache-materialization = "hardlink"
 artifact-cache-max-size = "100GB"
 ```
 
+Set `artifact-cache = false` to opt out for a narrower config scope or a
+particular invocation while `-Zartifact-cache` is enabled:
+
+```console
+cargo -Zartifact-cache --config build.artifact-cache=false build
+```
+
 The cache directory must be trusted build-artifact storage. Entry hashes reject
 accidental corruption but do not authenticate artifacts supplied by another
 writer with access to that directory.

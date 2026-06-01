@@ -64,7 +64,7 @@ pub struct BuildConfig {
     pub compile_time_deps_only: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum ArtifactCacheMaterialization {
     Copy,
     Hardlink,
@@ -137,7 +137,9 @@ impl BuildConfig {
             }
             (None, _) => false,
         };
-        let artifact_cache = match (&cfg.artifact_cache_dir, gctx.cli_unstable().artifact_cache) {
+        let artifact_cache_enabled =
+            gctx.cli_unstable().artifact_cache && cfg.artifact_cache.unwrap_or(true);
+        let artifact_cache = match (&cfg.artifact_cache_dir, artifact_cache_enabled) {
             (Some(dir), true) => {
                 let materialization = match cfg.artifact_cache_materialization.as_deref() {
                     None | Some("hardlink") => ArtifactCacheMaterialization::Hardlink,
@@ -157,12 +159,13 @@ impl BuildConfig {
                     max_size,
                 })
             }
-            (Some(_), false) => {
+            (Some(_), false) if !gctx.cli_unstable().artifact_cache => {
                 gctx.shell().warn(
                     "ignoring 'artifact-cache-dir' config, pass `-Zartifact-cache` to enable it",
                 )?;
                 None
             }
+            (Some(_), false) => None,
             (None, true) if cfg.artifact_cache_materialization.is_some() => anyhow::bail!(
                 "build.artifact-cache-materialization requires build.artifact-cache-dir"
             ),
