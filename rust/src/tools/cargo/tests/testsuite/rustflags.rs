@@ -1065,6 +1065,50 @@ fn host_rustflags_for_build_scripts() {
         .run();
 }
 
+#[cargo_test]
+fn srs_target_rustflags_append_to_configured_rustflags() {
+    if rustc_host() != "aarch64-apple-darwin" {
+        return;
+    }
+
+    let p = project()
+        .file(
+            ".cargo/config.toml",
+            r#"
+                [build]
+                rustflags = ["--cfg=from_config"]
+            "#,
+        )
+        .file(
+            "build.rs",
+            r#"
+                fn main() {
+                    assert!(cfg!(from_host));
+                    assert!(!cfg!(from_srs));
+                }
+            "#,
+        )
+        .file(
+            "src/lib.rs",
+            r#"
+                #[cfg(not(from_config))]
+                compile_error!("configured rustflags missing");
+                #[cfg(not(from_srs))]
+                compile_error!("SRS target rustflags missing");
+            "#,
+        )
+        .build();
+
+    p.cargo("check -Z target-applies-to-host -Z host-config")
+        .masquerade_as_nightly_cargo(&["target-applies-to-host", "host-config"])
+        .arg("--config")
+        .arg("target-applies-to-host=false")
+        .arg("--config")
+        .arg("host.rustflags=[\"--cfg=from_host\"]")
+        .env("SRS_ENCODED_TARGET_RUSTFLAGS", "--cfg=from_srs")
+        .run();
+}
+
 // target.{}.rustflags takes precedence over build.rustflags
 #[cargo_test]
 fn target_rustflags_precedence() {
