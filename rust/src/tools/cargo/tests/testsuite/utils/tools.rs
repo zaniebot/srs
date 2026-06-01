@@ -129,6 +129,18 @@ pub fn wrapped_clippy_driver() -> PathBuf {
                 let mut args = std::env::args_os();
                 let _me = args.next().unwrap();
                 let rustc = args.next().unwrap();
+                if let (Some(log), Ok(package)) = (
+                    std::env::var_os("WRAPPED_CLIPPY_DRIVER_LOG"),
+                    std::env::var("CARGO_PKG_NAME"),
+                ) {
+                    use std::io::Write;
+                    let mut log = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(log)
+                        .unwrap();
+                    writeln!(log, "{package}").unwrap();
+                }
                 let status = std::process::Command::new(rustc).args(args).status().unwrap();
                 std::process::exit(status.code().unwrap_or(1));
             }
