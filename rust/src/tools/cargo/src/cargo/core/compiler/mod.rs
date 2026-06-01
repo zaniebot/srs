@@ -836,6 +836,17 @@ fn modeled_sysroot_codegen_backend_flag(arg: &str) -> bool {
         .is_some_and(|backend| !backend.contains('.'))
 }
 
+fn unmodeled_codegen_backend_environment(rustc: &ProcessBuilder) -> bool {
+    rustc
+        .get_envs()
+        .keys()
+        .any(|key| key.starts_with("CG_GCCJIT_") && rustc.get_env(key).is_some())
+        || std::env::vars_os().any(|(key, _)| {
+            key.to_str()
+                .is_some_and(|key| key.starts_with("CG_GCCJIT_") && rustc.get_env(key).is_some())
+        })
+}
+
 fn custom_target_spec_flag(arg: &str) -> bool {
     arg.ends_with(".json")
 }
@@ -914,6 +925,7 @@ fn rlib_action_is_cacheable_with_search_paths(
         && !unmodeled_environment
             .iter()
             .any(|key| rustc.get_env(key).is_some())
+        && !unmodeled_codegen_backend_environment(rustc)
         // Windows GNU raw-dylib rlibs may embed output from a PATH-selected
         // or explicitly configured dlltool, which is outside this cache key.
         && !windows_gnu_target(action_target)
@@ -1196,6 +1208,7 @@ mod artifact_cache_admission_tests {
             ("CG_CLIF_DISABLE_INCR_CACHE", "1"),
             ("CG_CLIF_ENABLE_VERIFIER", "1"),
             ("CG_CLIF_JIT_ARGS", "--example"),
+            ("CG_GCCJIT_DUMP_TO_FILE", "1"),
         ] {
             let mut rustc = ordinary_rlib_command();
             rustc.env(key, value);

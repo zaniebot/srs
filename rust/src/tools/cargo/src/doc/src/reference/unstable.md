@@ -512,7 +512,7 @@ explicitly configured compiler drivers, SBOM side outputs, profiling side
 outputs, rustc tracing output, `RUSTC_BOOTSTRAP` builds, forced rustc version
 identity overrides, profile-guided compiler inputs, arbitrary LLVM backend
 arguments, host CPU auto-detection such as `-Ctarget-cpu=native`, external
-codegen backend libraries, runtime Cranelift backend controls, custom target
+codegen backend libraries, runtime Cranelift or GCC backend controls, custom target
 specifications or target search paths, explicit sysroot overrides, Windows
 GNU-family targets whose raw-dylib support can invoke unmodeled `dlltool`
 programs, unmodeled unstable rustc options, unmodeled dynamic loader overrides,
