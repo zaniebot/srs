@@ -17,7 +17,6 @@ export SLD_INCREMENTAL="${SLD_INCREMENTAL:-1}"
 # materialization avoids duplicating restored artifact allocation and Cargo
 # detaches links before rebuilding. Set SRS_CARGO_ARTIFACT_CACHE=0 to disable
 # this while investigating a build.
-artifact_cache_args=()
 if [[ "${SRS_CARGO_ARTIFACT_CACHE:-1}" != "0" ]]; then
     export CARGO_BUILD_ARTIFACT_CACHE_DIR="${CARGO_BUILD_ARTIFACT_CACHE_DIR:-${SRS_CARGO_ARTIFACT_CACHE_DIR:-${CARGO_HOME:-$HOME/.cargo}/srs-artifact-cache-v2}}"
     export CARGO_BUILD_ARTIFACT_CACHE_MATERIALIZATION="${CARGO_BUILD_ARTIFACT_CACHE_MATERIALIZATION:-${SRS_CARGO_ARTIFACT_CACHE_MATERIALIZATION:-hardlink}}"
@@ -25,6 +24,8 @@ if [[ "${SRS_CARGO_ARTIFACT_CACHE:-1}" != "0" ]]; then
         export CARGO_BUILD_ARTIFACT_CACHE_MAX_SIZE="${CARGO_BUILD_ARTIFACT_CACHE_MAX_SIZE:-$SRS_CARGO_ARTIFACT_CACHE_MAX_SIZE}"
     fi
     artifact_cache_args=(-Z artifact-cache)
+else
+    artifact_cache_args=(-Z artifact-cache --config build.artifact-cache=false)
 fi
 
 # Build scripts and proc macros execute on the build host. Keep those helpers

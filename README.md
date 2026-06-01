@@ -125,8 +125,10 @@ incremental-link behavior.
 Set `SRS_CARGO_ARTIFACT_CACHE=0` to disable shared artifact restoration.
 Set `SRS_CARGO_ARTIFACT_CACHE_DIR` to choose a different central cache root or
 `SRS_CARGO_ARTIFACT_CACHE_MATERIALIZATION=copy` to retain cache reuse without
-hardlink materialization. The dedicated cache documentation describes the
-remaining controls and trust assumptions.
+hardlink materialization. The cache is unbounded by default; set
+`SRS_CARGO_ARTIFACT_CACHE_MAX_SIZE`, for example to `100GiB`, when a logical
+byte cap is appropriate. The dedicated cache documentation describes the
+remaining controls, precedence rules, and trust assumptions.
 
 SRS also builds and installs Clippy. Its `--fix` mode keeps the same
 dependency-linting mode as a preceding plain Clippy run, so workspace-member

@@ -80,7 +80,9 @@ rechecked before restoration and publication.
 The cache is unbounded by default. When a size limit is configured, completed
 entries are evicted oldest-first and entries larger than the configured limit
 are not published. Aborted publications are cleaned during later cache
-publication activity.
+publication activity. The configured cap counts logical bytes reachable under
+completed entries; it is not a bound on physical blocks or a guarantee that
+eviction immediately reclaims storage while target-directory hardlinks remain.
 
 Concurrent restores use shared cache locks. Publication, cleanup, and eviction
 use an exclusive cache lock.
@@ -95,8 +97,19 @@ Set `SRS_CARGO_ARTIFACT_CACHE_MATERIALIZATION=copy` to retain cache reuse
 without hardlink materialization.
 
 Set `SRS_CARGO_ARTIFACT_CACHE_MAX_SIZE` to a human-readable cache limit such as
-`2GiB`.
+`100GiB`. The cache is unbounded when this variable is unset.
+
+The lower-level `CARGO_BUILD_ARTIFACT_CACHE_DIR`,
+`CARGO_BUILD_ARTIFACT_CACHE_MATERIALIZATION`, and
+`CARGO_BUILD_ARTIFACT_CACHE_MAX_SIZE` settings take precedence over their
+`SRS_` aliases.
 
 Choose a cache root writable only by trusted build processes. Entry hashes
 reject accidental corruption but do not authenticate artifacts supplied by
 another writer with access to that directory.
+
+Set `CARGO_LOG=cargo::core::compiler=debug` when diagnosing cache admission,
+restoration, or publication. When switching an existing target directory from
+hardlink to copy mode, run one Cargo build with the new setting before allowing
+external tools to mutate artifacts so Cargo can detach or rematerialize prior
+links.
