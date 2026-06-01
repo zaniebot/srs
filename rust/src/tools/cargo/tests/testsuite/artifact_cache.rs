@@ -2109,6 +2109,34 @@ fn admitted_lower_limit_restore_excludes_larger_limit_publication() {
 }
 
 #[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
+#[cfg(unix)]
+fn symlinked_action_root_does_not_escape_cache() {
+    use std::os::unix::fs::symlink;
+
+    let cache = paths::root().join("shared-cache");
+    let project = project_with_cache("project", &cache, "hardlink", 42);
+    let producer_target = project.root().join("producer-target");
+    let consumer_target = project.root().join("consumer-target");
+    let outside = project.root().join("outside");
+    let sentinel = outside.join("sentinel");
+
+    build_in_target(&project, &producer_target);
+    let stored = cached_rlib(&cache);
+    let action_root = stored.parent().unwrap().parent().unwrap().parent().unwrap();
+    fs::remove_dir_all(action_root).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(&sentinel, b"untouched").unwrap();
+    symlink(&outside, action_root).unwrap();
+
+    build_in_target(&project, &consumer_target);
+
+    assert!(action_root.is_symlink());
+    assert_eq!(fs::read(&sentinel).unwrap(), b"untouched");
+    assert!(cached_rlibs(&outside).is_empty());
+    assert!(cached_rlib(&consumer_target.join("debug").join("deps")).exists());
+}
+
+#[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
 fn oversized_entry_is_not_published() {
     let cache = paths::root().join("shared-cache");
     let project = project_with_cache("project", &cache, "hardlink", 42);

@@ -2206,7 +2206,13 @@ fn store_rlib_cache(
         debug!("not storing artifact cache entry with action inputs modified before publication");
         return Ok(false);
     }
-    paths::create_dir_all(entry_root)?;
+    if !create_rlib_cache_directory_no_follow(entry_root)? {
+        debug!(
+            "not storing artifact cache entry under unsupported action root {}",
+            entry_root.display()
+        );
+        return Ok(false);
+    }
     let entry = entry_root.join(&inputs_digest);
     if entry.exists() {
         if entry.join("complete").exists()
@@ -2708,8 +2714,22 @@ fn staging_rlib_cache_entry(entry: &Path) -> CargoResult<PathBuf> {
         ".{key}.publishing-{}-{sequence}",
         std::process::id()
     ));
-    paths::create_dir_all(&staging)?;
+    fs::create_dir(&staging)?;
     Ok(staging)
+}
+
+fn create_rlib_cache_directory_no_follow(path: &Path) -> CargoResult<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.file_type().is_dir()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => match fs::create_dir(path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                Ok(path_is_directory_no_follow(path))
+            }
+            Err(error) => Err(error.into()),
+        },
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn try_read_lock_rlib_cache(cache_root: &Path) -> CargoResult<Option<crate::util::FileLock>> {
