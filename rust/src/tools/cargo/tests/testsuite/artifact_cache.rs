@@ -1529,6 +1529,58 @@ fn changed_loader_input_after_compilation_is_not_published() {
 
 #[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
 #[cfg(unix)]
+fn changed_loader_input_during_staging_is_not_published() {
+    let cache = paths::root().join("shared-cache");
+    let project = project_with_cache("project", &cache, "hardlink", 42);
+    let producer_target = project.root().join("producer-target");
+    let consumer_target = project.root().join("consumer-target");
+    let loader_path = project.root().join("compiler-libs");
+    let input = loader_path.join("libcompiler_input.dylib");
+    let ready = project.root().join("loader-publish-ready");
+    let release = project.root().join("loader-publish-release");
+    fs::create_dir_all(&loader_path).unwrap();
+    fs::write(&input, b"before").unwrap();
+
+    let mut command = project
+        .cargo("-Zartifact-cache build --lib")
+        .arg("--target-dir")
+        .arg(&producer_target)
+        .masquerade_as_nightly_cargo(&["artifact-cache"])
+        .env(cargo_util::paths::dylib_path_envvar(), &loader_path)
+        .env("CARGO_INCREMENTAL", "1")
+        .env("__CARGO_TEST_ARTIFACT_CACHE_PUBLISH_READY_FILE", &ready)
+        .env("__CARGO_TEST_ARTIFACT_CACHE_PUBLISH_RELEASE_FILE", &release)
+        .build_command();
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let child = command.spawn().unwrap();
+    for _ in 0..100 {
+        if ready.exists() {
+            break;
+        }
+        sleep_ms(50);
+    }
+    assert!(ready.exists(), "cargo did not reach the publish test hook");
+    fs::write(&input, b"after!").unwrap();
+    fs::write(&release, b"release").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "producer build failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(cached_rlibs(&cache).is_empty());
+    build_in_target_with_env(
+        &project,
+        &consumer_target,
+        cargo_util::paths::dylib_path_envvar(),
+        loader_path.to_str().unwrap(),
+    );
+    assert_eq!(cached_rlibs(&cache).len(), 1);
+}
+
+#[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
+#[cfg(unix)]
 fn changed_loader_input_during_restore_forces_compile() {
     use std::os::unix::fs::MetadataExt;
 
