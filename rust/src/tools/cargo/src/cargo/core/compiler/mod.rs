@@ -2101,8 +2101,10 @@ fn restore_rlib_cache(
             materialize_rlib_cache_file(&stored, &output.path, materialization)?;
         }
         delay_rlib_cache_restore_materialized_for_tests()?;
-        if artifact_cache_action_inputs_digest(rustc, rustc_cwd)? != *action_inputs_digest {
-            debug!("not restoring artifact cache entry with action inputs modified during restore");
+        if compiler_loader_inputs_digest(loader_input_paths)? != *loader_inputs_digest
+            || artifact_cache_action_inputs_digest(rustc, rustc_cwd)? != *action_inputs_digest
+        {
+            debug!("not restoring artifact cache entry with inputs modified during restore");
             for output in outputs {
                 if fs::symlink_metadata(&output.path).is_ok() {
                     paths::remove_file(&output.path)?;
