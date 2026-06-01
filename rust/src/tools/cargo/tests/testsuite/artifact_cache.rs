@@ -46,6 +46,18 @@ fn cached_rlibs(root: &Path) -> Vec<PathBuf> {
     rlibs
 }
 
+fn cached_rmeta(root: &Path) -> PathBuf {
+    let mut rmetas = Vec::new();
+    visit_cached_artifacts(root, &mut rmetas, "rmeta");
+    assert_eq!(
+        rmetas.len(),
+        1,
+        "expected one cached rmeta under {}",
+        root.display()
+    );
+    rmetas.pop().unwrap()
+}
+
 fn all_rlibs(root: &Path) -> Vec<PathBuf> {
     let mut rlibs = Vec::new();
     visit_all_rlibs(root, &mut rlibs);
@@ -95,6 +107,10 @@ fn contains_file_named(path: &Path, name: &str) -> bool {
 }
 
 fn visit_rlibs(path: &Path, rlibs: &mut Vec<PathBuf>) {
+    visit_cached_artifacts(path, rlibs, "rlib");
+}
+
+fn visit_cached_artifacts(path: &Path, artifacts: &mut Vec<PathBuf>, extension: &str) {
     if !path.exists() {
         return;
     }
@@ -107,12 +123,12 @@ fn visit_rlibs(path: &Path, rlibs: &mut Vec<PathBuf>) {
             {
                 continue;
             }
-            visit_rlibs(&path, rlibs);
+            visit_cached_artifacts(&path, artifacts, extension);
         } else if path
             .extension()
-            .is_some_and(|extension| extension == "rlib")
+            .is_some_and(|candidate| candidate == extension)
         {
-            rlibs.push(path);
+            artifacts.push(path);
         }
     }
 }
@@ -402,17 +418,30 @@ fn hardlink_restore_detaches_before_rebuild() {
 
     let stored = cached_rlib(&cache);
     let restored = cached_rlib(&consumer_target.join("debug").join("deps"));
+    let stored_rmeta = cached_rmeta(&cache);
+    let restored_rmeta = cached_rmeta(&consumer_target.join("debug").join("deps"));
     assert_eq!(
         fs::metadata(&stored).unwrap().ino(),
         fs::metadata(&restored).unwrap().ino()
     );
+    assert_eq!(
+        fs::metadata(&stored_rmeta).unwrap().ino(),
+        fs::metadata(&restored_rmeta).unwrap().ino()
+    );
     let stored_before = fs::read(&stored).unwrap();
+    let stored_rmeta_before = fs::read(&stored_rmeta).unwrap();
 
     project.change_file("src/lib.rs", "pub fn value() -> u32 { 43 }\n");
     build_in_target(&project, &consumer_target);
 
     let rebuilt = cached_rlib(&consumer_target.join("debug").join("deps"));
+    let rebuilt_rmeta = cached_rmeta(&consumer_target.join("debug").join("deps"));
     assert_ne!(stored_before, fs::read(&rebuilt).unwrap());
+    assert_eq!(stored_rmeta_before, fs::read(&stored_rmeta).unwrap());
+    assert_ne!(
+        fs::metadata(&stored_rmeta).unwrap().ino(),
+        fs::metadata(&rebuilt_rmeta).unwrap().ino()
+    );
     assert!(
         all_rlibs(&cache)
             .iter()
@@ -538,11 +567,67 @@ fn copy_restore_does_not_share_inodes() {
 
     let stored = cached_rlib(&cache);
     let restored = cached_rlib(&consumer_target.join("debug").join("deps"));
+    let stored_rmeta = cached_rmeta(&cache);
+    let restored_rmeta = cached_rmeta(&consumer_target.join("debug").join("deps"));
     assert_ne!(
         fs::metadata(&stored).unwrap().ino(),
         fs::metadata(&restored).unwrap().ino()
     );
     assert_eq!(fs::read(&stored).unwrap(), fs::read(&restored).unwrap());
+    assert_ne!(
+        fs::metadata(&stored_rmeta).unwrap().ino(),
+        fs::metadata(&restored_rmeta).unwrap().ino()
+    );
+    assert_eq!(
+        fs::read(&stored_rmeta).unwrap(),
+        fs::read(&restored_rmeta).unwrap()
+    );
+}
+
+#[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
+#[cfg(unix)]
+fn cross_device_hardlink_failure_falls_back_to_copy() {
+    use std::os::unix::fs::MetadataExt;
+
+    let cache = paths::root().join("shared-cache");
+    let project = project_with_cache("project", &cache, "hardlink", 42);
+    let producer_target = project.root().join("producer-target");
+    let consumer_target = project.root().join("consumer-target");
+
+    build_in_target(&project, &producer_target);
+    project
+        .cargo("-Zartifact-cache build --lib")
+        .arg("--target-dir")
+        .arg(&consumer_target)
+        .masquerade_as_nightly_cargo(&["artifact-cache"])
+        .env(
+            cargo_util::paths::dylib_path_envvar(),
+            isolated_loader_path(),
+        )
+        .env("CARGO_INCREMENTAL", "1")
+        .env(
+            "__CARGO_TEST_ARTIFACT_CACHE_CROSS_DEVICE_HARDLINK_FAILURE",
+            "1",
+        )
+        .run();
+
+    let stored = cached_rlib(&cache);
+    let restored = cached_rlib(&consumer_target.join("debug").join("deps"));
+    assert_ne!(
+        fs::metadata(&stored).unwrap().ino(),
+        fs::metadata(&restored).unwrap().ino()
+    );
+    assert_eq!(fs::read(&stored).unwrap(), fs::read(&restored).unwrap());
+    let stored_rmeta = cached_rmeta(&cache);
+    let restored_rmeta = cached_rmeta(&consumer_target.join("debug").join("deps"));
+    assert_ne!(
+        fs::metadata(&stored_rmeta).unwrap().ino(),
+        fs::metadata(&restored_rmeta).unwrap().ino()
+    );
+    assert_eq!(
+        fs::read(&stored_rmeta).unwrap(),
+        fs::read(&restored_rmeta).unwrap()
+    );
 }
 
 #[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
@@ -572,14 +657,21 @@ fn copy_restore_detaches_existing_hardlink() {
         "before",
     );
     let before_output = cached_rlib(&consumer_target.join("debug").join("deps"));
+    let before_rmeta = cached_rmeta(&consumer_target.join("debug").join("deps"));
     let before_bytes = fs::read(&before_output).unwrap();
+    let before_rmeta_bytes = fs::read(&before_rmeta).unwrap();
     let before_cached = cached_rlibs(&cache)
         .into_iter()
         .find(|path| fs::read(path).unwrap() == before_bytes)
         .unwrap();
+    let before_cached_rmeta = cached_rmeta(&cache);
     assert_eq!(
         fs::metadata(&before_cached).unwrap().ino(),
         fs::metadata(&before_output).unwrap().ino()
+    );
+    assert_eq!(
+        fs::metadata(&before_cached_rmeta).unwrap().ino(),
+        fs::metadata(&before_rmeta).unwrap().ino()
     );
 
     project.change_file(
@@ -601,11 +693,18 @@ fn copy_restore_detaches_existing_hardlink() {
     );
 
     let after_output = cached_rlib(&consumer_target.join("debug").join("deps"));
+    let after_rmeta = cached_rmeta(&consumer_target.join("debug").join("deps"));
     assert_eq!(fs::read(&before_cached).unwrap(), before_bytes);
     assert_eq!(fs::read(&after_output).unwrap(), before_bytes);
     assert_ne!(
         fs::metadata(&before_cached).unwrap().ino(),
         fs::metadata(&after_output).unwrap().ino()
+    );
+    assert_eq!(fs::read(&before_cached_rmeta).unwrap(), before_rmeta_bytes);
+    assert_eq!(fs::read(&after_rmeta).unwrap(), before_rmeta_bytes);
+    assert_ne!(
+        fs::metadata(&before_cached_rmeta).unwrap().ino(),
+        fs::metadata(&after_rmeta).unwrap().ino()
     );
 }
 
@@ -624,9 +723,15 @@ fn same_source_different_target_directories_restore_by_hardlink() {
 
     let stored = cached_rlib(&cache);
     let restored = cached_rlib(&consumer_target.join("debug").join("deps"));
+    let stored_rmeta = cached_rmeta(&cache);
+    let restored_rmeta = cached_rmeta(&consumer_target.join("debug").join("deps"));
     assert_eq!(
         fs::metadata(&stored).unwrap().ino(),
         fs::metadata(&restored).unwrap().ino()
+    );
+    assert_eq!(
+        fs::metadata(&stored_rmeta).unwrap().ino(),
+        fs::metadata(&restored_rmeta).unwrap().ino()
     );
 }
 
@@ -688,6 +793,7 @@ fn concurrent_restores_share_the_cached_entry() {
     let delayed_target = project.root().join("delayed-target");
     let concurrent_target = project.root().join("concurrent-target");
     let ready = project.root().join("restore-ready");
+    let release = project.root().join("restore-release");
     if ready.exists() {
         fs::remove_file(&ready).unwrap();
     }
@@ -705,8 +811,8 @@ fn concurrent_restores_share_the_cached_entry() {
             isolated_loader_path(),
         )
         .env("CARGO_INCREMENTAL", "1")
-        .env("__CARGO_TEST_ARTIFACT_CACHE_RESTORE_DELAY_MS", "5000")
         .env("__CARGO_TEST_ARTIFACT_CACHE_RESTORE_READY_FILE", &ready)
+        .env("__CARGO_TEST_ARTIFACT_CACHE_RESTORE_RELEASE_FILE", &release)
         .build_command();
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let child = command.spawn().unwrap();
@@ -724,6 +830,7 @@ fn concurrent_restores_share_the_cached_entry() {
         fs::metadata(&stored).unwrap().ino(),
         fs::metadata(&concurrent).unwrap().ino()
     );
+    fs::write(&release, b"release").unwrap();
 
     let output = child.wait_with_output().unwrap();
     assert!(
@@ -745,6 +852,7 @@ fn concurrent_publishers_converge_on_single_entry() {
     let delayed_target = project.root().join("delayed-target");
     let concurrent_target = project.root().join("concurrent-target");
     let ready = project.root().join("publish-ready");
+    let release = project.root().join("publish-release");
 
     let mut command = project
         .cargo("-Zartifact-cache build --lib")
@@ -756,8 +864,8 @@ fn concurrent_publishers_converge_on_single_entry() {
             isolated_loader_path(),
         )
         .env("CARGO_INCREMENTAL", "1")
-        .env("__CARGO_TEST_ARTIFACT_CACHE_PUBLISH_DELAY_MS", "5000")
         .env("__CARGO_TEST_ARTIFACT_CACHE_PUBLISH_READY_FILE", &ready)
+        .env("__CARGO_TEST_ARTIFACT_CACHE_PUBLISH_RELEASE_FILE", &release)
         .build_command();
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let child = command.spawn().unwrap();
@@ -770,6 +878,8 @@ fn concurrent_publishers_converge_on_single_entry() {
     assert!(ready.exists(), "cargo did not reach the publish test hook");
 
     build_in_target(&project, &concurrent_target);
+    assert!(cached_rlibs(&cache).is_empty());
+    fs::write(&release, b"release").unwrap();
     let output = child.wait_with_output().unwrap();
     assert!(
         output.status.success(),
@@ -806,9 +916,15 @@ fn environment_configuration_restores_by_hardlink() {
 
     let stored = cached_rlib(&cache);
     let restored = cached_rlib(&consumer_target.join("debug").join("deps"));
+    let stored_rmeta = cached_rmeta(&cache);
+    let restored_rmeta = cached_rmeta(&consumer_target.join("debug").join("deps"));
     assert_eq!(
         fs::metadata(&stored).unwrap().ino(),
         fs::metadata(&restored).unwrap().ino()
+    );
+    assert_eq!(
+        fs::metadata(&stored_rmeta).unwrap().ino(),
+        fs::metadata(&restored_rmeta).unwrap().ino()
     );
 }
 
@@ -2621,9 +2737,15 @@ fn disabling_cache_still_detaches_previously_restored_hardlink() {
     build_in_target(&project, &consumer_target);
     let stored = cached_rlib(&cache);
     let restored = cached_rlib(&consumer_target.join("debug").join("deps"));
+    let stored_rmeta = cached_rmeta(&cache);
+    let restored_rmeta = cached_rmeta(&consumer_target.join("debug").join("deps"));
     assert_eq!(
         fs::metadata(&stored).unwrap().ino(),
         fs::metadata(&restored).unwrap().ino()
+    );
+    assert_eq!(
+        fs::metadata(&stored_rmeta).unwrap().ino(),
+        fs::metadata(&restored_rmeta).unwrap().ino()
     );
     let stored_before = fs::read(&stored).unwrap();
 
@@ -2635,9 +2757,14 @@ fn disabling_cache_still_detaches_previously_restored_hardlink() {
         .run();
 
     let rebuilt = cached_rlib(&consumer_target.join("debug").join("deps"));
+    let rebuilt_rmeta = cached_rmeta(&consumer_target.join("debug").join("deps"));
     assert_ne!(
         fs::metadata(&stored).unwrap().ino(),
         fs::metadata(&rebuilt).unwrap().ino()
+    );
+    assert_ne!(
+        fs::metadata(&stored_rmeta).unwrap().ino(),
+        fs::metadata(&rebuilt_rmeta).unwrap().ino()
     );
     assert_eq!(stored_before, fs::read(&stored).unwrap());
 }
@@ -2710,9 +2837,15 @@ fn config_override_can_disable_cache() {
     build_in_target(&project, &consumer_target);
     let stored = cached_rlib(&cache);
     let restored = cached_rlib(&consumer_target.join("debug").join("deps"));
+    let stored_rmeta = cached_rmeta(&cache);
+    let restored_rmeta = cached_rmeta(&consumer_target.join("debug").join("deps"));
     assert_eq!(
         fs::metadata(&stored).unwrap().ino(),
         fs::metadata(&restored).unwrap().ino()
+    );
+    assert_eq!(
+        fs::metadata(&stored_rmeta).unwrap().ino(),
+        fs::metadata(&restored_rmeta).unwrap().ino()
     );
     let stored_before = fs::read(&stored).unwrap();
 
@@ -2729,9 +2862,14 @@ fn config_override_can_disable_cache() {
         .run();
 
     let rebuilt = cached_rlib(&consumer_target.join("debug").join("deps"));
+    let rebuilt_rmeta = cached_rmeta(&consumer_target.join("debug").join("deps"));
     assert_ne!(
         fs::metadata(&stored).unwrap().ino(),
         fs::metadata(&rebuilt).unwrap().ino()
+    );
+    assert_ne!(
+        fs::metadata(&stored_rmeta).unwrap().ino(),
+        fs::metadata(&rebuilt_rmeta).unwrap().ino()
     );
     assert_eq!(stored_before, fs::read(&stored).unwrap());
 }

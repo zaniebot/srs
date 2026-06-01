@@ -128,6 +128,8 @@ const ARTIFACT_CACHE_PUBLISH_DELAY_MS_FOR_TESTS: &str =
     "__CARGO_TEST_ARTIFACT_CACHE_PUBLISH_DELAY_MS";
 const ARTIFACT_CACHE_PUBLISH_READY_FILE_FOR_TESTS: &str =
     "__CARGO_TEST_ARTIFACT_CACHE_PUBLISH_READY_FILE";
+const ARTIFACT_CACHE_PUBLISH_RELEASE_FILE_FOR_TESTS: &str =
+    "__CARGO_TEST_ARTIFACT_CACHE_PUBLISH_RELEASE_FILE";
 const ARTIFACT_CACHE_INPUT_DIGEST_DELAY_MS_FOR_TESTS: &str =
     "__CARGO_TEST_ARTIFACT_CACHE_INPUT_DIGEST_DELAY_MS";
 const ARTIFACT_CACHE_INPUT_DIGEST_READY_FILE_FOR_TESTS: &str =
@@ -136,6 +138,8 @@ const ARTIFACT_CACHE_RESTORE_DELAY_MS_FOR_TESTS: &str =
     "__CARGO_TEST_ARTIFACT_CACHE_RESTORE_DELAY_MS";
 const ARTIFACT_CACHE_RESTORE_READY_FILE_FOR_TESTS: &str =
     "__CARGO_TEST_ARTIFACT_CACHE_RESTORE_READY_FILE";
+const ARTIFACT_CACHE_RESTORE_RELEASE_FILE_FOR_TESTS: &str =
+    "__CARGO_TEST_ARTIFACT_CACHE_RESTORE_RELEASE_FILE";
 const ARTIFACT_CACHE_RESTORE_ADMITTED_DELAY_MS_FOR_TESTS: &str =
     "__CARGO_TEST_ARTIFACT_CACHE_RESTORE_ADMITTED_DELAY_MS";
 const ARTIFACT_CACHE_RESTORE_ADMITTED_READY_FILE_FOR_TESTS: &str =
@@ -145,6 +149,8 @@ const ARTIFACT_CACHE_STORE_FAILURE_AFTER_STAGING_FOR_TESTS: &str =
     "__CARGO_TEST_ARTIFACT_CACHE_STORE_FAILURE_AFTER_STAGING";
 const ARTIFACT_CACHE_TRANSIENT_REMOVE_FAILURE_FOR_TESTS: &str =
     "__CARGO_TEST_ARTIFACT_CACHE_TRANSIENT_REMOVE_FAILURE";
+const ARTIFACT_CACHE_CROSS_DEVICE_HARDLINK_FAILURE_FOR_TESTS: &str =
+    "__CARGO_TEST_ARTIFACT_CACHE_CROSS_DEVICE_HARDLINK_FAILURE";
 const ARTIFACT_CACHE_SIZE_STATE: &str = ".cargo-artifact-cache-size";
 const ARTIFACT_CACHE_SIZE_STATE_VERSION: &str = "v2";
 pub(super) const ARTIFACT_CACHE_FRESHNESS_STAMP: &str = "artifact-cache-complete.timestamp";
@@ -2000,7 +2006,19 @@ fn materialize_rlib_cache_file(
                 if fs::symlink_metadata(output).is_ok() {
                     paths::remove_file(output)?;
                 }
-                match fs::hard_link(stored, output) {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "test-only hook is intentionally outside user configuration"
+                )]
+                let hardlink_result =
+                    if std::env::var_os(ARTIFACT_CACHE_CROSS_DEVICE_HARDLINK_FAILURE_FOR_TESTS)
+                        .is_some()
+                    {
+                        Err(io::Error::from(io::ErrorKind::CrossesDevices))
+                    } else {
+                        fs::hard_link(stored, output)
+                    };
+                match hardlink_result {
                     Ok(()) => {
                         debug!(
                             "hardlinked cached artifact {} -> {}",
@@ -2223,23 +2241,7 @@ fn store_rlib_cache(
             );
             return Ok(false);
         }
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "test-only hook is intentionally outside user configuration"
-        )]
-        let publish_delay = std::env::var_os(ARTIFACT_CACHE_PUBLISH_DELAY_MS_FOR_TESTS);
-        if let Some(delay) =
-            publish_delay.and_then(|value| value.to_string_lossy().parse::<u64>().ok())
-        {
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "test-only hook is intentionally outside user configuration"
-            )]
-            if let Some(path) = std::env::var_os(ARTIFACT_CACHE_PUBLISH_READY_FILE_FOR_TESTS) {
-                paths::write(Path::new(&path), b"ready")?;
-            }
-            std::thread::sleep(Duration::from_millis(delay));
-        }
+        delay_rlib_cache_publish_for_tests()?;
         match fs::rename(&staging, &entry) {
             Ok(()) => {}
             Err(_error) if entry.join("complete").exists() => {
@@ -2521,9 +2523,15 @@ fn delay_rlib_cache_restore_for_tests() -> CargoResult<()> {
         reason = "test-only hook is intentionally outside user configuration"
     )]
     let delay = std::env::var_os(ARTIFACT_CACHE_RESTORE_DELAY_MS_FOR_TESTS);
-    let Some(delay) = delay.and_then(|value| value.to_string_lossy().parse::<u64>().ok()) else {
+    let delay = delay.and_then(|value| value.to_string_lossy().parse::<u64>().ok());
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test-only hook is intentionally outside user configuration"
+    )]
+    let release = std::env::var_os(ARTIFACT_CACHE_RESTORE_RELEASE_FILE_FOR_TESTS);
+    if delay.is_none() && release.is_none() {
         return Ok(());
-    };
+    }
     #[expect(
         clippy::disallowed_methods,
         reason = "test-only hook is intentionally outside user configuration"
@@ -2531,8 +2539,57 @@ fn delay_rlib_cache_restore_for_tests() -> CargoResult<()> {
     if let Some(path) = std::env::var_os(ARTIFACT_CACHE_RESTORE_READY_FILE_FOR_TESTS) {
         paths::write(Path::new(&path), b"ready")?;
     }
-    std::thread::sleep(Duration::from_millis(delay));
+    wait_for_rlib_cache_test_release(release)?;
+    if let Some(delay) = delay {
+        std::thread::sleep(Duration::from_millis(delay));
+    }
     Ok(())
+}
+
+fn delay_rlib_cache_publish_for_tests() -> CargoResult<()> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test-only hook is intentionally outside user configuration"
+    )]
+    let delay = std::env::var_os(ARTIFACT_CACHE_PUBLISH_DELAY_MS_FOR_TESTS)
+        .and_then(|value| value.to_string_lossy().parse::<u64>().ok());
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test-only hook is intentionally outside user configuration"
+    )]
+    let release = std::env::var_os(ARTIFACT_CACHE_PUBLISH_RELEASE_FILE_FOR_TESTS);
+    if delay.is_none() && release.is_none() {
+        return Ok(());
+    }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test-only hook is intentionally outside user configuration"
+    )]
+    if let Some(path) = std::env::var_os(ARTIFACT_CACHE_PUBLISH_READY_FILE_FOR_TESTS) {
+        paths::write(Path::new(&path), b"ready")?;
+    }
+    wait_for_rlib_cache_test_release(release)?;
+    if let Some(delay) = delay {
+        std::thread::sleep(Duration::from_millis(delay));
+    }
+    Ok(())
+}
+
+fn wait_for_rlib_cache_test_release(release: Option<OsString>) -> CargoResult<()> {
+    let Some(release) = release else {
+        return Ok(());
+    };
+    let release = Path::new(&release);
+    for _ in 0..3000 {
+        if release.exists() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Err(internal(format!(
+        "timed out waiting for artifact cache test release file {}",
+        release.display()
+    )))
 }
 
 fn delay_rlib_cache_restore_admitted_for_tests() -> CargoResult<()> {
