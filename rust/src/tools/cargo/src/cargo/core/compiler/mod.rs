@@ -819,10 +819,14 @@ fn rustc(
 }
 
 fn unmodeled_codegen_behavior_flag(arg: &str) -> bool {
-    ["profile-use", "profile-sample-use", "llvm-args"]
-        .iter()
-        .any(|flag| arg == *flag || arg.starts_with(&format!("{flag}=")))
-        || arg == "target-cpu=native"
+    let (flag, value) = arg
+        .split_once('=')
+        .map_or((arg, None), |(flag, value)| (flag, Some(value)));
+    let flag = flag.replace('_', "-");
+    matches!(
+        flag.as_str(),
+        "profile-use" | "profile-sample-use" | "llvm-args" | "save-temps"
+    ) || (flag == "target-cpu" && value == Some("native"))
 }
 
 fn modeled_sysroot_codegen_backend_flag(arg: &str) -> bool {
@@ -1031,7 +1035,12 @@ mod artifact_cache_admission_tests {
             compiler,
             host
         ));
-        for flag in ["profile-use", "profile-sample-use"] {
+        for flag in [
+            "profile-use",
+            "profile_use",
+            "profile-sample-use",
+            "profile_sample_use",
+        ] {
             let mut compact = ordinary_rlib_command();
             compact.arg(format!("-C{flag}=profile.profdata"));
             assert!(!rlib_action_is_cacheable(
@@ -1083,23 +1092,27 @@ mod artifact_cache_admission_tests {
         let compiler = Path::new("rustc");
         let host = "aarch64-apple-darwin";
 
-        let mut compact = ordinary_rlib_command();
-        compact.arg("-Cllvm-args=-load=/path/to/plugin.dylib");
-        assert!(!rlib_action_is_cacheable(
-            &compact,
-            output_root,
-            compiler,
-            host
-        ));
+        for flag in ["llvm-args", "llvm_args"] {
+            let mut compact = ordinary_rlib_command();
+            compact.arg(format!("-C{flag}=-load=/path/to/plugin.dylib"));
+            assert!(!rlib_action_is_cacheable(
+                &compact,
+                output_root,
+                compiler,
+                host
+            ));
 
-        let mut split = ordinary_rlib_command();
-        split.arg("-C").arg("llvm-args=-load=/path/to/plugin.dylib");
-        assert!(!rlib_action_is_cacheable(
-            &split,
-            output_root,
-            compiler,
-            host
-        ));
+            let mut split = ordinary_rlib_command();
+            split
+                .arg("-C")
+                .arg(format!("{flag}=-load=/path/to/plugin.dylib"));
+            assert!(!rlib_action_is_cacheable(
+                &split,
+                output_root,
+                compiler,
+                host
+            ));
+        }
     }
 
     #[test]
@@ -1108,23 +1121,52 @@ mod artifact_cache_admission_tests {
         let compiler = Path::new("rustc");
         let host = "aarch64-apple-darwin";
 
-        let mut compact = ordinary_rlib_command();
-        compact.arg("-Ctarget-cpu=native");
-        assert!(!rlib_action_is_cacheable(
-            &compact,
-            output_root,
-            compiler,
-            host
-        ));
+        for flag in ["target-cpu", "target_cpu"] {
+            let mut compact = ordinary_rlib_command();
+            compact.arg(format!("-C{flag}=native"));
+            assert!(!rlib_action_is_cacheable(
+                &compact,
+                output_root,
+                compiler,
+                host
+            ));
 
-        let mut split = ordinary_rlib_command();
-        split.arg("-C").arg("target-cpu=native");
-        assert!(!rlib_action_is_cacheable(
-            &split,
-            output_root,
-            compiler,
-            host
-        ));
+            let mut split = ordinary_rlib_command();
+            split.arg("-C").arg(format!("{flag}=native"));
+            assert!(!rlib_action_is_cacheable(
+                &split,
+                output_root,
+                compiler,
+                host
+            ));
+        }
+    }
+
+    #[test]
+    fn temporary_outputs_are_not_cacheable() {
+        let output_root = Path::new("target/debug/deps");
+        let compiler = Path::new("rustc");
+        let host = "aarch64-apple-darwin";
+
+        for flag in ["save-temps", "save_temps"] {
+            let mut compact = ordinary_rlib_command();
+            compact.arg(format!("-C{flag}"));
+            assert!(!rlib_action_is_cacheable(
+                &compact,
+                output_root,
+                compiler,
+                host
+            ));
+
+            let mut split = ordinary_rlib_command();
+            split.arg("-C").arg(flag);
+            assert!(!rlib_action_is_cacheable(
+                &split,
+                output_root,
+                compiler,
+                host
+            ));
+        }
     }
 
     #[test]
