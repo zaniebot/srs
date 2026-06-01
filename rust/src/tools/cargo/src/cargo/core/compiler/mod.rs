@@ -144,7 +144,7 @@ const ARTIFACT_CACHE_STORE_FAILURE_AFTER_STAGING_FOR_TESTS: &str =
 const ARTIFACT_CACHE_TRANSIENT_REMOVE_FAILURE_FOR_TESTS: &str =
     "__CARGO_TEST_ARTIFACT_CACHE_TRANSIENT_REMOVE_FAILURE";
 const ARTIFACT_CACHE_SIZE_STATE: &str = ".cargo-artifact-cache-size";
-const ARTIFACT_CACHE_SIZE_STATE_VERSION: &str = "v1";
+const ARTIFACT_CACHE_SIZE_STATE_VERSION: &str = "v2";
 pub(super) const ARTIFACT_CACHE_FRESHNESS_STAMP: &str = "artifact-cache-complete.timestamp";
 static ARTIFACT_CACHE_PUBLICATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -1876,14 +1876,14 @@ fn restore_rlib_cache(
     materialization: ArtifactCacheMaterialization,
     max_size: Option<u64>,
 ) -> CargoResult<bool> {
-    if !entry_root.exists() {
+    if !path_is_directory_no_follow(entry_root) {
         return Ok(false);
     }
     let cache_root = entry_root.parent().unwrap_or(entry_root);
-    let Some(_lock) = try_read_lock_rlib_cache_within_limit(cache_root, max_size)? else {
+    let Some(lock) = try_read_lock_rlib_cache_within_limit(cache_root, max_size)? else {
         return Ok(false);
     };
-    if !entry_root.exists() {
+    if !path_is_directory_no_follow(entry_root) {
         return Ok(false);
     }
     delay_rlib_cache_restore_for_tests()?;
@@ -1903,20 +1903,22 @@ fn restore_rlib_cache(
     }
     let mut entries = fs::read_dir(entry_root)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.path());
+    let mut corrupt_entries = Vec::new();
     for entry in entries {
         let entry = entry.path();
-        if !entry.is_dir()
+        if !path_is_directory_no_follow(&entry)
             || entry
                 .file_name()
                 .is_some_and(|name| name.to_string_lossy().starts_with('.'))
-            || !entry.join("complete").exists()
+            || !path_is_regular_file(&entry.join("complete"))
         {
             continue;
         }
-        match verify_rlib_cache_entry(&entry, outputs) {
+        match verify_rlib_cache_control_files(&entry) {
             Ok(true) => {}
             Ok(false) => {
                 debug!("rejecting corrupt artifact cache entry {}", entry.display());
+                corrupt_entries.push(entry);
                 continue;
             }
             Err(error) => {
@@ -1924,6 +1926,7 @@ fn restore_rlib_cache(
                     "rejecting unreadable artifact cache entry {}: {error:#}",
                     entry.display()
                 );
+                corrupt_entries.push(entry);
                 continue;
             }
         }
@@ -1938,6 +1941,22 @@ fn restore_rlib_cache(
                 continue;
             }
         }
+        match verify_rlib_cache_entry(&entry, outputs) {
+            Ok(true) => {}
+            Ok(false) => {
+                debug!("rejecting corrupt artifact cache entry {}", entry.display());
+                corrupt_entries.push(entry);
+                continue;
+            }
+            Err(error) => {
+                debug!(
+                    "rejecting unreadable artifact cache entry {}: {error:#}",
+                    entry.display()
+                );
+                corrupt_entries.push(entry);
+                continue;
+            }
+        }
         let stored_files = entry.join("files");
         for output in outputs {
             let stored = stored_files.join(output.path.file_name().unwrap());
@@ -1945,7 +1964,7 @@ fn restore_rlib_cache(
         }
         paths::copy(&entry.join("compiler-messages"), message_cache_path)?;
         let stored_dep_info = entry.join("rustc-dep-info");
-        if stored_dep_info.exists() {
+        if path_is_regular_file(&stored_dep_info) {
             let origin_pkg_root = paths::read(&entry.join("origin-pkg-root"))?;
             let origin_target_profile_root =
                 paths::read(&entry.join("origin-target-profile-root"))?;
@@ -1958,8 +1977,12 @@ fn restore_rlib_cache(
                 );
             paths::write(rustc_dep_info_loc, translated.as_bytes())?;
         }
+        drop(lock);
+        cleanup_corrupt_rlib_cache_entries(cache_root, &corrupt_entries, outputs, max_size);
         return Ok(true);
     }
+    drop(lock);
+    cleanup_corrupt_rlib_cache_entries(cache_root, &corrupt_entries, outputs, max_size);
     Ok(false)
 }
 
@@ -1972,7 +1995,7 @@ fn materialize_rlib_cache_file(
         ArtifactCacheMaterialization::Hardlink => {
             #[cfg(unix)]
             {
-                if output.exists() {
+                if fs::symlink_metadata(output).is_ok() {
                     paths::remove_file(output)?;
                 }
                 match fs::hard_link(stored, output) {
@@ -2005,7 +2028,7 @@ fn materialize_rlib_cache_file(
             }
         }
         ArtifactCacheMaterialization::Copy => {
-            if output.exists() {
+            if fs::symlink_metadata(output).is_ok() {
                 paths::remove_file(output)?;
             }
             paths::copy(stored, output)?;
@@ -2020,7 +2043,7 @@ fn materialize_rlib_cache_file(
 }
 
 fn prepare_materialized_rlib_output_for_write(output: &Path) -> CargoResult<()> {
-    if !output.exists() {
+    if fs::symlink_metadata(output).is_err() {
         return Ok(());
     }
     #[cfg(unix)]
@@ -2098,7 +2121,7 @@ fn store_rlib_cache(
         if entry.join("complete").exists()
             && verify_rlib_cache_entry(&entry, outputs).unwrap_or(false)
             && artifact_cache_entry_size(&entry)
-                .is_some_and(|size| rlib_cache_size_within_limit(size, max_size))
+                .is_ok_and(|size| rlib_cache_size_within_limit(size, max_size))
         {
             return Ok(false);
         }
@@ -2182,12 +2205,7 @@ fn store_rlib_cache(
             staging.join("complete"),
             format!("{manifest_digest}\n").as_bytes(),
         )?;
-        let entry_size = artifact_cache_entry_size(&staging).ok_or_else(|| {
-            internal(format!(
-                "failed to size artifact cache publication {}",
-                staging.display()
-            ))
-        })?;
+        let entry_size = artifact_cache_entry_size(&staging)?;
         if let Some(max_size) = max_size
             && entry_size > max_size
         {
@@ -2246,19 +2264,9 @@ fn verify_rlib_cache_entry(
     entry: &Path,
     outputs: &[build_runner::OutputFile],
 ) -> CargoResult<bool> {
-    let manifest_path = entry.join("manifest.blake3");
-    if !manifest_path.exists() {
+    let Some(expected) = verified_rlib_cache_manifest(entry)? else {
         return Ok(false);
-    }
-    let complete_digest = paths::read(&entry.join("complete"))?;
-    if rlib_cache_digest(&manifest_path)? != complete_digest.trim() {
-        return Ok(false);
-    }
-    let manifest = paths::read(&manifest_path)?;
-    let expected = manifest
-        .lines()
-        .filter_map(|line| line.split_once('\t'))
-        .collect::<HashMap<_, _>>();
+    };
     let mut required = vec![
         entry.join("origin-pkg-root"),
         entry.join("origin-target-profile-root"),
@@ -2275,16 +2283,91 @@ fn verify_rlib_cache_entry(
         };
         required.push(entry.join("files").join(name));
     }
+    verify_rlib_cache_manifest_files(entry, &expected, required)
+}
+
+fn verify_rlib_cache_control_files(entry: &Path) -> CargoResult<bool> {
+    let Some(expected) = verified_rlib_cache_manifest(entry)? else {
+        return Ok(false);
+    };
+    let mut required = vec![entry.join("inputs.blake3")];
+    if expected.contains_key("rustc-dep-info") {
+        required.push(entry.join("rustc-dep-info"));
+    }
+    verify_rlib_cache_manifest_files(entry, &expected, required)
+}
+
+fn verified_rlib_cache_manifest(entry: &Path) -> CargoResult<Option<HashMap<String, String>>> {
+    let manifest_path = entry.join("manifest.blake3");
+    if !path_is_regular_file(&manifest_path) || !path_is_regular_file(&entry.join("complete")) {
+        return Ok(None);
+    }
+    let complete_digest = paths::read(&entry.join("complete"))?;
+    if rlib_cache_digest(&manifest_path)? != complete_digest.trim() {
+        return Ok(None);
+    }
+    let manifest = paths::read(&manifest_path)?;
+    let mut expected = HashMap::new();
+    for line in manifest.lines() {
+        let Some((path, digest)) = line.split_once('\t') else {
+            return Ok(None);
+        };
+        if path.is_empty()
+            || digest.is_empty()
+            || digest.contains('\t')
+            || expected
+                .insert(path.to_string(), digest.to_string())
+                .is_some()
+        {
+            return Ok(None);
+        }
+    }
+    Ok(Some(expected))
+}
+
+fn verify_rlib_cache_manifest_files(
+    entry: &Path,
+    expected: &HashMap<String, String>,
+    required: impl IntoIterator<Item = PathBuf>,
+) -> CargoResult<bool> {
     for path in required {
         let relative = path.strip_prefix(entry).unwrap_or(&path).to_string_lossy();
         let Some(expected_digest) = expected.get(relative.as_ref()) else {
             return Ok(false);
         };
-        if !path.exists() || rlib_cache_digest(&path)? != *expected_digest {
+        if !path_is_regular_file(&path) || rlib_cache_digest(&path)? != *expected_digest {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+fn cleanup_corrupt_rlib_cache_entries(
+    cache_root: &Path,
+    entries: &[PathBuf],
+    outputs: &[build_runner::OutputFile],
+    max_size: Option<u64>,
+) {
+    if entries.is_empty() {
+        return;
+    }
+    let Ok(Some(_lock)) = try_write_lock_rlib_cache(cache_root) else {
+        return;
+    };
+    let mut changed = false;
+    for entry in entries {
+        if verify_rlib_cache_entry(entry, outputs).unwrap_or(false) {
+            continue;
+        }
+        if mark_rlib_cache_size_dirty(cache_root).is_ok()
+            && quarantine_rlib_cache_entry(entry).is_ok()
+        {
+            changed = true;
+        }
+    }
+    if changed && let Err(error) = reconcile_rlib_cache_size(cache_root, max_size, None) {
+        debug!("failed to reconcile artifact cache after removing corrupt entries: {error:#}");
+    }
 }
 
 fn verify_rlib_cache_inputs(
@@ -2473,6 +2556,14 @@ fn rlib_cache_digest(path: &Path) -> CargoResult<String> {
     Ok(blake3::hash(&fs::read(path)?).to_hex().to_string())
 }
 
+fn path_is_directory_no_follow(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
+}
+
+fn path_is_regular_file(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
+}
+
 fn staging_rlib_cache_entry(entry: &Path) -> CargoResult<PathBuf> {
     let key = entry.file_name().unwrap_or_default().to_string_lossy();
     let sequence = ARTIFACT_CACHE_PUBLICATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -2486,6 +2577,11 @@ fn staging_rlib_cache_entry(entry: &Path) -> CargoResult<PathBuf> {
 
 fn try_read_lock_rlib_cache(cache_root: &Path) -> CargoResult<Option<crate::util::FileLock>> {
     paths::create_dir_all(cache_root)?;
+    if fs::symlink_metadata(cache_root.join(".cargo-artifact-cache-lock"))
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Ok(None);
+    }
     Ok(
         match Filesystem::new(cache_root.to_path_buf())
             .try_open_ro_shared_create_strict(".cargo-artifact-cache-lock")?
@@ -2498,6 +2594,11 @@ fn try_read_lock_rlib_cache(cache_root: &Path) -> CargoResult<Option<crate::util
 
 fn try_write_lock_rlib_cache(cache_root: &Path) -> CargoResult<Option<crate::util::FileLock>> {
     paths::create_dir_all(cache_root)?;
+    if fs::symlink_metadata(cache_root.join(".cargo-artifact-cache-lock"))
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Ok(None);
+    }
     Ok(
         match Filesystem::new(cache_root.to_path_buf())
             .try_open_rw_exclusive_create_strict(".cargo-artifact-cache-lock")?
@@ -2519,7 +2620,10 @@ fn cleanup_abandoned_rlib_cache_transients(cache_root: &Path) {
         return;
     };
     for entry_root in entry_roots.flatten() {
-        if !entry_root.path().is_dir() {
+        if !entry_root
+            .file_type()
+            .is_ok_and(|file_type| file_type.is_dir())
+        {
             continue;
         }
         let Ok(entries) = fs::read_dir(entry_root.path()) else {
@@ -2532,6 +2636,9 @@ fn cleanup_abandoned_rlib_cache_transients(cache_root: &Path) {
                 name.starts_with('.')
                     && (name.contains(".publishing-") || name.contains(".rejected-"))
             }) {
+                continue;
+            }
+            if !entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
                 continue;
             }
             if retain_transients_for_tests {
@@ -2552,7 +2659,11 @@ fn cleanup_abandoned_rlib_cache_transients(cache_root: &Path) {
 }
 
 fn recorded_rlib_cache_size(cache_root: &Path) -> Option<u64> {
-    paths::read(&cache_root.join(ARTIFACT_CACHE_SIZE_STATE))
+    let state = cache_root.join(ARTIFACT_CACHE_SIZE_STATE);
+    if !path_is_regular_file(&state) {
+        return None;
+    }
+    paths::read(&state)
         .ok()?
         .trim()
         .strip_prefix(&format!("{ARTIFACT_CACHE_SIZE_STATE_VERSION} "))?
@@ -2572,7 +2683,10 @@ fn rlib_cache_has_transients(cache_root: &Path) -> bool {
         let Ok(entry_root) = entry_root else {
             return true;
         };
-        if !entry_root.path().is_dir() {
+        if !entry_root
+            .file_type()
+            .is_ok_and(|file_type| file_type.is_dir())
+        {
             continue;
         }
         let Ok(entries) = fs::read_dir(entry_root.path()) else {
@@ -2610,7 +2724,7 @@ fn reconcile_rlib_cache_size(
     retained_entry: Option<&Path>,
 ) -> CargoResult<u64> {
     cleanup_abandoned_rlib_cache_transients(cache_root);
-    let size = prune_rlib_cache_entries(cache_root, max_size, retained_entry);
+    let size = prune_rlib_cache_entries(cache_root, max_size, retained_entry)?;
     write_rlib_cache_size(cache_root, size)?;
     Ok(size)
 }
@@ -2655,33 +2769,43 @@ fn prune_rlib_cache_entries(
     cache_root: &Path,
     max_size: Option<u64>,
     retained_entry: Option<&Path>,
-) -> u64 {
-    let Ok(entry_roots) = fs::read_dir(cache_root) else {
-        return 0;
-    };
+) -> CargoResult<u64> {
+    let entry_roots = fs::read_dir(cache_root)?;
     let mut completed = Vec::new();
     let mut total_size = 0u64;
-    for entry_root in entry_roots.flatten() {
-        let entry_root = entry_root.path();
-        if !entry_root.is_dir() {
+    for entry_root in entry_roots {
+        let entry_root = entry_root?;
+        let file_type = entry_root.file_type()?;
+        if file_type.is_symlink() {
+            if entry_root.file_name() == OsStr::new(ARTIFACT_CACHE_SIZE_STATE) {
+                continue;
+            }
+            anyhow::bail!(
+                "artifact cache contains symlinked action root {}",
+                entry_root.path().display()
+            );
+        }
+        if !file_type.is_dir() {
             continue;
         }
-        let Ok(entries) = fs::read_dir(&entry_root) else {
-            continue;
-        };
-        for entry in entries.flatten() {
+        let entry_root = entry_root.path();
+        let entries = fs::read_dir(&entry_root)?;
+        for entry in entries {
+            let entry = entry?;
             let path = entry.path();
-            if !path.is_dir()
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                anyhow::bail!("artifact cache contains symlinked entry {}", path.display());
+            }
+            if !file_type.is_dir()
                 || path
                     .file_name()
                     .is_some_and(|name| name.to_string_lossy().starts_with('.'))
-                || !path.join("complete").exists()
+                || !path_is_regular_file(&path.join("complete"))
             {
                 continue;
             }
-            let Some(size) = artifact_cache_entry_size(&path) else {
-                continue;
-            };
+            let size = artifact_cache_entry_size(&path)?;
             let modified = entry
                 .metadata()
                 .and_then(|metadata| metadata.modified())
@@ -2691,10 +2815,10 @@ fn prune_rlib_cache_entries(
         }
     }
     let Some(max_size) = max_size else {
-        return total_size;
+        return Ok(total_size);
     };
     if total_size <= max_size {
-        return total_size;
+        return Ok(total_size);
     }
     completed.sort_by_key(|(modified, _, _)| *modified);
     for (_, size, path) in completed {
@@ -2711,7 +2835,7 @@ fn prune_rlib_cache_entries(
             }
         }
     }
-    total_size
+    Ok(total_size)
 }
 
 fn rlib_cache_size_within_limit(size: u64, max_size: Option<u64>) -> bool {
@@ -2720,7 +2844,7 @@ fn rlib_cache_size_within_limit(size: u64, max_size: Option<u64>) -> bool {
 
 #[cfg(test)]
 mod artifact_cache_size_tests {
-    use super::rlib_cache_size_within_limit;
+    use super::{artifact_cache_entry_size, hash_path_tree, rlib_cache_size_within_limit};
 
     #[test]
     fn unconfigured_size_limit_is_unbounded() {
@@ -2728,20 +2852,67 @@ mod artifact_cache_size_tests {
         assert!(rlib_cache_size_within_limit(10, Some(10)));
         assert!(!rlib_cache_size_within_limit(11, Some(10)));
     }
+
+    #[test]
+    #[cfg(unix)]
+    fn entry_size_rejects_symlink_cycles() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("file"), b"contents").unwrap();
+        symlink(".", temp.path().join("loop")).unwrap();
+
+        assert!(artifact_cache_entry_size(temp.path()).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn action_input_tree_rejects_symlink_cycles() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        symlink(".", temp.path().join("loop")).unwrap();
+
+        assert!(
+            hash_path_tree(
+                &mut blake3::Hasher::new(),
+                temp.path(),
+                temp.path(),
+                None,
+                false,
+            )
+            .is_err()
+        );
+    }
 }
 
-fn artifact_cache_entry_size(path: &Path) -> Option<u64> {
-    let entries = fs::read_dir(path).ok()?;
+fn artifact_cache_entry_size(path: &Path) -> CargoResult<u64> {
+    if !path_is_directory_no_follow(path) {
+        anyhow::bail!(
+            "artifact cache size root is not an ordinary directory: {}",
+            path.display()
+        );
+    }
+    let entries = fs::read_dir(path)?;
     let mut size = 0u64;
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry?;
         let path = entry.path();
-        if path.is_dir() {
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            anyhow::bail!("artifact cache contains symlink {}", path.display());
+        } else if file_type.is_dir() {
             size = size.saturating_add(artifact_cache_entry_size(&path)?);
+        } else if file_type.is_file() {
+            size = size.saturating_add(entry.metadata()?.len());
         } else {
-            size = size.saturating_add(entry.metadata().ok()?.len());
+            anyhow::bail!(
+                "artifact cache contains unsupported node {}",
+                path.display()
+            );
         }
     }
-    Some(size)
+    Ok(size)
 }
 
 fn quarantine_rlib_cache_entry(entry: &Path) -> CargoResult<()> {
