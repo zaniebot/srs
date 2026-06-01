@@ -38,6 +38,9 @@ jobs:
           persist-credentials: false
           submodules: recursive
 
+      - name: Verify SRS Cargo wrapper
+        run: ./scripts/test-cargo-srs-wrapper.sh
+
       - name: Build SRS
         # Standard macOS arm64 runners are tight on storage for rustc stage2 builds.
         run: ./build.sh --ci false --set=rust.incremental=false --set=rust.debuginfo-level=0
