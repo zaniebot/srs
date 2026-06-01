@@ -364,11 +364,14 @@ fn directory_files(path: &Path, recursive: bool) -> Option<Vec<PathBuf>> {
     };
     let mut files = Vec::new();
     for entry in entries {
-        let path = entry.ok()?.path();
-        let metadata = std::fs::metadata(&path).ok()?;
-        if metadata.is_file() {
+        let entry = entry.ok()?;
+        let path = entry.path();
+        let file_type = entry.file_type().ok()?;
+        if file_type.is_symlink() {
+            return None;
+        } else if file_type.is_file() {
             files.push(path);
-        } else if recursive && metadata.is_dir() {
+        } else if recursive && file_type.is_dir() {
             files.extend(directory_files(&path, true)?);
         }
     }
@@ -509,8 +512,12 @@ fn artifact_cache_identity_for_program(path: &Path) -> Option<ArtifactCacheIdent
     );
     let rustlib = sysroot.join("lib").join("rustlib");
     for target in std::fs::read_dir(&rustlib).ok()? {
-        let target = target.ok()?.path();
-        if std::fs::metadata(&target).ok()?.is_dir() {
+        let target = target.ok()?;
+        if target.file_type().ok()?.is_symlink() {
+            return None;
+        }
+        let target = target.path();
+        if target.is_dir() {
             if cfg!(target_os = "linux") && has_nested_runtime_library(&target.join("lib"), None)? {
                 return None;
             }
@@ -721,6 +728,27 @@ mod artifact_cache_identity_tests {
         let second = artifact_cache_identity_for_program(&rustc).unwrap().digest;
 
         assert_ne!(first, second);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sysroot_symlink_cycle_disables_compiler_identity() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let sysroot = temp.path().join("toolchain");
+        let rustc = sysroot.join("bin").join("rustc");
+        let libraries = sysroot
+            .join("lib")
+            .join("rustlib")
+            .join("test-target")
+            .join("lib");
+        std::fs::create_dir_all(rustc.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&libraries).unwrap();
+        std::fs::write(&rustc, b"rustc").unwrap();
+        symlink(".", libraries.join("loop")).unwrap();
+
+        assert!(artifact_cache_identity_for_program(&rustc).is_none());
     }
 
     #[cfg(target_os = "linux")]
