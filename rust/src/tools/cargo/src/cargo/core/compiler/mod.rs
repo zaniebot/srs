@@ -1765,7 +1765,7 @@ fn restore_rlib_cache(
     loader_input_paths: &[(OsString, PathBuf)],
     loader_inputs_digest: &blake3::Hash,
     materialization: ArtifactCacheMaterialization,
-    max_size: u64,
+    max_size: Option<u64>,
 ) -> CargoResult<bool> {
     if !entry_root.exists() {
         return Ok(false);
@@ -1938,7 +1938,7 @@ fn store_rlib_cache(
     identity_witness: &crate::util::rustc::ArtifactCacheIdentityWitness,
     loader_input_paths: &[(OsString, PathBuf)],
     loader_inputs_digest: &blake3::Hash,
-    max_size: u64,
+    max_size: Option<u64>,
 ) -> CargoResult<bool> {
     if !rlib_cache_inputs_are_supported(rustc_dep_info_loc, rustc_cwd, build_dir, output_root)? {
         debug!("not storing artifact cache entry with generated build-directory inputs");
@@ -1970,7 +1970,7 @@ fn store_rlib_cache(
         return Ok(false);
     };
     let mut cache_size = match recorded_rlib_cache_size(cache_root) {
-        Some(size) if size <= max_size => size,
+        Some(size) if rlib_cache_size_within_limit(size, max_size) => size,
         Some(_) | None => reconcile_rlib_cache_size(cache_root, max_size, None)?,
     };
     paths::create_dir_all(entry_root)?;
@@ -1978,7 +1978,8 @@ fn store_rlib_cache(
     if entry.exists() {
         if entry.join("complete").exists()
             && verify_rlib_cache_entry(&entry, outputs).unwrap_or(false)
-            && artifact_cache_entry_size(&entry).is_some_and(|size| size <= max_size)
+            && artifact_cache_entry_size(&entry)
+                .is_some_and(|size| rlib_cache_size_within_limit(size, max_size))
         {
             return Ok(false);
         }
@@ -2068,7 +2069,9 @@ fn store_rlib_cache(
                 staging.display()
             ))
         })?;
-        if entry_size > max_size {
+        if let Some(max_size) = max_size
+            && entry_size > max_size
+        {
             paths::remove_dir_all(&staging)?;
             write_rlib_cache_size(cache_root, cache_size)?;
             debug!(
@@ -2097,7 +2100,7 @@ fn store_rlib_cache(
             Err(error) => return Err(error.into()),
         }
         cache_size = cache_size.saturating_add(entry_size);
-        if cache_size > max_size {
+        if !rlib_cache_size_within_limit(cache_size, max_size) {
             reconcile_rlib_cache_size(cache_root, max_size, Some(&entry))?;
         } else {
             write_rlib_cache_size(cache_root, cache_size)?;
@@ -2472,7 +2475,7 @@ fn write_rlib_cache_size(cache_root: &Path, size: u64) -> CargoResult<()> {
 
 fn reconcile_rlib_cache_size(
     cache_root: &Path,
-    max_size: u64,
+    max_size: Option<u64>,
     retained_entry: Option<&Path>,
 ) -> CargoResult<u64> {
     cleanup_abandoned_rlib_cache_transients(cache_root);
@@ -2483,12 +2486,15 @@ fn reconcile_rlib_cache_size(
 
 fn try_read_lock_rlib_cache_within_limit(
     cache_root: &Path,
-    max_size: u64,
+    max_size: Option<u64>,
 ) -> CargoResult<Option<crate::util::FileLock>> {
     let Some(lock) = try_read_lock_rlib_cache(cache_root)? else {
         return Ok(None);
     };
-    if recorded_rlib_cache_size(cache_root).is_some_and(|size| size <= max_size) {
+    if max_size.is_none()
+        || recorded_rlib_cache_size(cache_root)
+            .is_some_and(|size| rlib_cache_size_within_limit(size, max_size))
+    {
         delay_rlib_cache_restore_admitted_for_tests()?;
         return Ok(Some(lock));
     }
@@ -2496,14 +2502,18 @@ fn try_read_lock_rlib_cache_within_limit(
     let Some(_lock) = try_write_lock_rlib_cache(cache_root)? else {
         return Ok(None);
     };
-    if !recorded_rlib_cache_size(cache_root).is_some_and(|size| size <= max_size) {
+    if !recorded_rlib_cache_size(cache_root)
+        .is_some_and(|size| rlib_cache_size_within_limit(size, max_size))
+    {
         reconcile_rlib_cache_size(cache_root, max_size, None)?;
     }
     drop(_lock);
     let Some(lock) = try_read_lock_rlib_cache(cache_root)? else {
         return Ok(None);
     };
-    if !recorded_rlib_cache_size(cache_root).is_some_and(|size| size <= max_size) {
+    if !recorded_rlib_cache_size(cache_root)
+        .is_some_and(|size| rlib_cache_size_within_limit(size, max_size))
+    {
         return Ok(None);
     }
     delay_rlib_cache_restore_admitted_for_tests()?;
@@ -2512,7 +2522,7 @@ fn try_read_lock_rlib_cache_within_limit(
 
 fn prune_rlib_cache_entries(
     cache_root: &Path,
-    max_size: u64,
+    max_size: Option<u64>,
     retained_entry: Option<&Path>,
 ) -> u64 {
     let Ok(entry_roots) = fs::read_dir(cache_root) else {
@@ -2549,6 +2559,9 @@ fn prune_rlib_cache_entries(
             completed.push((modified, size, path));
         }
     }
+    let Some(max_size) = max_size else {
+        return total_size;
+    };
     if total_size <= max_size {
         return total_size;
     }
@@ -2568,6 +2581,22 @@ fn prune_rlib_cache_entries(
         }
     }
     total_size
+}
+
+fn rlib_cache_size_within_limit(size: u64, max_size: Option<u64>) -> bool {
+    max_size.is_none_or(|max_size| size <= max_size)
+}
+
+#[cfg(test)]
+mod artifact_cache_size_tests {
+    use super::rlib_cache_size_within_limit;
+
+    #[test]
+    fn unconfigured_size_limit_is_unbounded() {
+        assert!(rlib_cache_size_within_limit(u64::MAX, None));
+        assert!(rlib_cache_size_within_limit(10, Some(10)));
+        assert!(!rlib_cache_size_within_limit(11, Some(10)));
+    }
 }
 
 fn artifact_cache_entry_size(path: &Path) -> Option<u64> {
