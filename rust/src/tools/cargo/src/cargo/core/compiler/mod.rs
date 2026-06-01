@@ -228,7 +228,6 @@ fn compile<'gctx>(
     jobs: &mut JobQueue<'gctx>,
     unit: &Unit,
     exec: &Arc<dyn Executor>,
-    force_rebuild: bool,
 ) -> CargoResult<()> {
     if !build_runner.compiled.insert(unit.clone()) {
         return Ok(());
@@ -254,7 +253,7 @@ fn compile<'gctx>(
             // We run these targets later, so this is just a no-op for now.
             Job::new_fresh()
         } else {
-            let force = exec.force_rebuild(unit) || force_rebuild;
+            let force = exec.force_rebuild(unit);
             let mut job = fingerprint::prepare_target(build_runner, unit, force)?;
             job.before(if job.freshness().is_dirty() {
                 let work = if unit.mode.is_doc() || unit.mode.is_doc_scrape() {
@@ -302,7 +301,7 @@ fn compile<'gctx>(
     // Be sure to compile all dependencies of this target as well.
     let deps = Vec::from(build_runner.unit_deps(unit)); // Create vec due to mutable borrow.
     for dep in deps {
-        compile(build_runner, jobs, &dep.unit, exec, false)?;
+        compile(build_runner, jobs, &dep.unit, exec)?;
     }
 
     Ok(())
