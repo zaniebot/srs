@@ -300,22 +300,56 @@ fn rustc_bootstrap_requests_are_not_cacheable() {
 fn rustc_forced_version_inputs_are_not_cacheable() {
     let cache = paths::root().join("shared-cache");
     let project = project_with_cache("project", &cache, "hardlink", 42);
-    let target = project.root().join("target-dir");
-
-    project
-        .cargo("-Zartifact-cache build --lib")
-        .arg("--target-dir")
-        .arg(&target)
-        .masquerade_as_nightly_cargo(&["artifact-cache"])
-        .env(
-            cargo_util::paths::dylib_path_envvar(),
-            isolated_loader_path(),
-        )
-        .env("CARGO_INCREMENTAL", "1")
-        .env("RUSTC_FORCE_RUSTC_VERSION", "artifact-cache-test-version")
-        .run();
+    for key in ["RUSTC_FORCE_RUSTC_VERSION", "RUSTC_OVERRIDE_VERSION_STRING"] {
+        project
+            .cargo("-Zartifact-cache build --lib")
+            .arg("--target-dir")
+            .arg(project.root().join(key))
+            .masquerade_as_nightly_cargo(&["artifact-cache"])
+            .env(
+                cargo_util::paths::dylib_path_envvar(),
+                isolated_loader_path(),
+            )
+            .env("CARGO_INCREMENTAL", "1")
+            .env(key, "1.99.0")
+            .run();
+    }
 
     assert!(cached_rlibs(&cache).is_empty());
+}
+
+#[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
+#[cfg(target_os = "macos")]
+fn deployment_target_changes_keep_distinct_variants() {
+    use std::os::unix::fs::MetadataExt;
+
+    let cache = paths::root().join("shared-cache");
+    let project = project_with_cache("project", &cache, "hardlink", 42);
+    let first_target = project.root().join("first-target");
+    let second_target = project.root().join("second-target");
+    let restored_target = project.root().join("restored-target");
+
+    build_in_target_with_env(&project, &first_target, "MACOSX_DEPLOYMENT_TARGET", "11.0");
+    build_in_target_with_env(&project, &second_target, "MACOSX_DEPLOYMENT_TARGET", "14.0");
+    assert_eq!(cached_rlibs(&cache).len(), 2);
+
+    build_in_target_with_env(
+        &project,
+        &restored_target,
+        "MACOSX_DEPLOYMENT_TARGET",
+        "11.0",
+    );
+    let first_bytes = fs::read(cached_rlib(&first_target.join("debug").join("deps"))).unwrap();
+    let first_cached = cached_rlibs(&cache)
+        .into_iter()
+        .find(|path| fs::read(path).unwrap() == first_bytes)
+        .unwrap();
+    assert_eq!(
+        fs::metadata(first_cached).unwrap().ino(),
+        fs::metadata(cached_rlib(&restored_target.join("debug").join("deps")))
+            .unwrap()
+            .ino()
+    );
 }
 
 fn project_without_cache_config(name: &str, value: u32) -> Project {
@@ -327,8 +361,8 @@ fn project_without_cache_config(name: &str, value: u32) -> Project {
         .build()
 }
 
-fn build_manual_extern_dependency() -> PathBuf {
-    let dependency = project_in("dependency")
+fn build_manual_extern_dependency_with_value(name: &str, value: u32) -> PathBuf {
+    let dependency = project_in(name)
         .file(
             "Cargo.toml",
             r#"
@@ -338,11 +372,18 @@ fn build_manual_extern_dependency() -> PathBuf {
             edition = "2024"
             "#,
         )
-        .file("src/lib.rs", "pub fn value() -> u32 { 7 }\n")
+        .file(
+            "src/lib.rs",
+            &format!("pub fn value() -> u32 {{ {value} }}\n"),
+        )
         .build();
     let target = dependency.root().join("target-dir");
     build_in_target(&dependency, &target);
     cached_rlib(&target.join("debug").join("deps"))
+}
+
+fn build_manual_extern_dependency() -> PathBuf {
+    build_manual_extern_dependency_with_value("dependency", 7)
 }
 
 #[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
@@ -2151,6 +2192,70 @@ fn pathless_extern_rustflag_is_not_cacheable() {
 }
 
 #[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
+fn relative_extern_content_is_resolved_from_rustc_cwd() {
+    let first_extern = build_manual_extern_dependency_with_value("first-dependency", 7);
+    let second_extern = build_manual_extern_dependency_with_value("second-dependency", 8);
+    let cache = paths::root().join("shared-cache");
+    let project = project_in("relative-extern-workspace")
+        .file(
+            ".cargo/config.toml",
+            &format!(
+                r#"
+                [build]
+                artifact-cache-dir = "{}"
+                artifact-cache-materialization = "hardlink"
+                rustflags = ["--extern", "extern_dep=libextern_dep.rlib"]
+                "#,
+                cache.to_string_lossy().replace('\\', "\\\\")
+            ),
+        )
+        .file(
+            "Cargo.toml",
+            r#"
+            [workspace]
+            members = ["member"]
+            resolver = "3"
+            "#,
+        )
+        .file(
+            "member/Cargo.toml",
+            r#"
+            [package]
+            name = "project"
+            version = "0.0.1"
+            edition = "2024"
+            "#,
+        )
+        .file(
+            "member/src/lib.rs",
+            "pub fn value() -> u32 { extern_dep::value() }\n",
+        )
+        .build();
+    let extern_path = project.root().join("libextern_dep.rlib");
+
+    fs::copy(&first_extern, &extern_path).unwrap();
+    for (target, dependency) in [
+        (project.root().join("first-target"), &first_extern),
+        (project.root().join("second-target"), &second_extern),
+    ] {
+        fs::copy(dependency, &extern_path).unwrap();
+        project
+            .cargo("-Zartifact-cache build --lib -p project")
+            .arg("--target-dir")
+            .arg(target)
+            .masquerade_as_nightly_cargo(&["artifact-cache"])
+            .env(
+                cargo_util::paths::dylib_path_envvar(),
+                isolated_loader_path(),
+            )
+            .env("CARGO_INCREMENTAL", "1")
+            .run();
+    }
+
+    assert_eq!(cached_rlibs(&cache).len(), 2);
+}
+
+#[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
 #[cfg(unix)]
 fn distinct_package_roots_do_not_share_path_sensitive_artifacts() {
     use std::os::unix::fs::MetadataExt;
@@ -2170,6 +2275,27 @@ fn distinct_package_roots_do_not_share_path_sensitive_artifacts() {
         fs::metadata(cached_rlib(&producer.target_debug_dir().join("deps")))
             .unwrap()
             .ino(),
+        fs::metadata(cached_rlib(&consumer.target_debug_dir().join("deps")))
+            .unwrap()
+            .ino()
+    );
+}
+
+#[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
+#[cfg(unix)]
+fn distinct_package_roots_share_path_independent_artifacts() {
+    use std::os::unix::fs::MetadataExt;
+
+    let cache = paths::root().join("shared-cache");
+    let producer = project_with_cache("producer", &cache, "hardlink", 42);
+    let consumer = project_with_cache("consumer", &cache, "hardlink", 42);
+
+    build(&producer);
+    build(&consumer);
+
+    assert_eq!(cached_rlibs(&cache).len(), 1);
+    assert_eq!(
+        fs::metadata(cached_rlib(&cache)).unwrap().ino(),
         fs::metadata(cached_rlib(&consumer.target_debug_dir().join("deps")))
             .unwrap()
             .ino()
