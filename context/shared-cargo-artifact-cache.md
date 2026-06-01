@@ -1,0 +1,102 @@
+# Shared Cargo Artifact Cache
+
+## Purpose
+
+SRS developers commonly build from multiple worktrees. Each worktree should
+keep its own writable target directory, but independently compiling and storing
+the same dependencies wastes both build time and disk space.
+
+The installed SRS Cargo wrapper enables Cargo's verified ordinary-library
+artifact cache at:
+
+```text
+${CARGO_HOME:-$HOME/.cargo}/srs-artifact-cache-v2
+```
+
+Dependencies compiled from a shared source location, such as registry
+packages, can be restored across SRS worktrees. Separate local checkouts remain
+distinct when their source location can affect output.
+
+## Materialization
+
+On macOS and Linux, cached artifacts are restored by hardlink by default.
+Hardlink materialization avoids allocating a second copy of identical `.rlib`
+and `.rmeta` files. Restoration automatically falls back to copying when the
+cache and build directory are on different filesystems.
+
+Cargo detaches restored hardlinks before rebuilding them, including when the
+cache feature is later disabled. Tools outside Cargo must not overwrite
+restored `.rlib` or `.rmeta` files in place: in hardlink mode, those files
+share storage with the central cache. Use copy materialization for workflows
+that mutate build artifacts after compilation.
+
+## Cache Admission
+
+The cache is deliberately limited to verified ordinary-library artifacts.
+Builds that use unmodeled inputs execute normally without artifact restoration.
+
+Restoration is skipped for:
+
+- wrapped `rustc` invocations
+- explicitly configured or otherwise unmodeled compiler dispatch
+- self-profile builds and rustc tracing runs
+- `RUSTC_BOOTSTRAP` builds
+- forced rustc version identity overrides
+- profile-guided compiler inputs
+- arbitrary LLVM backend arguments
+- external codegen backend libraries
+- custom target specifications or search paths
+- explicit sysroot overrides
+- unmodeled dynamic loader overrides
+- unmodeled dependency search paths
+- rustc `-Z` options other than selecting a named sysroot codegen backend
+- Windows GNU-family targets, where raw-dylib compilation can invoke unmodeled
+  `dlltool` programs
+
+These exclusions cover configurations that can change output or request side
+effects outside Cargo's cache key.
+
+## Compiler Identity
+
+Each cache key includes sysroot compiler and target library file identity,
+named sysroot codegen backend contents including SRS's Cranelift backend, and
+compiler-visible dynamic library search inputs.
+
+Linux runs with nonempty `GLIBC_TUNABLES` or nested shared objects in compiler
+loader roots execute normally without restoration. This includes glibc
+hardware-capability candidates in configured or installed compiler loader
+roots, because they can change the selected compiler library.
+
+Sysroot library identity assumes ordinary toolchain publication updates file
+identity metadata. Overwriting a watched file in place while preserving
+identity, size, and modification time, or mutating installed toolchain files
+during an active Cargo invocation, is outside the cache model. For ordinary
+publication that replaces watched installed files or directory trees, file
+and directory identity metadata are included in the cache identity and
+rechecked before restoration and publication.
+
+## Capacity And Concurrency
+
+The cache is currently capped at 10 GB by default. Completed entries are
+evicted oldest-first, entries larger than the configured limit are not
+published, and aborted publications are cleaned during later cache publication
+activity.
+
+Concurrent restores use shared cache locks. Publication, cleanup, and eviction
+use an exclusive cache lock.
+
+## Configuration
+
+Set `SRS_CARGO_ARTIFACT_CACHE=0` to disable shared artifact restoration.
+
+Set `SRS_CARGO_ARTIFACT_CACHE_DIR` to choose a different central cache root.
+
+Set `SRS_CARGO_ARTIFACT_CACHE_MATERIALIZATION=copy` to retain cache reuse
+without hardlink materialization.
+
+Set `SRS_CARGO_ARTIFACT_CACHE_MAX_SIZE` to a human-readable cache limit such as
+`2GiB`.
+
+Choose a cache root writable only by trusted build processes. Entry hashes
+reject accidental corruption but do not authenticate artifacts supplied by
+another writer with access to that directory.
