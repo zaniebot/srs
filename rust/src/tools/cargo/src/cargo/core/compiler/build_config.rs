@@ -74,10 +74,8 @@ pub enum ArtifactCacheMaterialization {
 pub struct ArtifactCacheConfig {
     pub dir: PathBuf,
     pub materialization: ArtifactCacheMaterialization,
-    pub max_size: u64,
+    pub max_size: Option<u64>,
 }
-
-const DEFAULT_ARTIFACT_CACHE_MAX_SIZE: u64 = 10_000_000_000;
 
 fn default_parallelism() -> CargoResult<u32> {
     Ok(available_parallelism()
@@ -152,8 +150,7 @@ impl BuildConfig {
                     .artifact_cache_max_size
                     .as_deref()
                     .map(crate::core::gc::parse_human_size)
-                    .transpose()?
-                    .unwrap_or(DEFAULT_ARTIFACT_CACHE_MAX_SIZE);
+                    .transpose()?;
                 Some(ArtifactCacheConfig {
                     dir: dir.resolve_path(gctx),
                     materialization,

@@ -550,7 +550,7 @@ Enable it with `-Zartifact-cache` and configure the shared directory:
 [build]
 artifact-cache-dir = "/var/cache/cargo/artifacts"
 artifact-cache-materialization = "hardlink"
-artifact-cache-max-size = "10GB"
+artifact-cache-max-size = "100GB"
 ```
 
 The cache directory must be trusted build-artifact storage. Entry hashes reject
@@ -568,11 +568,12 @@ place; use `copy` materialization for workflows that modify build artifacts
 after compilation.
 
 `artifact-cache-max-size` caps completed cache entries using oldest-first
-eviction and accepts human-readable sizes such as `"10GB"` or `"2GiB"`. The
-default is `"10GB"`. Individual entries larger than this limit are not
-published. Cargo allows concurrent restorations under shared cache locks and
-protects publication, size accounting, cleanup of aborted publications, and
-eviction with an exclusive cache lock.
+eviction and accepts human-readable sizes such as `"100GB"` or `"2GiB"`.
+The cache is unbounded when this setting is omitted. Individual entries larger
+than an explicitly configured limit are not published. Cargo allows concurrent
+restorations under shared cache locks and protects publication, size
+accounting, cleanup of aborted publications, and eviction with an exclusive
+cache lock.
 
 ## update-breaking
 

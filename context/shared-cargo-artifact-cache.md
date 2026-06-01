@@ -77,10 +77,10 @@ rechecked before restoration and publication.
 
 ## Capacity And Concurrency
 
-The cache is currently capped at 10 GB by default. Completed entries are
-evicted oldest-first, entries larger than the configured limit are not
-published, and aborted publications are cleaned during later cache publication
-activity.
+The cache is unbounded by default. When a size limit is configured, completed
+entries are evicted oldest-first and entries larger than the configured limit
+are not published. Aborted publications are cleaned during later cache
+publication activity.
 
 Concurrent restores use shared cache locks. Publication, cleanup, and eviction
 use an exclusive cache lock.
