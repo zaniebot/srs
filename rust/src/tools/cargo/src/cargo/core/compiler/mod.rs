@@ -818,6 +818,7 @@ fn unmodeled_codegen_behavior_flag(arg: &str) -> bool {
     ["profile-use", "profile-sample-use", "llvm-args"]
         .iter()
         .any(|flag| arg == *flag || arg.starts_with(&format!("{flag}=")))
+        || arg == "target-cpu=native"
 }
 
 fn modeled_sysroot_codegen_backend_flag(arg: &str) -> bool {
@@ -888,6 +889,9 @@ fn rlib_action_is_cacheable_with_search_paths(
         "RUSTC_LOG_FORMAT_JSON",
         "RUSTC_LOG_OUTPUT_TARGET",
         "RUST_TARGET_PATH",
+        "CG_CLIF_DISABLE_INCR_CACHE",
+        "CG_CLIF_ENABLE_VERIFIER",
+        "CG_CLIF_JIT_ARGS",
     ];
     rustc.get_programs().all(|program| program.to_str().is_some())
         && rustc.get_args().all(|arg| arg.to_str().is_some())
@@ -896,6 +900,7 @@ fn rlib_action_is_cacheable_with_search_paths(
             .values()
             .flatten()
             .all(|value| value.to_str().is_some())
+        && !rustc.get_envs().contains_key("PATH")
         && rustc.get_programs().count() == 1
         && action_program == compiler_program
         && !unmodeled_environment
@@ -931,7 +936,7 @@ fn rlib_action_is_cacheable_with_search_paths(
                     .is_some_and(custom_target_spec_flag)
                 || arg.starts_with("--sysroot=")
                 || arg.starts_with("-Zunpretty=")
-                || arg == "-o"
+                || arg.starts_with("-o")
                 || arg == "--print"
                 || arg == "--pretty"
                 || arg == "--unpretty"
@@ -1091,6 +1096,68 @@ mod artifact_cache_admission_tests {
             compiler,
             host
         ));
+    }
+
+    #[test]
+    fn host_cpu_detection_is_not_cacheable() {
+        let output_root = Path::new("target/debug/deps");
+        let compiler = Path::new("rustc");
+        let host = "aarch64-apple-darwin";
+
+        let mut compact = ordinary_rlib_command();
+        compact.arg("-Ctarget-cpu=native");
+        assert!(!rlib_action_is_cacheable(
+            &compact,
+            output_root,
+            compiler,
+            host
+        ));
+
+        let mut split = ordinary_rlib_command();
+        split.arg("-C").arg("target-cpu=native");
+        assert!(!rlib_action_is_cacheable(
+            &split,
+            output_root,
+            compiler,
+            host
+        ));
+    }
+
+    #[test]
+    fn compact_output_overrides_are_not_cacheable() {
+        let output_root = Path::new("target/debug/deps");
+        let compiler = Path::new("rustc");
+        let host = "aarch64-apple-darwin";
+
+        let mut compact = ordinary_rlib_command();
+        compact.arg("-ocustom-output");
+        assert!(!rlib_action_is_cacheable(
+            &compact,
+            output_root,
+            compiler,
+            host
+        ));
+    }
+
+    #[test]
+    fn compiler_dispatch_and_backend_controls_are_not_cacheable() {
+        let output_root = Path::new("target/debug/deps");
+        let compiler = Path::new("rustc");
+        let host = "aarch64-apple-darwin";
+
+        for (key, value) in [
+            ("PATH", "/configured/compiler/path"),
+            ("CG_CLIF_DISABLE_INCR_CACHE", "1"),
+            ("CG_CLIF_ENABLE_VERIFIER", "1"),
+            ("CG_CLIF_JIT_ARGS", "--example"),
+        ] {
+            let mut rustc = ordinary_rlib_command();
+            rustc.env(key, value);
+            assert!(
+                !rlib_action_is_cacheable(&rustc, output_root, compiler, host),
+                "{key} should disable cache restoration"
+            );
+        }
     }
 
     #[test]
