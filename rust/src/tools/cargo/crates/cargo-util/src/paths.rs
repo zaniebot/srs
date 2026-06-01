@@ -192,11 +192,22 @@ pub fn write<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C) -> Result<()>
 /// This uses `tempfile::persist` to accomplish atomic writes.
 /// If the path is a symlink, it will follow the symlink and write to the actual target.
 pub fn write_atomic<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C) -> Result<()> {
-    let path = path.as_ref();
+    write_atomic_impl(path.as_ref(), contents.as_ref(), true)
+}
 
-    // Check if the path is a symlink and follow it if it is
+/// Writes a file to disk atomically without following a destination symlink.
+///
+/// This uses `tempfile::persist` to accomplish atomic writes. If the path is a
+/// symlink, the symlink is replaced with a regular file and its target is left
+/// unchanged.
+pub fn write_atomic_no_follow<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C) -> Result<()> {
+    write_atomic_impl(path.as_ref(), contents.as_ref(), false)
+}
+
+fn write_atomic_impl(path: &Path, contents: &[u8], follow_destination_symlink: bool) -> Result<()> {
+    // Check if the path is a symlink and follow it if requested.
     let resolved_path;
-    let path = if path.is_symlink() {
+    let path = if follow_destination_symlink && path.is_symlink() {
         resolved_path = fs::read_link(path)
             .with_context(|| format!("failed to read symlink at `{}`", path.display()))?;
         &resolved_path
@@ -208,7 +219,14 @@ pub fn write_atomic<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C) -> Res
     // read/write/execute permission bits. The tempfile lib defaults to an initial mode of 0o600,
     // and we'll set the proper permissions after creating the file.
     #[cfg(unix)]
-    let perms = path.metadata().ok().map(|meta| {
+    let perms = if follow_destination_symlink {
+        path.metadata().ok()
+    } else {
+        fs::symlink_metadata(path)
+            .ok()
+            .filter(|meta| !meta.file_type().is_symlink())
+    }
+    .map(|meta| {
         use std::os::unix::fs::PermissionsExt;
 
         // these constants are u16 on macOS
@@ -221,7 +239,7 @@ pub fn write_atomic<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C) -> Res
     let mut tmp = TempFileBuilder::new()
         .prefix(path.file_name().unwrap())
         .tempfile_in(path.parent().unwrap())?;
-    tmp.write_all(contents.as_ref())?;
+    tmp.write_all(contents)?;
 
     // On unix platforms, set the permissions on the newly created file. We can use fchmod (called
     // by the std lib; subject to change) which ignores the umask so that the new file has the same
@@ -887,6 +905,7 @@ mod tests {
     use super::normalize_path;
     use super::write;
     use super::write_atomic;
+    use super::write_atomic_no_follow;
 
     #[test]
     fn test_normalize_path() {
@@ -1029,6 +1048,26 @@ mod tests {
         // Verify symlink still exists and points to the same target
         assert!(symlink_path.is_symlink());
         assert_eq!(std::fs::read_link(&symlink_path).unwrap(), target_path);
+    }
+
+    #[test]
+    fn write_atomic_no_follow_symlink() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let target_path = tmpdir.path().join("target.txt");
+        let symlink_path = tmpdir.path().join("symlink.txt");
+
+        write(&target_path, "initial").unwrap();
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target_path, &symlink_path).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&target_path, &symlink_path).unwrap();
+
+        write_atomic_no_follow(&symlink_path, "updated").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&target_path).unwrap(), "initial");
+        assert_eq!(std::fs::read_to_string(&symlink_path).unwrap(), "updated");
+        assert!(!symlink_path.is_symlink());
     }
 
     #[test]
