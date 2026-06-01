@@ -70,8 +70,9 @@ fn recorded_cache_size(path: &Path) -> u64 {
     fs::read_to_string(path.join(".cargo-artifact-cache-size"))
         .unwrap()
         .trim()
-        .strip_prefix("v1 ")
+        .split_once(' ')
         .unwrap()
+        .1
         .parse()
         .unwrap()
 }
@@ -1428,6 +1429,53 @@ fn unreadable_cache_metadata_is_removed_and_rebuilt() {
     let stored = cached_rlib(&cache);
     assert_eq!(fs::read(&stored).unwrap(), fs::read(&rebuilt).unwrap());
     assert!(!contains_cache_entry_with_marker(&cache, ".rejected-"));
+}
+
+#[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
+#[cfg(unix)]
+fn corrupt_sibling_is_removed_while_healthy_variant_restores() {
+    use std::os::unix::fs::MetadataExt;
+
+    let cache = paths::root().join("shared-cache");
+    let project = project_with_cache("external-input/pkg", &cache, "hardlink", 42);
+    let first_target = project.root().join("first-target");
+    let second_target = project.root().join("second-target");
+    let restored_target = project.root().join("restored-target");
+    let input = project.root().parent().unwrap().join("shared.bin");
+    project.change_file(
+        "src/lib.rs",
+        "pub fn value() -> &'static [u8] { include_bytes!(\"../../shared.bin\") }\n",
+    );
+
+    fs::write(&input, b"before").unwrap();
+    build_in_target(&project, &first_target);
+    let first_bytes = fs::read(cached_rlib(&cache)).unwrap();
+
+    fs::write(&input, b"after").unwrap();
+    build_in_target(&project, &second_target);
+    let healthy = cached_rlibs(&cache)
+        .into_iter()
+        .find(|path| fs::read(path).unwrap() != first_bytes)
+        .unwrap();
+    let corrupt = cached_rlibs(&cache)
+        .into_iter()
+        .find(|path| fs::read(path).unwrap() == first_bytes)
+        .unwrap();
+    let corrupt_entry = corrupt.parent().unwrap().parent().unwrap();
+    let renamed_corrupt = corrupt_entry.parent().unwrap().join("000-corrupt");
+    fs::rename(corrupt_entry, &renamed_corrupt).unwrap();
+    fs::write(renamed_corrupt.join("complete"), b"corrupt").unwrap();
+
+    build_in_target(&project, &restored_target);
+
+    assert!(!renamed_corrupt.exists());
+    assert_eq!(cached_rlibs(&cache).len(), 1);
+    assert_eq!(
+        fs::metadata(healthy).unwrap().ino(),
+        fs::metadata(cached_rlib(&restored_target.join("debug").join("deps")))
+            .unwrap()
+            .ino()
+    );
 }
 
 #[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]

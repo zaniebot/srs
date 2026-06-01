@@ -89,6 +89,10 @@ use an exclusive cache lock. When the filesystem does not provide reliable
 locking, Cargo executes normally without restoring or publishing shared
 artifacts.
 
+Cache descendants and modeled generated-input trees are traversed without
+following symlinks. A symlinked or otherwise unsupported tree falls back to an
+ordinary compilation rather than participating in shared restoration.
+
 ## Configuration
 
 Set `SRS_CARGO_ARTIFACT_CACHE=0` to disable shared artifact restoration.
