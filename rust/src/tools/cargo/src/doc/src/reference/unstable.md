@@ -261,6 +261,10 @@ development builds. Cargo copies the public root artifact out of the private
 output location and keeps the linker environment scoped away from
 dependencies, rustdoc, and build-script processes.
 
+This mode assumes root executable links resolve to `sld`; Cargo does not verify
+linker identity. Omit the feature when selecting another linker through target
+configuration, environment rustflags, or `cargo rustc` arguments.
+
 ```console
 cargo +nightly build -Z sld-native-incremental
 ```
