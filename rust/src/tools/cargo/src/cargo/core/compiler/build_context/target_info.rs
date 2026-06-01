@@ -28,6 +28,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::str::{self, FromStr};
 
+const SRS_ENCODED_TARGET_RUSTFLAGS: &str = "SRS_ENCODED_TARGET_RUSTFLAGS";
+
 /// Information about the platform target gleaned from querying rustc.
 ///
 /// [`RustcTargetData`] keeps several of these, one for the host and the others
@@ -807,17 +809,32 @@ fn extra_args(
     // NOTE: It is impossible to have a [host] section and reach this logic with kind.is_host(),
     // since [host] implies `target-applies-to-host = false`, which always early-returns above.
 
-    if let Some(rustflags) = rustflags_from_env(gctx, flags) {
-        Ok(rustflags)
+    let mut rustflags = if let Some(rustflags) = rustflags_from_env(gctx, flags) {
+        rustflags
     } else if let Some(rustflags) =
         rustflags_from_target(gctx, host_triple, target_cfg, kind, flags)?
     {
-        Ok(rustflags)
+        rustflags
     } else if let Some(rustflags) = rustflags_from_build(gctx, flags)? {
-        Ok(rustflags)
+        rustflags
     } else {
-        Ok(Vec::new())
+        Vec::new()
+    };
+
+    // SRS policy flags layer on top of user-selected rustflags instead of
+    // replacing Cargo's normal environment and configuration precedence.
+    if matches!(flags, Flags::Rust)
+        && let Ok(srs_target_rustflags) = gctx.get_env(SRS_ENCODED_TARGET_RUSTFLAGS)
+    {
+        rustflags.extend(
+            srs_target_rustflags
+                .split('\x1f')
+                .filter(|rustflag| !rustflag.is_empty())
+                .map(str::to_string),
+        );
     }
+
+    Ok(rustflags)
 }
 
 /// Gets compiler flags from environment variables.
