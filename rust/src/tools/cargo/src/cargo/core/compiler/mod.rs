@@ -114,7 +114,7 @@ use crate::util::OnceExt;
 use crate::util::errors::{CargoResult, VerboseError};
 use crate::util::interning::InternedString;
 use crate::util::machine_message::{self, Message};
-use crate::util::{Filesystem, add_path_args, internal, path_args};
+use crate::util::{Filesystem, TryLockResult, add_path_args, internal, path_args};
 
 use cargo_util::{ProcessBuilder, ProcessError, paths};
 use cargo_util_schemas::manifest::TomlDebugInfo;
@@ -2373,14 +2373,26 @@ fn staging_rlib_cache_entry(entry: &Path) -> CargoResult<PathBuf> {
 
 fn try_read_lock_rlib_cache(cache_root: &Path) -> CargoResult<Option<crate::util::FileLock>> {
     paths::create_dir_all(cache_root)?;
-    Filesystem::new(cache_root.to_path_buf())
-        .try_open_ro_shared_create(".cargo-artifact-cache-lock")
+    Ok(
+        match Filesystem::new(cache_root.to_path_buf())
+            .try_open_ro_shared_create_strict(".cargo-artifact-cache-lock")?
+        {
+            TryLockResult::Acquired(lock) => Some(lock),
+            TryLockResult::WouldBlock | TryLockResult::LockingUnsupported => None,
+        },
+    )
 }
 
 fn try_write_lock_rlib_cache(cache_root: &Path) -> CargoResult<Option<crate::util::FileLock>> {
     paths::create_dir_all(cache_root)?;
-    Filesystem::new(cache_root.to_path_buf())
-        .try_open_rw_exclusive_create(".cargo-artifact-cache-lock")
+    Ok(
+        match Filesystem::new(cache_root.to_path_buf())
+            .try_open_rw_exclusive_create_strict(".cargo-artifact-cache-lock")?
+        {
+            TryLockResult::Acquired(lock) => Some(lock),
+            TryLockResult::WouldBlock | TryLockResult::LockingUnsupported => None,
+        },
+    )
 }
 
 fn cleanup_abandoned_rlib_cache_transients(cache_root: &Path) {
@@ -2436,7 +2448,7 @@ fn recorded_rlib_cache_size(cache_root: &Path) -> Option<u64> {
 }
 
 fn mark_rlib_cache_size_dirty(cache_root: &Path) -> CargoResult<()> {
-    paths::write_atomic(&cache_root.join(ARTIFACT_CACHE_SIZE_STATE), b"dirty\n")
+    paths::write_atomic_no_follow(&cache_root.join(ARTIFACT_CACHE_SIZE_STATE), b"dirty\n")
 }
 
 fn rlib_cache_has_transients(cache_root: &Path) -> bool {
@@ -2473,7 +2485,7 @@ fn write_rlib_cache_size(cache_root: &Path, size: u64) -> CargoResult<()> {
     if rlib_cache_has_transients(cache_root) {
         return mark_rlib_cache_size_dirty(cache_root);
     }
-    paths::write_atomic(
+    paths::write_atomic_no_follow(
         &cache_root.join(ARTIFACT_CACHE_SIZE_STATE),
         format!("{ARTIFACT_CACHE_SIZE_STATE_VERSION} {size}\n").as_bytes(),
     )

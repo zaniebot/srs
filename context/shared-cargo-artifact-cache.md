@@ -85,7 +85,9 @@ completed entries; it is not a bound on physical blocks or a guarantee that
 eviction immediately reclaims storage while target-directory hardlinks remain.
 
 Concurrent restores use shared cache locks. Publication, cleanup, and eviction
-use an exclusive cache lock.
+use an exclusive cache lock. When the filesystem does not provide reliable
+locking, Cargo executes normally without restoring or publishing shared
+artifacts.
 
 ## Configuration
 

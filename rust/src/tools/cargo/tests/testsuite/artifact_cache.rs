@@ -1729,6 +1729,26 @@ fn unversioned_size_state_is_reconciled_before_restore() {
 
 #[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
 #[cfg(unix)]
+fn symlinked_size_state_is_replaced_without_touching_target() {
+    use std::os::unix::fs::symlink;
+
+    let cache = paths::root().join("shared-cache");
+    let sentinel = paths::root().join("sentinel");
+    let project = project_with_cache("project", &cache, "hardlink", 42);
+
+    fs::create_dir_all(&cache).unwrap();
+    fs::write(&sentinel, b"unchanged\n").unwrap();
+    symlink(&sentinel, cache.join(".cargo-artifact-cache-size")).unwrap();
+
+    build(&project);
+
+    assert_eq!(fs::read(&sentinel).unwrap(), b"unchanged\n");
+    assert!(!cache.join(".cargo-artifact-cache-size").is_symlink());
+    assert!(recorded_cache_size(&cache) > 0);
+}
+
+#[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
+#[cfg(unix)]
 fn admitted_lower_limit_restore_excludes_larger_limit_publication() {
     use std::os::unix::fs::MetadataExt;
 
