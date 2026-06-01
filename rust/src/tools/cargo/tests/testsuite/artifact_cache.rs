@@ -1476,6 +1476,7 @@ fn changed_loader_input_after_compilation_is_not_published() {
     let loader_path = project.root().join("compiler-libs");
     let input = loader_path.join("libcompiler_input.dylib");
     let ready = project.root().join("loader-digest-ready");
+    let release = project.root().join("loader-digest-release");
     fs::create_dir_all(&loader_path).unwrap();
     fs::write(&input, b"before").unwrap();
 
@@ -1486,10 +1487,13 @@ fn changed_loader_input_after_compilation_is_not_published() {
         .masquerade_as_nightly_cargo(&["artifact-cache"])
         .env(cargo_util::paths::dylib_path_envvar(), &loader_path)
         .env("CARGO_INCREMENTAL", "1")
-        .env("__CARGO_TEST_ARTIFACT_CACHE_INPUT_DIGEST_DELAY_MS", "5000")
         .env(
             "__CARGO_TEST_ARTIFACT_CACHE_INPUT_DIGEST_READY_FILE",
             &ready,
+        )
+        .env(
+            "__CARGO_TEST_ARTIFACT_CACHE_INPUT_DIGEST_RELEASE_FILE",
+            &release,
         )
         .build_command();
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -1505,6 +1509,7 @@ fn changed_loader_input_after_compilation_is_not_published() {
         "cargo did not reach the loader-input digest test hook"
     );
     fs::write(&input, b"after!").unwrap();
+    fs::write(&release, b"release").unwrap();
     let output = child.wait_with_output().unwrap();
     assert!(
         output.status.success(),
@@ -1534,6 +1539,7 @@ fn changed_loader_input_during_restore_forces_compile() {
     let loader_path = project.root().join("compiler-libs");
     let input = loader_path.join("libcompiler_input.dylib");
     let ready = project.root().join("loader-restore-ready");
+    let release = project.root().join("loader-restore-release");
     fs::create_dir_all(&loader_path).unwrap();
     fs::write(&input, b"before").unwrap();
 
@@ -1552,8 +1558,8 @@ fn changed_loader_input_during_restore_forces_compile() {
         .masquerade_as_nightly_cargo(&["artifact-cache"])
         .env(cargo_util::paths::dylib_path_envvar(), &loader_path)
         .env("CARGO_INCREMENTAL", "1")
-        .env("__CARGO_TEST_ARTIFACT_CACHE_RESTORE_DELAY_MS", "5000")
         .env("__CARGO_TEST_ARTIFACT_CACHE_RESTORE_READY_FILE", &ready)
+        .env("__CARGO_TEST_ARTIFACT_CACHE_RESTORE_RELEASE_FILE", &release)
         .build_command();
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let child = command.spawn().unwrap();
@@ -1565,6 +1571,7 @@ fn changed_loader_input_during_restore_forces_compile() {
     }
     assert!(ready.exists(), "cargo did not reach the restore test hook");
     fs::write(&input, b"after!").unwrap();
+    fs::write(&release, b"release").unwrap();
     let output = child.wait_with_output().unwrap();
     assert!(
         output.status.success(),
@@ -1897,6 +1904,7 @@ fn lowered_max_size_during_concurrent_restore_causes_a_miss_until_maintenance_ca
     let contended_target = project.root().join("contended-target");
     let restored_target = project.root().join("restored-target");
     let ready = project.root().join("restore-ready");
+    let release = project.root().join("restore-release");
 
     build_in_target(&project, &first_target);
     sleep_ms(1100);
@@ -1923,8 +1931,8 @@ fn lowered_max_size_during_concurrent_restore_causes_a_miss_until_maintenance_ca
             isolated_loader_path(),
         )
         .env("CARGO_INCREMENTAL", "1")
-        .env("__CARGO_TEST_ARTIFACT_CACHE_RESTORE_DELAY_MS", "5000")
         .env("__CARGO_TEST_ARTIFACT_CACHE_RESTORE_READY_FILE", &ready)
+        .env("__CARGO_TEST_ARTIFACT_CACHE_RESTORE_RELEASE_FILE", &release)
         .build_command();
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let child = command.spawn().unwrap();
@@ -1953,6 +1961,7 @@ fn lowered_max_size_during_concurrent_restore_causes_a_miss_until_maintenance_ca
     let contended_was_restored =
         fs::metadata(&newest_cached).unwrap().ino() == fs::metadata(&contended).unwrap().ino();
 
+    fs::write(&release, b"release").unwrap();
     let output = child.wait_with_output().unwrap();
     assert!(
         output.status.success(),
@@ -2043,6 +2052,7 @@ fn admitted_lower_limit_restore_excludes_larger_limit_publication() {
     let contended_writer_target = project.root().join("contended-writer-target");
     let retried_writer_target = project.root().join("retried-writer-target");
     let ready = project.root().join("restore-admitted-ready");
+    let release = project.root().join("restore-admitted-release");
 
     project.change_file(
         "src/lib.rs",
@@ -2081,12 +2091,12 @@ fn admitted_lower_limit_restore_excludes_larger_limit_publication() {
         .env("CARGO_INCREMENTAL", "1")
         .env("ARTIFACT_CACHE_TEST_VALUE", "alpha")
         .env(
-            "__CARGO_TEST_ARTIFACT_CACHE_RESTORE_ADMITTED_DELAY_MS",
-            "5000",
-        )
-        .env(
             "__CARGO_TEST_ARTIFACT_CACHE_RESTORE_ADMITTED_READY_FILE",
             &ready,
+        )
+        .env(
+            "__CARGO_TEST_ARTIFACT_CACHE_RESTORE_ADMITTED_RELEASE_FILE",
+            &release,
         )
         .build_command();
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -2125,6 +2135,7 @@ fn admitted_lower_limit_restore_excludes_larger_limit_publication() {
         "a larger-limit writer published while an admitted low-limit restore held the lock"
     );
 
+    fs::write(&release, b"release").unwrap();
     let output = child.wait_with_output().unwrap();
     assert!(
         output.status.success(),
@@ -2742,6 +2753,7 @@ fn input_changed_after_compilation_is_not_published() {
     let producer_target = project.root().join("producer-build");
     let consumer_target = project.root().join("consumer-build");
     let ready = project.root().join("input-digest-ready");
+    let release = project.root().join("input-digest-release");
     if ready.exists() {
         fs::remove_file(&ready).unwrap();
     }
@@ -2756,10 +2768,13 @@ fn input_changed_after_compilation_is_not_published() {
             isolated_loader_path(),
         )
         .env("CARGO_INCREMENTAL", "1")
-        .env("__CARGO_TEST_ARTIFACT_CACHE_INPUT_DIGEST_DELAY_MS", "5000")
         .env(
             "__CARGO_TEST_ARTIFACT_CACHE_INPUT_DIGEST_READY_FILE",
             &ready,
+        )
+        .env(
+            "__CARGO_TEST_ARTIFACT_CACHE_INPUT_DIGEST_RELEASE_FILE",
+            &release,
         )
         .build_command();
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -2776,6 +2791,7 @@ fn input_changed_after_compilation_is_not_published() {
     );
     sleep_ms(1100);
     project.change_file("src/lib.rs", "pub fn value() -> u32 { 43 }\n");
+    fs::write(&release, b"release").unwrap();
     let output = child.wait_with_output().unwrap();
     assert!(
         output.status.success(),

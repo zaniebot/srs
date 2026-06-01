@@ -134,6 +134,8 @@ const ARTIFACT_CACHE_INPUT_DIGEST_DELAY_MS_FOR_TESTS: &str =
     "__CARGO_TEST_ARTIFACT_CACHE_INPUT_DIGEST_DELAY_MS";
 const ARTIFACT_CACHE_INPUT_DIGEST_READY_FILE_FOR_TESTS: &str =
     "__CARGO_TEST_ARTIFACT_CACHE_INPUT_DIGEST_READY_FILE";
+const ARTIFACT_CACHE_INPUT_DIGEST_RELEASE_FILE_FOR_TESTS: &str =
+    "__CARGO_TEST_ARTIFACT_CACHE_INPUT_DIGEST_RELEASE_FILE";
 const ARTIFACT_CACHE_RESTORE_DELAY_MS_FOR_TESTS: &str =
     "__CARGO_TEST_ARTIFACT_CACHE_RESTORE_DELAY_MS";
 const ARTIFACT_CACHE_RESTORE_READY_FILE_FOR_TESTS: &str =
@@ -148,6 +150,8 @@ const ARTIFACT_CACHE_RESTORE_ADMITTED_DELAY_MS_FOR_TESTS: &str =
     "__CARGO_TEST_ARTIFACT_CACHE_RESTORE_ADMITTED_DELAY_MS";
 const ARTIFACT_CACHE_RESTORE_ADMITTED_READY_FILE_FOR_TESTS: &str =
     "__CARGO_TEST_ARTIFACT_CACHE_RESTORE_ADMITTED_READY_FILE";
+const ARTIFACT_CACHE_RESTORE_ADMITTED_RELEASE_FILE_FOR_TESTS: &str =
+    "__CARGO_TEST_ARTIFACT_CACHE_RESTORE_ADMITTED_RELEASE_FILE";
 const ARTIFACT_CACHE_KEY_FAILURE_FOR_TESTS: &str = "__CARGO_TEST_ARTIFACT_CACHE_KEY_FAILURE";
 const ARTIFACT_CACHE_STORE_FAILURE_AFTER_STAGING_FOR_TESTS: &str =
     "__CARGO_TEST_ARTIFACT_CACHE_STORE_FAILURE_AFTER_STAGING";
@@ -2650,10 +2654,16 @@ fn delay_rlib_cache_input_digest_for_tests() -> CargoResult<()> {
         clippy::disallowed_methods,
         reason = "test-only hook is intentionally outside user configuration"
     )]
-    let delay = std::env::var_os(ARTIFACT_CACHE_INPUT_DIGEST_DELAY_MS_FOR_TESTS);
-    let Some(delay) = delay.and_then(|value| value.to_string_lossy().parse::<u64>().ok()) else {
+    let delay = std::env::var_os(ARTIFACT_CACHE_INPUT_DIGEST_DELAY_MS_FOR_TESTS)
+        .and_then(|value| value.to_string_lossy().parse::<u64>().ok());
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test-only hook is intentionally outside user configuration"
+    )]
+    let release = std::env::var_os(ARTIFACT_CACHE_INPUT_DIGEST_RELEASE_FILE_FOR_TESTS);
+    if delay.is_none() && release.is_none() {
         return Ok(());
-    };
+    }
     #[expect(
         clippy::disallowed_methods,
         reason = "test-only hook is intentionally outside user configuration"
@@ -2661,7 +2671,10 @@ fn delay_rlib_cache_input_digest_for_tests() -> CargoResult<()> {
     if let Some(path) = std::env::var_os(ARTIFACT_CACHE_INPUT_DIGEST_READY_FILE_FOR_TESTS) {
         paths::write(Path::new(&path), b"ready")?;
     }
-    std::thread::sleep(Duration::from_millis(delay));
+    wait_for_rlib_cache_test_release(release)?;
+    if let Some(delay) = delay {
+        std::thread::sleep(Duration::from_millis(delay));
+    }
     Ok(())
 }
 
@@ -2764,10 +2777,16 @@ fn delay_rlib_cache_restore_admitted_for_tests() -> CargoResult<()> {
         clippy::disallowed_methods,
         reason = "test-only hook is intentionally outside user configuration"
     )]
-    let delay = std::env::var_os(ARTIFACT_CACHE_RESTORE_ADMITTED_DELAY_MS_FOR_TESTS);
-    let Some(delay) = delay.and_then(|value| value.to_string_lossy().parse::<u64>().ok()) else {
+    let delay = std::env::var_os(ARTIFACT_CACHE_RESTORE_ADMITTED_DELAY_MS_FOR_TESTS)
+        .and_then(|value| value.to_string_lossy().parse::<u64>().ok());
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test-only hook is intentionally outside user configuration"
+    )]
+    let release = std::env::var_os(ARTIFACT_CACHE_RESTORE_ADMITTED_RELEASE_FILE_FOR_TESTS);
+    if delay.is_none() && release.is_none() {
         return Ok(());
-    };
+    }
     #[expect(
         clippy::disallowed_methods,
         reason = "test-only hook is intentionally outside user configuration"
@@ -2775,7 +2794,10 @@ fn delay_rlib_cache_restore_admitted_for_tests() -> CargoResult<()> {
     if let Some(path) = std::env::var_os(ARTIFACT_CACHE_RESTORE_ADMITTED_READY_FILE_FOR_TESTS) {
         paths::write(Path::new(&path), b"ready")?;
     }
-    std::thread::sleep(Duration::from_millis(delay));
+    wait_for_rlib_cache_test_release(release)?;
+    if let Some(delay) = delay {
+        std::thread::sleep(Duration::from_millis(delay));
+    }
     Ok(())
 }
 
