@@ -37,6 +37,17 @@ pub struct FileLock {
     path: PathBuf,
 }
 
+/// The result of trying to acquire a filesystem lock without blocking.
+#[derive(Debug)]
+pub enum TryLockResult {
+    /// The lock was acquired.
+    Acquired(FileLock),
+    /// Another process holds the lock.
+    WouldBlock,
+    /// The filesystem does not provide locks Cargo can rely on.
+    LockingUnsupported,
+}
+
 impl FileLock {
     /// Returns the underlying file handle of this lock.
     pub fn file(&self) -> &File {
@@ -261,6 +272,25 @@ impl Filesystem {
         }
     }
 
+    /// A strict non-blocking version of [`Filesystem::open_rw_exclusive_create`].
+    ///
+    /// Unlike [`Filesystem::try_open_rw_exclusive_create`], this reports when
+    /// the filesystem does not provide locks Cargo can rely on instead of
+    /// returning an unlocked [`FileLock`].
+    pub fn try_open_rw_exclusive_create_strict<P: AsRef<Path>>(
+        &self,
+        path: P,
+    ) -> CargoResult<TryLockResult> {
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true).create(true);
+        let (path, f) = self.open(path.as_ref(), &opts, true)?;
+        Ok(match try_acquire_strict(&path, &|| f.try_lock())? {
+            TryAcquire::Acquired => TryLockResult::Acquired(FileLock { f: Some(f), path }),
+            TryAcquire::WouldBlock => TryLockResult::WouldBlock,
+            TryAcquire::LockingUnsupported => TryLockResult::LockingUnsupported,
+        })
+    }
+
     /// Opens read-only shared access to a file, returning the locked version of a file.
     ///
     /// This function will fail if `path` doesn't already exist, but if it does
@@ -324,6 +354,25 @@ impl Filesystem {
         }
     }
 
+    /// A strict non-blocking version of [`Filesystem::open_ro_shared_create`].
+    ///
+    /// Unlike [`Filesystem::try_open_ro_shared_create`], this reports when the
+    /// filesystem does not provide locks Cargo can rely on instead of
+    /// returning an unlocked [`FileLock`].
+    pub fn try_open_ro_shared_create_strict<P: AsRef<Path>>(
+        &self,
+        path: P,
+    ) -> CargoResult<TryLockResult> {
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true).create(true);
+        let (path, f) = self.open(path.as_ref(), &opts, true)?;
+        Ok(match try_acquire_strict(&path, &|| f.try_lock_shared())? {
+            TryAcquire::Acquired => TryLockResult::Acquired(FileLock { f: Some(f), path }),
+            TryAcquire::WouldBlock => TryLockResult::WouldBlock,
+            TryAcquire::LockingUnsupported => TryLockResult::LockingUnsupported,
+        })
+    }
+
     fn open(&self, path: &Path, opts: &OpenOptions, create: bool) -> CargoResult<(PathBuf, File)> {
         let path = self.root.join(path);
         let f = opts
@@ -356,7 +405,24 @@ impl PartialEq<Filesystem> for Path {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TryAcquire {
+    Acquired,
+    WouldBlock,
+    LockingUnsupported,
+}
+
 fn try_acquire(path: &Path, lock_try: &dyn Fn() -> Result<(), TryLockError>) -> CargoResult<bool> {
+    Ok(!matches!(
+        try_acquire_strict(path, lock_try)?,
+        TryAcquire::WouldBlock
+    ))
+}
+
+fn try_acquire_strict(
+    path: &Path,
+    lock_try: &dyn Fn() -> Result<(), TryLockError>,
+) -> CargoResult<TryAcquire> {
     // File locking on Unix is currently implemented via `flock`, which is known
     // to be broken on NFS. We could in theory just ignore errors that happen on
     // NFS, but apparently the failure mode [1] for `flock` on NFS is **blocking
@@ -369,16 +435,16 @@ fn try_acquire(path: &Path, lock_try: &dyn Fn() -> Result<(), TryLockError>) -> 
     // [1]: https://github.com/rust-lang/cargo/issues/2615
     if is_on_nfs_mount(path) {
         tracing::debug!("{path:?} appears to be an NFS mount, not trying to lock");
-        return Ok(true);
+        return Ok(TryAcquire::LockingUnsupported);
     }
 
     match lock_try() {
-        Ok(()) => Ok(true),
+        Ok(()) => Ok(TryAcquire::Acquired),
 
         // In addition to ignoring NFS which is commonly not working we also
         // just ignore locking on filesystems that look like they don't
         // implement file locking.
-        Err(TryLockError::Error(e)) if error_unsupported(&e) => Ok(true),
+        Err(TryLockError::Error(e)) if error_unsupported(&e) => Ok(TryAcquire::LockingUnsupported),
 
         Err(TryLockError::Error(e)) => {
             let e = anyhow::Error::from(e);
@@ -386,7 +452,7 @@ fn try_acquire(path: &Path, lock_try: &dyn Fn() -> Result<(), TryLockError>) -> 
             Err(e.context(cx))
         }
 
-        Err(TryLockError::WouldBlock) => Ok(false),
+        Err(TryLockError::WouldBlock) => Ok(TryAcquire::WouldBlock),
     }
 }
 
@@ -464,6 +530,48 @@ fn error_unsupported(err: &std::io::Error) -> bool {
         Some(libc::ENOTSUP | libc::EOPNOTSUPP) => true,
         Some(libc::ENOSYS) => true,
         _ => err.kind() == std::io::ErrorKind::Unsupported,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TryAcquire, try_acquire, try_acquire_strict};
+    use std::fs::TryLockError;
+    use std::io;
+    use std::path::Path;
+
+    #[test]
+    fn permissive_locking_treats_unsupported_as_acquired() {
+        let lock_try = || {
+            Err(TryLockError::Error(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "locking unsupported",
+            )))
+        };
+        assert!(try_acquire(Path::new("nonexistent"), &lock_try).unwrap());
+    }
+
+    #[test]
+    fn strict_locking_reports_unsupported() {
+        let lock_try = || {
+            Err(TryLockError::Error(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "locking unsupported",
+            )))
+        };
+        assert_eq!(
+            try_acquire_strict(Path::new("nonexistent"), &lock_try).unwrap(),
+            TryAcquire::LockingUnsupported
+        );
+    }
+
+    #[test]
+    fn strict_locking_reports_contention() {
+        let lock_try = || Err(TryLockError::WouldBlock);
+        assert_eq!(
+            try_acquire_strict(Path::new("nonexistent"), &lock_try).unwrap(),
+            TryAcquire::WouldBlock
+        );
     }
 }
 

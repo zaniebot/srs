@@ -9,7 +9,7 @@ pub use self::diagnostic_server::RustfixDiagnosticServer;
 pub use self::edit_distance::{closest, closest_msg, edit_distance};
 pub use self::errors::CliError;
 pub use self::errors::{CargoResult, CliResult, internal};
-pub use self::flock::{FileLock, Filesystem};
+pub use self::flock::{FileLock, Filesystem, TryLockResult};
 pub use self::graph::Graph;
 pub use self::hasher::StableHasher;
 pub use self::hex::{hash_u64, short_hash, to_hex};
