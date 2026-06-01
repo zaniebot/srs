@@ -3,6 +3,14 @@
 use crate::prelude::*;
 use cargo_test_support::{paths, prelude::*, project};
 
+fn contains_file_named(path: &std::path::Path, name: &str) -> bool {
+    std::fs::read_dir(path).unwrap().any(|entry| {
+        let path = entry.unwrap().path();
+        path.file_name().is_some_and(|file_name| file_name == name)
+            || (path.is_dir() && contains_file_named(&path, name))
+    })
+}
+
 #[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
 fn configured_cache_is_not_published_on_unsupported_hosts() {
     let cache = paths::root().join("shared-cache");
@@ -28,4 +36,13 @@ fn configured_cache_is_not_published_on_unsupported_hosts() {
         !cache.exists(),
         "unsupported hosts must not publish restorable artifacts"
     );
+    assert!(contains_file_named(
+        &p.root().join("target"),
+        "artifact-cache-complete.timestamp"
+    ));
+
+    p.cargo("-Zartifact-cache build --lib")
+        .masquerade_as_nightly_cargo(&["artifact-cache"])
+        .with_stderr_does_not_contain("[COMPILING]")
+        .run();
 }
