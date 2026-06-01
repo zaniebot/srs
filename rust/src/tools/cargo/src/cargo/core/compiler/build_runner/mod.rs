@@ -186,8 +186,7 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
         }
 
         for unit in &self.bcx.roots {
-            let force_rebuild = self.bcx.build_config.force_rebuild;
-            super::compile(&mut self, &mut queue, unit, exec, force_rebuild)?;
+            super::compile(&mut self, &mut queue, unit, exec)?;
         }
 
         // Now that we've got the full job queue and we've done all our

@@ -35,8 +35,6 @@ pub struct BuildConfig {
     pub intent: UserIntent,
     /// `true` to print stdout in JSON format (for machine reading).
     pub message_format: MessageFormat,
-    /// Force Cargo to do a full rebuild and treat each target as changed.
-    pub force_rebuild: bool,
     /// Output the unit graph to stdout instead of actually compiling.
     pub unit_graph: bool,
     /// `true` to avoid really compiling.
@@ -182,7 +180,6 @@ impl BuildConfig {
             requested_profile: "dev".into(),
             intent,
             message_format: MessageFormat::Human,
-            force_rebuild: false,
             unit_graph: false,
             dry_run: false,
             primary_unit_rustc: None,

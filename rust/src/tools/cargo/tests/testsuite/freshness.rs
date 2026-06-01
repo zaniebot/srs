@@ -1274,6 +1274,44 @@ fn reuse_workspace_lib() {
 }
 
 #[cargo_test]
+fn workspace_member_dependency_stays_fresh_when_selected_directly() {
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [workspace]
+                members = ["bar", "baz"]
+                resolver = "2"
+            "#,
+        )
+        .file(
+            "bar/Cargo.toml",
+            r#"
+                [package]
+                name = "bar"
+                version = "0.1.0"
+                edition = "2015"
+
+                [dependencies]
+                baz = { path = "../baz" }
+            "#,
+        )
+        .file("bar/src/lib.rs", "")
+        .file("baz/Cargo.toml", &basic_manifest("baz", "0.1.0"))
+        .file("baz/src/lib.rs", "")
+        .build();
+
+    p.cargo("build -p bar").run();
+    p.cargo("build -p baz -v")
+        .with_stderr_data(str![[r#"
+[FRESH] baz v0.1.0 ([ROOT]/foo/baz)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
+}
+
+#[cargo_test]
 fn reuse_shared_build_dep() {
     let p = project()
         .file(
