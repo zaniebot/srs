@@ -226,6 +226,21 @@ if [[ "$("$snapshot_dir/bin/cargo")" != "fake cargo A" ]]; then
     exit 1
 fi
 
+ln -s ../.. "$toolchain_dir/lib/x"
+if SRS_INSTALL_REPLACE=1 install_snapshot > "$scratch/relative-parent-escape-symlink.log" 2>&1; then
+    printf 'installer unexpectedly accepted a retained parent-escaping relative symlink\n' >&2
+    exit 1
+fi
+if ! grep -q 'refusing external relative symlink in SRS toolchain snapshot' "$scratch/relative-parent-escape-symlink.log"; then
+    printf 'installer did not explain the retained parent-escaping relative symlink refusal\n' >&2
+    exit 1
+fi
+rm "$toolchain_dir/lib/x"
+if [[ "$("$snapshot_dir/bin/cargo")" != "fake cargo A" ]]; then
+    printf 'installer changed snapshot after rejecting a parent-escaping relative symlink\n' >&2
+    exit 1
+fi
+
 mkdir -p "$toolchain_dir/lib/internal-target"
 ln -s internal-target "$toolchain_dir/lib/internal-relative"
 SRS_INSTALL_REPLACE=1 install_snapshot

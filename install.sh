@@ -160,7 +160,12 @@ while IFS= read -r -d '' symlink; do
         external_symlink_found=1
         continue
     fi
-    resolved_target="$target_parent/$(basename "$target")"
+    target_name="$(basename "$target")"
+    if [[ "$target_name" == "." || "$target_name" == ".." ]]; then
+        resolved_target="$(cd -P "$target_parent/$target_name" && pwd)"
+    else
+        resolved_target="$target_parent/$target_name"
+    fi
     if [[ "$resolved_target" != "$staging_dir" && "$resolved_target" != "$staging_dir/"* ]]; then
         printf 'refusing external relative symlink in SRS toolchain snapshot: %s -> %s\n' "$symlink" "$target" >&2
         external_symlink_found=1
