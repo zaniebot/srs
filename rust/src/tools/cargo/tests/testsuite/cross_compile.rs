@@ -126,6 +126,47 @@ fn simple_cross_config() {
 }
 
 #[cargo_test]
+fn srs_target_rustflags_do_not_apply_to_cross_targets() {
+    if rustc_host() != "aarch64-apple-darwin" {
+        return;
+    }
+    if cross_compile_disabled() {
+        return;
+    }
+
+    let target = cross_compile::alternate();
+    let source = r#"
+        #[cfg(from_srs)]
+        compile_error!("SRS target rustflags leaked into a cross target");
+    "#;
+    let p = project().file("src/lib.rs", source).build();
+
+    p.cargo("check --target")
+        .arg(&target)
+        .env("SRS_ENCODED_TARGET_RUSTFLAGS", "--cfg=from_srs")
+        .run();
+
+    let configured = project()
+        .at("configured")
+        .file(
+            ".cargo/config.toml",
+            &format!(
+                r#"
+                    [build]
+                    target = "{target}"
+                "#
+            ),
+        )
+        .file("src/lib.rs", source)
+        .build();
+
+    configured
+        .cargo("check")
+        .env("SRS_ENCODED_TARGET_RUSTFLAGS", "--cfg=from_srs")
+        .run();
+}
+
+#[cargo_test]
 fn target_host_arg() {
     if cross_compile_disabled() {
         return;

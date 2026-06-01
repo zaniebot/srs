@@ -821,9 +821,14 @@ fn extra_args(
         Vec::new()
     };
 
-    // SRS policy flags layer on top of user-selected rustflags instead of
-    // replacing Cargo's normal environment and configuration precedence.
+    // SRS policy flags layer on top of user-selected rustflags for the
+    // integrated Darwin lane instead of replacing Cargo's normal environment
+    // and configuration precedence.
     if matches!(flags, Flags::Rust)
+        && matches!(
+            kind,
+            CompileKind::Target(target) if target.short_name() == "aarch64-apple-darwin"
+        )
         && let Ok(srs_target_rustflags) = gctx.get_env(SRS_ENCODED_TARGET_RUSTFLAGS)
     {
         rustflags.extend(
