@@ -739,6 +739,47 @@ fn concurrent_restores_share_the_cached_entry() {
 }
 
 #[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
+fn concurrent_publishers_converge_on_single_entry() {
+    let cache = paths::root().join("shared-cache");
+    let project = project_with_cache("project", &cache, "hardlink", 42);
+    let delayed_target = project.root().join("delayed-target");
+    let concurrent_target = project.root().join("concurrent-target");
+    let ready = project.root().join("publish-ready");
+
+    let mut command = project
+        .cargo("-Zartifact-cache build --lib")
+        .arg("--target-dir")
+        .arg(&delayed_target)
+        .masquerade_as_nightly_cargo(&["artifact-cache"])
+        .env(
+            cargo_util::paths::dylib_path_envvar(),
+            isolated_loader_path(),
+        )
+        .env("CARGO_INCREMENTAL", "1")
+        .env("__CARGO_TEST_ARTIFACT_CACHE_PUBLISH_DELAY_MS", "5000")
+        .env("__CARGO_TEST_ARTIFACT_CACHE_PUBLISH_READY_FILE", &ready)
+        .build_command();
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let child = command.spawn().unwrap();
+    for _ in 0..100 {
+        if ready.exists() {
+            break;
+        }
+        sleep_ms(50);
+    }
+    assert!(ready.exists(), "cargo did not reach the publish test hook");
+
+    build_in_target(&project, &concurrent_target);
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "delayed publisher failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(cached_rlibs(&cache).len(), 1);
+}
+
+#[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
 #[cfg(unix)]
 fn environment_configuration_restores_by_hardlink() {
     use std::os::unix::fs::MetadataExt;

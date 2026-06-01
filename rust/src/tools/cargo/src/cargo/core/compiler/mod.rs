@@ -126,6 +126,8 @@ use rustfix::diagnostics::Applicability;
 const RUSTDOC_CRATE_VERSION_FLAG: &str = "--crate-version";
 const ARTIFACT_CACHE_PUBLISH_DELAY_MS_FOR_TESTS: &str =
     "__CARGO_TEST_ARTIFACT_CACHE_PUBLISH_DELAY_MS";
+const ARTIFACT_CACHE_PUBLISH_READY_FILE_FOR_TESTS: &str =
+    "__CARGO_TEST_ARTIFACT_CACHE_PUBLISH_READY_FILE";
 const ARTIFACT_CACHE_INPUT_DIGEST_DELAY_MS_FOR_TESTS: &str =
     "__CARGO_TEST_ARTIFACT_CACHE_INPUT_DIGEST_DELAY_MS";
 const ARTIFACT_CACHE_INPUT_DIGEST_READY_FILE_FOR_TESTS: &str =
@@ -2225,6 +2227,13 @@ fn store_rlib_cache(
         if let Some(delay) =
             publish_delay.and_then(|value| value.to_string_lossy().parse::<u64>().ok())
         {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "test-only hook is intentionally outside user configuration"
+            )]
+            if let Some(path) = std::env::var_os(ARTIFACT_CACHE_PUBLISH_READY_FILE_FOR_TESTS) {
+                paths::write(Path::new(&path), b"ready")?;
+            }
             std::thread::sleep(Duration::from_millis(delay));
         }
         match fs::rename(&staging, &entry) {
