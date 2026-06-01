@@ -1450,8 +1450,6 @@ fn artifact_cache_action_inputs_digest(
         let path = resolve_rustc_input_path(Path::new(path), rustc_cwd);
         if path.is_file() {
             hasher.update(b"extern-content\0");
-            hasher.update(path.as_os_str().as_encoded_bytes());
-            hasher.update(b"\0");
             hasher.update(&fs::read(path)?);
             hasher.update(b"\0");
         }
@@ -1485,8 +1483,6 @@ fn artifact_cache_action_inputs_digest(
         let path = resolve_rustc_input_path(Path::new(path), rustc_cwd);
         if path.is_dir() {
             hasher.update(b"link-search-input-tree\0");
-            hasher.update(value.as_bytes());
-            hasher.update(b"\0");
             hash_path_tree(&mut hasher, &path, &path, None, true)?;
         }
     }
@@ -1959,6 +1955,10 @@ fn restore_rlib_cache(
                 continue;
             }
         }
+        if artifact_cache_action_inputs_digest(rustc, rustc_cwd)? != *action_inputs_digest {
+            debug!("not restoring artifact cache entry with action inputs modified during lookup");
+            return Ok(false);
+        }
         let stored_files = entry.join("files");
         for output in outputs {
             let stored = stored_files.join(output.path.file_name().unwrap());
@@ -2117,6 +2117,10 @@ fn store_rlib_cache(
         Some(size) if rlib_cache_size_within_limit(size, max_size) => size,
         Some(_) | None => reconcile_rlib_cache_size(cache_root, max_size, None)?,
     };
+    if artifact_cache_action_inputs_digest(rustc, rustc_cwd)? != *action_inputs_digest {
+        debug!("not storing artifact cache entry with action inputs modified before publication");
+        return Ok(false);
+    }
     paths::create_dir_all(entry_root)?;
     let entry = entry_root.join(&inputs_digest);
     if entry.exists() {
