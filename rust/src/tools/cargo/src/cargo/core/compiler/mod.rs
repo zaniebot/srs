@@ -140,6 +140,10 @@ const ARTIFACT_CACHE_RESTORE_READY_FILE_FOR_TESTS: &str =
     "__CARGO_TEST_ARTIFACT_CACHE_RESTORE_READY_FILE";
 const ARTIFACT_CACHE_RESTORE_RELEASE_FILE_FOR_TESTS: &str =
     "__CARGO_TEST_ARTIFACT_CACHE_RESTORE_RELEASE_FILE";
+const ARTIFACT_CACHE_RESTORE_MATERIALIZED_READY_FILE_FOR_TESTS: &str =
+    "__CARGO_TEST_ARTIFACT_CACHE_RESTORE_MATERIALIZED_READY_FILE";
+const ARTIFACT_CACHE_RESTORE_MATERIALIZED_RELEASE_FILE_FOR_TESTS: &str =
+    "__CARGO_TEST_ARTIFACT_CACHE_RESTORE_MATERIALIZED_RELEASE_FILE";
 const ARTIFACT_CACHE_RESTORE_ADMITTED_DELAY_MS_FOR_TESTS: &str =
     "__CARGO_TEST_ARTIFACT_CACHE_RESTORE_ADMITTED_DELAY_MS";
 const ARTIFACT_CACHE_RESTORE_ADMITTED_READY_FILE_FOR_TESTS: &str =
@@ -2037,6 +2041,16 @@ fn restore_rlib_cache(
             let stored = stored_files.join(output.path.file_name().unwrap());
             materialize_rlib_cache_file(&stored, &output.path, materialization)?;
         }
+        delay_rlib_cache_restore_materialized_for_tests()?;
+        if artifact_cache_action_inputs_digest(rustc, rustc_cwd)? != *action_inputs_digest {
+            debug!("not restoring artifact cache entry with action inputs modified during restore");
+            for output in outputs {
+                if fs::symlink_metadata(&output.path).is_ok() {
+                    paths::remove_file(&output.path)?;
+                }
+            }
+            return Ok(false);
+        }
         paths::copy(&entry.join("compiler-messages"), message_cache_path)?;
         let stored_dep_info = entry.join("rustc-dep-info");
         if path_is_regular_file(&stored_dep_info) {
@@ -2315,6 +2329,12 @@ fn store_rlib_cache(
             return Ok(false);
         }
         delay_rlib_cache_publish_for_tests()?;
+        if artifact_cache_action_inputs_digest(rustc, rustc_cwd)? != *action_inputs_digest {
+            debug!("not storing artifact cache entry with action inputs modified during staging");
+            paths::remove_dir_all(&staging)?;
+            write_rlib_cache_size(cache_root, cache_size)?;
+            return Ok(false);
+        }
         match fs::rename(&staging, &entry) {
             Ok(()) => {}
             Err(_error) if entry.join("complete").exists() => {
@@ -2646,6 +2666,25 @@ fn delay_rlib_cache_publish_for_tests() -> CargoResult<()> {
         std::thread::sleep(Duration::from_millis(delay));
     }
     Ok(())
+}
+
+fn delay_rlib_cache_restore_materialized_for_tests() -> CargoResult<()> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test-only hook is intentionally outside user configuration"
+    )]
+    let release = std::env::var_os(ARTIFACT_CACHE_RESTORE_MATERIALIZED_RELEASE_FILE_FOR_TESTS);
+    if release.is_none() {
+        return Ok(());
+    }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test-only hook is intentionally outside user configuration"
+    )]
+    if let Some(path) = std::env::var_os(ARTIFACT_CACHE_RESTORE_MATERIALIZED_READY_FILE_FOR_TESTS) {
+        paths::write(Path::new(&path), b"ready")?;
+    }
+    wait_for_rlib_cache_test_release(release)
 }
 
 fn wait_for_rlib_cache_test_release(release: Option<OsString>) -> CargoResult<()> {
