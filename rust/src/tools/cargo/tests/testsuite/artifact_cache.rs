@@ -403,6 +403,44 @@ fn build_manual_extern_dependency() -> PathBuf {
     build_manual_extern_dependency_with_value("dependency", 7)
 }
 
+fn project_with_relative_extern_cache(name: &str, cache: &Path) -> Project {
+    project_in(name)
+        .file(
+            ".cargo/config.toml",
+            &format!(
+                r#"
+                [build]
+                artifact-cache-dir = "{}"
+                artifact-cache-materialization = "hardlink"
+                rustflags = ["--extern", "extern_dep=libextern_dep.rlib"]
+                "#,
+                cache.to_string_lossy().replace('\\', "\\\\")
+            ),
+        )
+        .file(
+            "Cargo.toml",
+            r#"
+            [workspace]
+            members = ["member"]
+            resolver = "3"
+            "#,
+        )
+        .file(
+            "member/Cargo.toml",
+            r#"
+            [package]
+            name = "project"
+            version = "0.0.1"
+            edition = "2024"
+            "#,
+        )
+        .file(
+            "member/src/lib.rs",
+            "pub fn value() -> u32 { extern_dep::value() }\n",
+        )
+        .build()
+}
+
 #[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
 #[cfg(unix)]
 fn hardlink_restore_detaches_before_rebuild() {
@@ -2429,41 +2467,7 @@ fn relative_extern_content_is_resolved_from_rustc_cwd() {
     let first_extern = build_manual_extern_dependency_with_value("first-dependency", 7);
     let second_extern = build_manual_extern_dependency_with_value("second-dependency", 8);
     let cache = paths::root().join("shared-cache");
-    let project = project_in("relative-extern-workspace")
-        .file(
-            ".cargo/config.toml",
-            &format!(
-                r#"
-                [build]
-                artifact-cache-dir = "{}"
-                artifact-cache-materialization = "hardlink"
-                rustflags = ["--extern", "extern_dep=libextern_dep.rlib"]
-                "#,
-                cache.to_string_lossy().replace('\\', "\\\\")
-            ),
-        )
-        .file(
-            "Cargo.toml",
-            r#"
-            [workspace]
-            members = ["member"]
-            resolver = "3"
-            "#,
-        )
-        .file(
-            "member/Cargo.toml",
-            r#"
-            [package]
-            name = "project"
-            version = "0.0.1"
-            edition = "2024"
-            "#,
-        )
-        .file(
-            "member/src/lib.rs",
-            "pub fn value() -> u32 { extern_dep::value() }\n",
-        )
-        .build();
+    let project = project_with_relative_extern_cache("relative-extern-workspace", &cache);
     let extern_path = project.root().join("libextern_dep.rlib");
 
     fs::copy(&first_extern, &extern_path).unwrap();
@@ -2486,6 +2490,144 @@ fn relative_extern_content_is_resolved_from_rustc_cwd() {
     }
 
     assert_eq!(cached_rlibs(&cache).len(), 2);
+}
+
+#[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
+#[cfg(unix)]
+fn changed_relative_extern_during_restore_forces_compile() {
+    use std::os::unix::fs::MetadataExt;
+
+    let first_extern = build_manual_extern_dependency_with_value("first-dependency", 7);
+    let second_extern = build_manual_extern_dependency_with_value("second-dependency", 8);
+    let cache = paths::root().join("shared-cache");
+    let project = project_with_relative_extern_cache("relative-extern-workspace", &cache);
+    let extern_path = project.root().join("libextern_dep.rlib");
+    let producer_target = project.root().join("producer-target");
+    let consumer_target = project.root().join("consumer-target");
+    let ready = project.root().join("restore-materialized-ready");
+    let release = project.root().join("restore-materialized-release");
+
+    fs::copy(&first_extern, &extern_path).unwrap();
+    project
+        .cargo("-Zartifact-cache build --lib -p project")
+        .arg("--target-dir")
+        .arg(&producer_target)
+        .masquerade_as_nightly_cargo(&["artifact-cache"])
+        .env(
+            cargo_util::paths::dylib_path_envvar(),
+            isolated_loader_path(),
+        )
+        .env("CARGO_INCREMENTAL", "1")
+        .run();
+    let stored = cached_rlib(&cache);
+    let stored_bytes = fs::read(&stored).unwrap();
+
+    let mut command = project
+        .cargo("-Zartifact-cache build --lib -p project")
+        .arg("--target-dir")
+        .arg(&consumer_target)
+        .masquerade_as_nightly_cargo(&["artifact-cache"])
+        .env(
+            cargo_util::paths::dylib_path_envvar(),
+            isolated_loader_path(),
+        )
+        .env("CARGO_INCREMENTAL", "1")
+        .env(
+            "__CARGO_TEST_ARTIFACT_CACHE_RESTORE_MATERIALIZED_READY_FILE",
+            &ready,
+        )
+        .env(
+            "__CARGO_TEST_ARTIFACT_CACHE_RESTORE_MATERIALIZED_RELEASE_FILE",
+            &release,
+        )
+        .build_command();
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let child = command.spawn().unwrap();
+    for _ in 0..100 {
+        if ready.exists() {
+            break;
+        }
+        sleep_ms(50);
+    }
+    assert!(
+        ready.exists(),
+        "cargo did not reach the restore-materialized test hook"
+    );
+    fs::copy(&second_extern, &extern_path).unwrap();
+    fs::write(&release, b"release").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "consumer build failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let rebuilt = cached_rlib(&consumer_target.join("debug").join("deps"));
+    assert_ne!(
+        fs::metadata(&stored).unwrap().ino(),
+        fs::metadata(&rebuilt).unwrap().ino()
+    );
+    assert_ne!(stored_bytes, fs::read(&rebuilt).unwrap());
+    assert_eq!(cached_rlibs(&cache).len(), 1);
+}
+
+#[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
+fn changed_relative_extern_during_publication_is_not_published() {
+    let first_extern = build_manual_extern_dependency_with_value("first-dependency", 7);
+    let second_extern = build_manual_extern_dependency_with_value("second-dependency", 8);
+    let cache = paths::root().join("shared-cache");
+    let project = project_with_relative_extern_cache("relative-extern-workspace", &cache);
+    let extern_path = project.root().join("libextern_dep.rlib");
+    let producer_target = project.root().join("producer-target");
+    let consumer_target = project.root().join("consumer-target");
+    let ready = project.root().join("publish-ready");
+    let release = project.root().join("publish-release");
+
+    fs::copy(&first_extern, &extern_path).unwrap();
+    let mut command = project
+        .cargo("-Zartifact-cache build --lib -p project")
+        .arg("--target-dir")
+        .arg(&producer_target)
+        .masquerade_as_nightly_cargo(&["artifact-cache"])
+        .env(
+            cargo_util::paths::dylib_path_envvar(),
+            isolated_loader_path(),
+        )
+        .env("CARGO_INCREMENTAL", "1")
+        .env("__CARGO_TEST_ARTIFACT_CACHE_PUBLISH_READY_FILE", &ready)
+        .env("__CARGO_TEST_ARTIFACT_CACHE_PUBLISH_RELEASE_FILE", &release)
+        .build_command();
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let child = command.spawn().unwrap();
+    for _ in 0..100 {
+        if ready.exists() {
+            break;
+        }
+        sleep_ms(50);
+    }
+    assert!(ready.exists(), "cargo did not reach the publish test hook");
+    fs::copy(&second_extern, &extern_path).unwrap();
+    fs::write(&release, b"release").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "producer build failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(cached_rlibs(&cache).is_empty());
+
+    project
+        .cargo("-Zartifact-cache build --lib -p project")
+        .arg("--target-dir")
+        .arg(&consumer_target)
+        .masquerade_as_nightly_cargo(&["artifact-cache"])
+        .env(
+            cargo_util::paths::dylib_path_envvar(),
+            isolated_loader_path(),
+        )
+        .env("CARGO_INCREMENTAL", "1")
+        .run();
+    assert_eq!(cached_rlibs(&cache).len(), 1);
 }
 
 #[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
