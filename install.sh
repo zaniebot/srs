@@ -54,6 +54,19 @@ if [[ ! -x "$cargo_bin" ]]; then
     exit 2
 fi
 
+missing_toolchain_bins=()
+for bin in cargo-clippy clippy-driver; do
+    if [[ ! -x "$toolchain_dir/bin/$bin" ]]; then
+        missing_toolchain_bins+=("$bin")
+    fi
+done
+
+if [[ "${#missing_toolchain_bins[@]}" -ne 0 ]]; then
+    printf 'incomplete stage2 toolchain at %s: missing executable(s): %s\n' \
+        "$toolchain_dir" "${missing_toolchain_bins[*]}" >&2
+    exit 2
+fi
+
 if [[ ! -x "$sld_bin" ]]; then
     printf 'missing sld binary at %s; run %s/build-sld.sh first\n' "$sld_bin" "$root" >&2
     exit 2
