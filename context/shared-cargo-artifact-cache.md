@@ -43,7 +43,9 @@ Restoration is skipped for:
 - `RUSTC_BOOTSTRAP` builds
 - forced rustc version identity overrides
 - profile-guided compiler inputs
+- host CPU auto-detection such as `-Ctarget-cpu=native`
 - arbitrary LLVM backend arguments
+- runtime Cranelift backend controls
 - external codegen backend libraries
 - custom target specifications or search paths
 - explicit sysroot overrides
@@ -55,6 +57,10 @@ Restoration is skipped for:
 
 These exclusions cover configurations that can change output or request side
 effects outside Cargo's cache key.
+
+Source-input publication assumes ordinary filesystem writes update modification
+times. Mutating a source while Cargo is compiling it and deliberately preserving
+an older modification time is outside the cache model.
 
 ## Compiler Identity
 

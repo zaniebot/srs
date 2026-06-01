@@ -542,7 +542,10 @@ compile-time paths can affect their output. The cache retains distinct verified
 variants for rustc-discovered file and environment inputs and replays cached
 compiler diagnostics when restoring an artifact. Artifacts are not published
 when tracked file inputs change during compilation, and unavailable cache
-storage falls back to ordinary compilation.
+storage falls back to ordinary compilation. Source-input publication assumes
+ordinary filesystem writes update modification times; mutating a source during
+compilation while deliberately preserving an older modification time is outside
+the cache model.
 
 Enable it with `-Zartifact-cache` and configure the shared directory:
 
