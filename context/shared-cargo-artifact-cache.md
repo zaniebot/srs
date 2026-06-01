@@ -45,7 +45,7 @@ Restoration is skipped for:
 - profile-guided compiler inputs
 - host CPU auto-detection such as `-Ctarget-cpu=native`
 - arbitrary LLVM backend arguments
-- runtime Cranelift backend controls
+- runtime Cranelift or GCC backend controls
 - external codegen backend libraries
 - custom target specifications or search paths
 - explicit sysroot overrides
