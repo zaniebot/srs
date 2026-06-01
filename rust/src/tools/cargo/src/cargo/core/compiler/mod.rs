@@ -2390,8 +2390,10 @@ fn store_rlib_cache(
             return Ok(false);
         }
         delay_rlib_cache_publish_for_tests()?;
-        if artifact_cache_action_inputs_digest(rustc, rustc_cwd)? != *action_inputs_digest {
-            debug!("not storing artifact cache entry with action inputs modified during staging");
+        if compiler_loader_inputs_digest(loader_input_paths)? != *loader_inputs_digest
+            || artifact_cache_action_inputs_digest(rustc, rustc_cwd)? != *action_inputs_digest
+        {
+            debug!("not storing artifact cache entry with inputs modified during staging");
             paths::remove_dir_all(&staging)?;
             write_rlib_cache_size(cache_root, cache_size)?;
             return Ok(false);
