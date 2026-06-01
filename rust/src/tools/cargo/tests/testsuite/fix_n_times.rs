@@ -30,6 +30,8 @@ enum Step {
     SuccessNoOutput = b'0',
     /// Delegates to the real rustc.
     RealRustc = b'r',
+    /// Delegates to the real rustc, then emits one suggested fix.
+    RealRustcOneFix = b'c',
     /// Emits one suggested fix.
     ///
     /// The suggested fix involves updating the number of the first line
@@ -140,6 +142,16 @@ fn main() {
                 .args(std::env::args_os().skip(1))
                 .status();
             std::process::exit(r.unwrap().code().unwrap_or(2));
+        }
+        b'c' => {
+            let r = std::process::Command::new("rustc")
+                .args(std::env::args_os().skip(1))
+                .status()
+                .unwrap();
+            if !r.success() {
+                std::process::exit(r.code().unwrap_or(2));
+            }
+            output_suggestion(successful_count + 1);
         }
         b'1' => {
             output_suggestion(successful_count + 1);
@@ -482,6 +494,66 @@ fn fix_is_fresh_after_prior_fix_but_not_after_clippy_artifacts() {
         .with_stderr_contains("[FRESH] foo v0.0.1 ([ROOT]/foo)")
         .run();
     assert_eq!("1", p.read_file("rustc-fix-shim-count"));
+}
+
+#[cargo_test]
+fn clippy_first_write_transition_counts_wrapper_invocations() {
+    let rustc = rustc_for_cargo_fix();
+    let clippy_driver = tools::wrapped_clippy_driver();
+    let p = project().file("src/lib.rs", "// fix-count 0").build();
+    let wrapper_log = p.root().join("wrapped-clippy-driver.log");
+    let plain_sequence = String::from_utf8(vec![Step::RealRustcOneFix as u8]).unwrap();
+    let fix_sequence = String::from_utf8(vec![
+        Step::OneFix as u8,
+        Step::RealRustc as u8,
+        Step::RealRustc as u8,
+        Step::Error as u8,
+    ])
+    .unwrap();
+
+    p.cargo("check --lib")
+        .env("RUSTC", &rustc)
+        .env("RUSTC_WORKSPACE_WRAPPER", &clippy_driver)
+        .env("WRAPPED_CLIPPY_DRIVER_LOG", &wrapper_log)
+        .env("RUSTC_FIX_SHIM_SEQUENCE", &plain_sequence)
+        .run();
+    assert_eq!("// fix-count 0", p.read_file("src/lib.rs"));
+    assert_eq!("foo\n", p.read_file("wrapped-clippy-driver.log"));
+    std::fs::remove_file(p.root().join("rustc-fix-shim-count")).unwrap();
+    std::fs::remove_file(&wrapper_log).unwrap();
+
+    p.cargo("fix --allow-no-vcs --lib --verbose")
+        .env("RUSTC", &rustc)
+        .env("RUSTC_WORKSPACE_WRAPPER", &clippy_driver)
+        .env("WRAPPED_CLIPPY_DRIVER_LOG", &wrapper_log)
+        .env("RUSTC_FIX_SHIM_SEQUENCE", &fix_sequence)
+        .with_stderr_contains("[CHECKING] foo v0.0.1 ([ROOT]/foo)")
+        .run();
+    assert_eq!("// fix-count 1", p.read_file("src/lib.rs"));
+    assert_eq!("2", p.read_file("rustc-fix-shim-count"));
+    assert_eq!("foo\nfoo\n", p.read_file("wrapped-clippy-driver.log"));
+
+    p.cargo("fix --allow-no-vcs --lib --verbose")
+        .env("RUSTC", &rustc)
+        .env("RUSTC_WORKSPACE_WRAPPER", &clippy_driver)
+        .env("WRAPPED_CLIPPY_DRIVER_LOG", &wrapper_log)
+        .env("RUSTC_FIX_SHIM_SEQUENCE", &fix_sequence)
+        .with_stderr_contains("[CHECKING] foo v0.0.1 ([ROOT]/foo)")
+        .run();
+    assert_eq!("// fix-count 1", p.read_file("src/lib.rs"));
+    assert_eq!("3", p.read_file("rustc-fix-shim-count"));
+    assert_eq!("foo\nfoo\nfoo\n", p.read_file("wrapped-clippy-driver.log"));
+
+    p.cargo("fix --allow-no-vcs --lib --verbose")
+        .env("RUSTC", &rustc)
+        .env("RUSTC_WORKSPACE_WRAPPER", &clippy_driver)
+        .env("WRAPPED_CLIPPY_DRIVER_LOG", &wrapper_log)
+        .env("RUSTC_FIX_SHIM_SEQUENCE", &fix_sequence)
+        .with_stderr_contains("[FRESH] foo v0.0.1 ([ROOT]/foo)")
+        .run();
+    assert_eq!("// fix-count 1", p.read_file("src/lib.rs"));
+    assert_eq!("3", p.read_file("rustc-fix-shim-count"));
+    assert_eq!("foo\nfoo\nfoo\n", p.read_file("wrapped-clippy-driver.log"));
 }
 
 #[cargo_test]
