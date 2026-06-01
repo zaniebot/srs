@@ -2593,6 +2593,7 @@ fn try_read_lock_rlib_cache(cache_root: &Path) -> CargoResult<Option<crate::util
     if fs::symlink_metadata(cache_root.join(".cargo-artifact-cache-lock"))
         .is_ok_and(|metadata| metadata.file_type().is_symlink())
     {
+        debug!("not restoring artifact cache entries because the lock path is a symlink");
         return Ok(None);
     }
     Ok(
@@ -2600,7 +2601,14 @@ fn try_read_lock_rlib_cache(cache_root: &Path) -> CargoResult<Option<crate::util
             .try_open_ro_shared_create_strict(".cargo-artifact-cache-lock")?
         {
             TryLockResult::Acquired(lock) => Some(lock),
-            TryLockResult::WouldBlock | TryLockResult::LockingUnsupported => None,
+            TryLockResult::WouldBlock => {
+                debug!("not restoring artifact cache entries because the cache lock is contended");
+                None
+            }
+            TryLockResult::LockingUnsupported => {
+                debug!("not restoring artifact cache entries because locking is unsupported");
+                None
+            }
         },
     )
 }
@@ -2610,6 +2618,7 @@ fn try_write_lock_rlib_cache(cache_root: &Path) -> CargoResult<Option<crate::uti
     if fs::symlink_metadata(cache_root.join(".cargo-artifact-cache-lock"))
         .is_ok_and(|metadata| metadata.file_type().is_symlink())
     {
+        debug!("not publishing artifact cache entries because the lock path is a symlink");
         return Ok(None);
     }
     Ok(
@@ -2617,7 +2626,14 @@ fn try_write_lock_rlib_cache(cache_root: &Path) -> CargoResult<Option<crate::uti
             .try_open_rw_exclusive_create_strict(".cargo-artifact-cache-lock")?
         {
             TryLockResult::Acquired(lock) => Some(lock),
-            TryLockResult::WouldBlock | TryLockResult::LockingUnsupported => None,
+            TryLockResult::WouldBlock => {
+                debug!("not publishing artifact cache entries because the cache lock is contended");
+                None
+            }
+            TryLockResult::LockingUnsupported => {
+                debug!("not publishing artifact cache entries because locking is unsupported");
+                None
+            }
         },
     )
 }
