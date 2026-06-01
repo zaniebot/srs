@@ -440,9 +440,13 @@ fn artifact_cache_identity_witness_for_sysroot(
     fn collect_directories(
         path: &Path,
         recursive: bool,
+        excluded: &[PathBuf],
         visited: &mut HashSet<PathBuf>,
         directories: &mut Vec<ArtifactCacheDirectoryWitness>,
     ) -> Option<()> {
+        if excluded.iter().any(|excluded| path == excluded) {
+            return Some(());
+        }
         let metadata = match std::fs::metadata(path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(()),
@@ -467,17 +471,33 @@ fn artifact_cache_identity_witness_for_sysroot(
             for entry in std::fs::read_dir(path).ok()? {
                 let path = entry.ok()?.path();
                 if std::fs::metadata(&path).ok()?.is_dir() {
-                    collect_directories(&path, true, visited, directories)?;
+                    collect_directories(&path, true, excluded, visited, directories)?;
                 }
             }
         }
         Some(())
     }
 
+    let excluded = [
+        sysroot.join("lib").join("rustlib").join("src"),
+        sysroot.join("lib").join("rustlib").join("rustc-src"),
+    ];
     let mut directories = Vec::new();
     let mut visited = HashSet::new();
-    collect_directories(&sysroot.join("lib"), true, &mut visited, &mut directories)?;
-    collect_directories(&sysroot.join("bin"), false, &mut visited, &mut directories)?;
+    collect_directories(
+        &sysroot.join("lib"),
+        true,
+        &excluded,
+        &mut visited,
+        &mut directories,
+    )?;
+    collect_directories(
+        &sysroot.join("bin"),
+        false,
+        &excluded,
+        &mut visited,
+        &mut directories,
+    )?;
     directories.sort_by(|left, right| left.path.cmp(&right.path));
     Some(ArtifactCacheIdentityWitness {
         directories,
@@ -728,6 +748,34 @@ mod artifact_cache_identity_tests {
         let second = artifact_cache_identity_for_program(&rustc).unwrap().digest;
 
         assert_ne!(first, second);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sysroot_source_symlinks_are_excluded_from_compiler_identity() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let sysroot = temp.path().join("toolchain");
+        let rustc = sysroot.join("bin").join("rustc");
+        let rustlib = sysroot.join("lib").join("rustlib");
+        let source = temp.path().join("source");
+        std::fs::create_dir_all(rustc.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(rustlib.join("test-target").join("lib")).unwrap();
+        std::fs::create_dir_all(rustlib.join("src")).unwrap();
+        std::fs::create_dir_all(rustlib.join("rustc-src")).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(&rustc, b"rustc").unwrap();
+        std::fs::write(source.join("lib.rs"), b"first source").unwrap();
+        symlink(&source, rustlib.join("src").join("rust")).unwrap();
+        symlink(&source, rustlib.join("rustc-src").join("rust")).unwrap();
+
+        let first = artifact_cache_identity_for_program(&rustc).unwrap();
+        std::fs::write(source.join("lib.rs"), b"other source").unwrap();
+        let second = artifact_cache_identity_for_program(&rustc).unwrap();
+
+        assert!(first.witness.is_current());
+        assert_eq!(first.digest, second.digest);
     }
 
     #[cfg(unix)]
