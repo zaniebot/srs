@@ -136,17 +136,19 @@ byte cap is appropriate. `cargo clean` leaves the central cache intact. The
 dedicated cache documentation describes the remaining controls, precedence
 rules, manual reclamation, and trust assumptions.
 
-SRS also builds and installs Clippy. Its `--fix` mode keeps the same
-dependency-linting mode as a preceding plain Clippy run, so workspace-member
-artifacts remain reusable when applying suggestions that Clippy just reported:
+SRS also builds and installs Clippy. By default, its `--fix` mode checks the
+same dependencies as a plain Clippy run, so workspace-member artifacts remain
+reusable when applying suggestions that Clippy just reported:
 
 ```bash
 cargo +srs clippy --fix
 ```
 
-Pass `--no-deps` explicitly when only the selected crate should be linted:
+When a plain Clippy run uses `--no-deps` to lint only the selected crate, repeat
+`--no-deps` explicitly when applying its suggestions:
 
 ```bash
+cargo +srs clippy --no-deps
 cargo +srs clippy --fix --no-deps
 ```
 
