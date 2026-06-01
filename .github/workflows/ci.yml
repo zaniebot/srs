@@ -48,6 +48,7 @@ jobs:
           cargo test --lib util::flock
           cargo test -p cargo-util atomic
           cargo test --test testsuite artifact_cache -- --ignored --test-threads=1
+          cargo test --test testsuite rustup::artifact_cache -- --test-threads=1
 
       - name: Build SRS
         # Standard macOS arm64 runners are tight on storage for rustc stage2 builds.
