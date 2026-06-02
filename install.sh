@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+root="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 name="${1:-srs}"
 rust_dir="${SRS_RUST_DIR:-$root/rust}"
 toolchain_dir="${2:-}"
 cargo_bin="${3:-}"
 sld_bin="${SRS_SLD_BIN:-$root/target/sld/opt/sld}"
 install_root="${SRS_INSTALL_ROOT:-$HOME/code/tmp/srs-toolchains}"
-snapshot_dir="$install_root/$name"
 rustup_bin="${SRS_RUSTUP_BIN:-rustup}"
 replace="${SRS_INSTALL_REPLACE:-0}"
 
@@ -21,6 +20,47 @@ if [[ "$replace" != "0" && "$replace" != "1" ]]; then
     printf 'SRS_INSTALL_REPLACE must be 0 or 1, got %s\n' "$replace" >&2
     exit 2
 fi
+
+mkdir -p "$install_root"
+install_root_physical="$(cd -P "$install_root" && pwd)"
+snapshot_dir="$install_root_physical/$name"
+lock_dir="$install_root_physical/.${name}.lock"
+staging_dir=""
+replacement_parent=""
+replaced_snapshot=""
+lock_acquired=0
+snapshot_published=0
+install_complete=0
+cleanup() {
+    if [[ -n "$staging_dir" ]] && [[ -e "$staging_dir" || -L "$staging_dir" ]]; then
+        rm -rf "$staging_dir"
+    fi
+    if [[ "$install_complete" == "1" ]]; then
+        if [[ -n "$replacement_parent" ]] && [[ -e "$replacement_parent" || -L "$replacement_parent" ]]; then
+            rm -rf "$replacement_parent"
+        fi
+    else
+        if [[ "$snapshot_published" == "1" ]] && [[ -e "$snapshot_dir" || -L "$snapshot_dir" ]]; then
+            rm -rf "$snapshot_dir"
+        fi
+        if [[ -n "$replaced_snapshot" ]] && [[ -e "$replaced_snapshot" || -L "$replaced_snapshot" ]]; then
+            mv "$replaced_snapshot" "$snapshot_dir"
+        fi
+        if [[ -n "$replacement_parent" ]] && [[ -e "$replacement_parent" || -L "$replacement_parent" ]]; then
+            rm -rf "$replacement_parent"
+        fi
+    fi
+    if [[ "$lock_acquired" == "1" ]] && [[ -d "$lock_dir" ]]; then
+        rmdir "$lock_dir"
+    fi
+}
+trap cleanup EXIT
+
+if ! mkdir "$lock_dir"; then
+    printf 'SRS toolchain snapshot installation is already in progress at %s\n' "$lock_dir" >&2
+    exit 2
+fi
+lock_acquired=1
 
 if [[ -e "$snapshot_dir" || -L "$snapshot_dir" ]] && [[ "$replace" != "1" ]]; then
     printf 'SRS toolchain snapshot already exists at %s; set SRS_INSTALL_REPLACE=1 to replace it\n' "$snapshot_dir" >&2
@@ -91,30 +131,8 @@ if [[ ! -x "$sld_bin" ]]; then
     exit 2
 fi
 
-mkdir -p "$install_root"
-staging_dir="$(mktemp -d "$install_root/.${name}.tmp.XXXXXX")"
+staging_dir="$(mktemp -d "$install_root_physical/.${name}.tmp.XXXXXX")"
 staging_dir_physical="$(cd -P "$staging_dir" && pwd)"
-replaced_snapshot=""
-snapshot_published=0
-install_complete=0
-cleanup() {
-    if [[ -n "${staging_dir:-}" ]] && [[ -e "$staging_dir" || -L "$staging_dir" ]]; then
-        rm -rf "$staging_dir"
-    fi
-    if [[ "$install_complete" == "1" ]]; then
-        if [[ -n "$replaced_snapshot" ]] && [[ -e "$replaced_snapshot" || -L "$replaced_snapshot" ]]; then
-            rm -rf "$replaced_snapshot"
-        fi
-        return
-    fi
-    if [[ "$snapshot_published" == "1" ]] && [[ -e "$snapshot_dir" || -L "$snapshot_dir" ]]; then
-        rm -rf "$snapshot_dir"
-    fi
-    if [[ -n "$replaced_snapshot" ]] && [[ -e "$replaced_snapshot" || -L "$replaced_snapshot" ]]; then
-        mv "$replaced_snapshot" "$snapshot_dir"
-    fi
-}
-trap cleanup EXIT
 
 # Prefer copy-on-write filesystem clones where the host supports them. The
 # portable fallback keeps installed names independent from mutable build
@@ -130,7 +148,11 @@ fi
 # Bootstrap stage 2 sysroots link rust-src back into the mutable checkout.
 # Omit those optional sources instead of publishing a snapshot that stops
 # being self-contained when its source worktree is removed.
-rm -f "$staging_dir/lib/rustlib/rustc-src/rust" "$staging_dir/lib/rustlib/src/rust"
+for rust_src in "$staging_dir/lib/rustlib/rustc-src/rust" "$staging_dir/lib/rustlib/src/rust"; do
+    if [[ -L "$rust_src" || ! -d "$rust_src" ]]; then
+        rm -f "$rust_src"
+    fi
+done
 
 # A Rust bootstrap sysroot does not include Cargo by default. Keep copied Cargo
 # and linker binaries next to a copied SRS wrapper so the snapshot survives
@@ -155,13 +177,13 @@ while IFS= read -r -d '' symlink; do
         external_symlink_found=1
         continue
     fi
-    symlink_dir="$(cd -P "$(dirname "$symlink")" && pwd)"
-    if ! target_parent="$(cd -P "$symlink_dir/$(dirname "$target")" && pwd)"; then
+    symlink_dir="$(cd -P "$(dirname -- "$symlink")" && pwd)"
+    if ! target_parent="$(cd -P "$symlink_dir/$(dirname -- "$target")" && pwd)"; then
         printf 'refusing unresolved symlink in SRS toolchain snapshot: %s -> %s\n' "$symlink" "$target" >&2
         external_symlink_found=1
         continue
     fi
-    target_name="$(basename "$target")"
+    target_name="$(basename -- "$target")"
     if [[ "$target_name" == "." || "$target_name" == ".." ]]; then
         resolved_target="$(cd -P "$target_parent/$target_name" && pwd)"
     else
@@ -181,7 +203,8 @@ if [[ -e "$snapshot_dir" || -L "$snapshot_dir" ]]; then
         printf 'SRS toolchain snapshot already exists at %s; set SRS_INSTALL_REPLACE=1 to replace it\n' "$snapshot_dir" >&2
         exit 2
     fi
-    replaced_snapshot="$snapshot_dir.replaced.$$"
+    replacement_parent="$(mktemp -d "$install_root_physical/.${name}.replaced.XXXXXX")"
+    replaced_snapshot="$replacement_parent/snapshot"
     mv "$snapshot_dir" "$replaced_snapshot"
 fi
 

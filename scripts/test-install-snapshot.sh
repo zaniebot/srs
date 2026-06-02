@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+root="$(cd "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 scratch_root="${SRS_TEST_TMPDIR:-$HOME/code/tmp}"
 mkdir -p "$scratch_root"
 scratch="$(mktemp -d "$scratch_root/srs-install-snapshot.XXXXXX")"
@@ -33,6 +33,13 @@ cat > "$toolchain_dir/bin/rustc" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ "${1:-}" == "--print" && "${2:-}" == "host-tuple" ]]; then
+    if [[ -n "${SRS_TEST_COLLIDE_BACKUP_BASE:-}" ]]; then
+        mkdir -p "$SRS_TEST_COLLIDE_BACKUP_BASE.$PPID"
+    fi
+    if [[ -n "${SRS_TEST_RETARGET_INSTALL_ROOT:-}" ]]; then
+        rm "$SRS_TEST_RETARGET_INSTALL_ROOT"
+        ln -s "$SRS_TEST_RETARGET_INSTALL_ROOT_TO" "$SRS_TEST_RETARGET_INSTALL_ROOT"
+    fi
     printf 'fake-host\n'
     exit 0
 fi
@@ -75,6 +82,9 @@ install_snapshot() {
         SRS_INSTALL_REPLACE="${SRS_INSTALL_REPLACE:-0}" \
         SRS_RUSTUP_BIN="$rustup_bin" \
         SRS_SLD_BIN="$sld_bin" \
+        SRS_TEST_COLLIDE_BACKUP_BASE="${SRS_TEST_COLLIDE_BACKUP_BASE:-}" \
+        SRS_TEST_RETARGET_INSTALL_ROOT="${SRS_TEST_RETARGET_INSTALL_ROOT:-}" \
+        SRS_TEST_RETARGET_INSTALL_ROOT_TO="${SRS_TEST_RETARGET_INSTALL_ROOT_TO:-}" \
         SRS_TEST_RUSTUP_FAIL="${SRS_TEST_RUSTUP_FAIL:-0}" \
         SRS_TEST_RUSTUP_LINKS="$rustup_links" \
         "$root/install.sh" "$name" "$toolchain_dir" "$cargo_bin"
@@ -96,6 +106,7 @@ if ! grep -q 'invalid SRS toolchain name' "$scratch/option-like-name.log"; then
 fi
 
 install_snapshot
+snapshot_dir="$physical_install_root/$name"
 
 if [[ "$(readlink "$rustup_links/$name")" != "$snapshot_dir" ]]; then
     printf 'fake rustup link did not point at installed snapshot\n' >&2
@@ -164,11 +175,39 @@ if ! grep -q 'SRS toolchain snapshot already exists' "$scratch/reinstall.log"; t
     exit 1
 fi
 
-mkdir -p "$toolchain_dir/bin" "$toolchain_dir/lib"
+lock_dir="$physical_install_root/.${name}.lock"
+mkdir "$lock_dir"
+if SRS_INSTALL_REPLACE=1 install_snapshot > "$scratch/concurrent-install.log" 2>&1; then
+    printf 'installer unexpectedly allowed concurrent installation of the same label\n' >&2
+    exit 1
+fi
+if ! grep -q 'installation is already in progress' "$scratch/concurrent-install.log"; then
+    printf 'installer did not explain the concurrent same-label refusal\n' >&2
+    exit 1
+fi
+rmdir "$lock_dir"
+if [[ "$("$snapshot_dir/bin/cargo")" != "fake cargo A" ]]; then
+    printf 'installer changed snapshot while refusing concurrent same-label installation\n' >&2
+    exit 1
+fi
+
+mkdir -p \
+    "$toolchain_dir/bin" \
+    "$toolchain_dir/lib/rustlib/rustc-src/rust" \
+    "$toolchain_dir/lib/rustlib/src/rust"
+printf 'preserved rustc source\n' > "$toolchain_dir/lib/rustlib/rustc-src/rust/README"
+printf 'preserved library source\n' > "$toolchain_dir/lib/rustlib/src/rust/README"
 cat > "$toolchain_dir/bin/rustc" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ "${1:-}" == "--print" && "${2:-}" == "host-tuple" ]]; then
+    if [[ -n "${SRS_TEST_COLLIDE_BACKUP_BASE:-}" ]]; then
+        mkdir -p "$SRS_TEST_COLLIDE_BACKUP_BASE.$PPID"
+    fi
+    if [[ -n "${SRS_TEST_RETARGET_INSTALL_ROOT:-}" ]]; then
+        rm "$SRS_TEST_RETARGET_INSTALL_ROOT"
+        ln -s "$SRS_TEST_RETARGET_INSTALL_ROOT_TO" "$SRS_TEST_RETARGET_INSTALL_ROOT"
+    fi
     printf 'fake-host\n'
     exit 0
 fi
@@ -190,7 +229,12 @@ printf 'fake sld B\n'
 EOF
 chmod +x "$sld_bin"
 
-if SRS_INSTALL_REPLACE=1 SRS_TEST_RUSTUP_FAIL=1 install_snapshot > "$scratch/replace-failure.log" 2>&1; then
+if \
+    SRS_INSTALL_REPLACE=1 \
+    SRS_TEST_RUSTUP_FAIL=1 \
+    SRS_TEST_COLLIDE_BACKUP_BASE="$snapshot_dir.replaced" \
+    install_snapshot > "$scratch/replace-failure.log" 2>&1
+then
     printf 'installer unexpectedly accepted requested fake rustup failure\n' >&2
     exit 1
 fi
@@ -198,6 +242,14 @@ if [[ "$("$snapshot_dir/bin/cargo")" != "fake cargo A" ]]; then
     printf 'installer did not roll back snapshot after rustup failure\n' >&2
     exit 1
 fi
+shopt -s nullglob
+collision_backups=("$snapshot_dir".replaced.*)
+shopt -u nullglob
+if [[ "${#collision_backups[@]}" -ne 1 ]]; then
+    printf 'expected exactly one injected predictable-backup collision, found %s\n' "${#collision_backups[@]}" >&2
+    exit 1
+fi
+rm -rf "${collision_backups[@]}"
 
 ln -s "$scratch/rust-source" "$toolchain_dir/lib/mutable-external"
 if SRS_INSTALL_REPLACE=1 install_snapshot > "$scratch/external-symlink.log" 2>&1; then
@@ -244,8 +296,9 @@ if [[ "$("$snapshot_dir/bin/cargo")" != "fake cargo A" ]]; then
     exit 1
 fi
 
-mkdir -p "$toolchain_dir/lib/internal-target"
+mkdir -p "$toolchain_dir/lib/internal-target" "$toolchain_dir/lib/-internal-target"
 ln -s internal-target "$toolchain_dir/lib/internal-relative"
+ln -s -- -internal-target "$toolchain_dir/lib/dash-prefixed-internal-relative"
 SRS_INSTALL_REPLACE=1 install_snapshot
 if [[ "$("$snapshot_dir/bin/cargo")" != "fake cargo B" ]]; then
     printf 'installer did not replace snapshot after explicit opt-in\n' >&2
@@ -253,6 +306,46 @@ if [[ "$("$snapshot_dir/bin/cargo")" != "fake cargo B" ]]; then
 fi
 if [[ ! -L "$snapshot_dir/lib/internal-relative" || "$(readlink "$snapshot_dir/lib/internal-relative")" != "internal-target" ]]; then
     printf 'installer did not retain an internal relative symlink\n' >&2
+    exit 1
+fi
+if [[ ! -L "$snapshot_dir/lib/dash-prefixed-internal-relative" || "$(readlink "$snapshot_dir/lib/dash-prefixed-internal-relative")" != "-internal-target" ]]; then
+    printf 'installer did not retain a dash-prefixed internal relative symlink\n' >&2
+    exit 1
+fi
+for preserved_path in \
+    "$snapshot_dir/lib/rustlib/rustc-src/rust/README" \
+    "$snapshot_dir/lib/rustlib/src/rust/README"
+do
+    if [[ ! -f "$preserved_path" ]]; then
+        printf 'installer did not retain copied rust-src directory content: %s\n' "$preserved_path" >&2
+        exit 1
+    fi
+done
+
+retarget_physical_install_root="$scratch/retarget-physical-install-root"
+retarget_other_install_root="$scratch/retarget-other-install-root"
+retarget_install_root="$scratch/retarget-install-root"
+retarget_name="srs-retarget-smoke"
+mkdir -p "$retarget_physical_install_root" "$retarget_other_install_root"
+ln -s "$retarget_physical_install_root" "$retarget_install_root"
+env \
+    SRS_INSTALL_ROOT="$retarget_install_root" \
+    SRS_RUSTUP_BIN="$rustup_bin" \
+    SRS_SLD_BIN="$sld_bin" \
+    SRS_TEST_RETARGET_INSTALL_ROOT="$retarget_install_root" \
+    SRS_TEST_RETARGET_INSTALL_ROOT_TO="$retarget_other_install_root" \
+    SRS_TEST_RUSTUP_LINKS="$rustup_links" \
+    "$root/install.sh" "$retarget_name" "$toolchain_dir" "$cargo_bin"
+if [[ ! -x "$retarget_physical_install_root/$retarget_name/bin/rustc" ]]; then
+    printf 'installer did not publish into the pinned physical install root\n' >&2
+    exit 1
+fi
+if [[ -e "$retarget_other_install_root/$retarget_name" || -L "$retarget_other_install_root/$retarget_name" ]]; then
+    printf 'installer followed a retargeted install-root symlink during publication\n' >&2
+    exit 1
+fi
+if [[ "$(readlink "$rustup_links/$retarget_name")" != "$retarget_physical_install_root/$retarget_name" ]]; then
+    printf 'installer did not link rustup to the pinned physical snapshot path\n' >&2
     exit 1
 fi
 
