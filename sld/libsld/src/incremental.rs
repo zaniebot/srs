@@ -891,6 +891,13 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
     }
 
     if !changed_inputs.is_empty() {
+        if retained_output_to_restore.is_some() {
+            append_log(
+                &state_dir,
+                "changed-input patch unavailable before loading inputs: missing retained output requires full relink",
+            )?;
+            return Ok(false);
+        }
         if !args.should_patch_changed_inputs_before_loading() {
             append_log(
                 &state_dir,
@@ -22131,6 +22138,13 @@ mod tests {
         let state_dir = state_dir_for_output(&output);
         let mut state = publishing_metadata_state(&args, &output, &input);
         state.output = FileContentState::from_path(&output).unwrap();
+        state.input_files[0].patch = Some(FilePatchState {
+            fingerprint: String::new(),
+            archive_member_set_proof: None,
+            archive_member_patch_fingerprints: None,
+            sections: Vec::new(),
+            raw_sections: None,
+        });
         state.write(&state_dir).unwrap();
         install_output_snapshot(&state_dir, &output).unwrap();
         std::fs::remove_file(&output).unwrap();
@@ -22138,6 +22152,11 @@ mod tests {
 
         assert!(!maybe_reuse_output_before_loading(&args).unwrap());
         assert!(!output.exists());
+        assert!(
+            std::fs::read_to_string(state_dir.join(LOG_FILE))
+                .unwrap()
+                .contains("missing retained output requires full relink")
+        );
     }
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
