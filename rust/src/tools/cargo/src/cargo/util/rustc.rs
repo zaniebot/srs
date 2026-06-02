@@ -840,7 +840,7 @@ mod artifact_cache_identity_tests {
         symlink(&source, rustlib.join("rustc-src").join("rust")).unwrap();
 
         let first = artifact_cache_identity_for_program(&rustc).unwrap();
-        std::fs::write(source.join("lib.rs"), b"other source").unwrap();
+        std::fs::write(source.join("other.rs"), b"other source").unwrap();
         let second = artifact_cache_identity_for_program(&rustc).unwrap();
 
         assert!(first.witness.is_current());

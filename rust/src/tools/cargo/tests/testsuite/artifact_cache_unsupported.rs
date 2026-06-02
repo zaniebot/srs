@@ -14,6 +14,7 @@ fn contains_file_named(path: &std::path::Path, name: &str) -> bool {
 #[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
 fn configured_cache_is_not_published_on_unsupported_hosts() {
     let cache = paths::root().join("shared-cache");
+    let cache_config = cache.to_string_lossy().replace('\\', "\\\\");
     let p = project()
         .file(
             ".cargo/config.toml",
@@ -22,7 +23,7 @@ fn configured_cache_is_not_published_on_unsupported_hosts() {
                 [build]
                 artifact-cache-dir = "{}"
                 "#,
-                cache.display()
+                cache_config
             ),
         )
         .file("src/lib.rs", "pub fn value() -> u32 { 42 }\n")
