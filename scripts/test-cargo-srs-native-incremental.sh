@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
-    printf 'cargo +srs native incremental replay skipped: requires macOS arm64\n'
-    exit 0
+verify_native_sld_replay=0
+uname_s="${SRS_TEST_UNAME_S:-$(uname -s)}"
+uname_m="${SRS_TEST_UNAME_M:-$(uname -m)}"
+if [[ "$uname_s" == "Darwin" && "$uname_m" == "arm64" ]]; then
+    verify_native_sld_replay=1
 fi
 
 scratch_root="${SRS_TEST_TMPDIR:-$HOME/code/tmp}"
@@ -50,18 +52,20 @@ if [[ "$("$binary")" != "41" ]]; then
     exit 1
 fi
 
-shopt -s nullglob
-incremental_logs=("$target_dir"/debug/deps/*.incr/log)
-shopt -u nullglob
-if [[ "${#incremental_logs[@]}" -ne 1 ]]; then
-    printf 'expected one private root SLD incremental log, found %s\n' \
-        "${#incremental_logs[@]}" >&2
-    find "$target_dir" -path '*.incr/log' -print >&2
-    exit 1
-fi
+if [[ "$verify_native_sld_replay" == 1 ]]; then
+    shopt -s nullglob
+    incremental_logs=("$target_dir"/debug/deps/*.incr/log)
+    shopt -u nullglob
+    if [[ "${#incremental_logs[@]}" -ne 1 ]]; then
+        printf 'expected one private root SLD incremental log, found %s\n' \
+            "${#incremental_logs[@]}" >&2
+        find "$target_dir" -path '*.incr/log' -print >&2
+        exit 1
+    fi
 
-incremental_log="${incremental_logs[0]}"
-log_offset="$(wc -c < "$incremental_log")"
+    incremental_log="${incremental_logs[0]}"
+    log_offset="$(wc -c < "$incremental_log")"
+fi
 cat > "$scratch/replay-lib/src/lib.rs" <<'EOF'
 pub static VALUE: i32 = 42;
 
@@ -76,17 +80,21 @@ if [[ "$("$binary")" != "42" ]]; then
     exit 1
 fi
 
-rebuild_log="$scratch/rebuild.log"
-dd if="$incremental_log" bs=1 skip="$log_offset" 2>/dev/null > "$rebuild_log"
-if ! grep -Fq 'patched 1 changed input file before loading inputs' "$rebuild_log"; then
-    printf 'cargo +%s rebuild did not patch its changed rlib input\n' "$toolchain" >&2
-    cat "$rebuild_log" >&2
-    exit 1
-fi
-if ! grep -Eq 'patched [1-9][0-9]* changed input sections before loading inputs' "$rebuild_log"; then
-    printf 'cargo +%s rebuild did not patch changed input sections\n' "$toolchain" >&2
-    cat "$rebuild_log" >&2
-    exit 1
-fi
+if [[ "$verify_native_sld_replay" == 1 ]]; then
+    rebuild_log="$scratch/rebuild.log"
+    dd if="$incremental_log" bs=1 skip="$log_offset" 2>/dev/null > "$rebuild_log"
+    if ! grep -Fq 'patched 1 changed input file before loading inputs' "$rebuild_log"; then
+        printf 'cargo +%s rebuild did not patch its changed rlib input\n' "$toolchain" >&2
+        cat "$rebuild_log" >&2
+        exit 1
+    fi
+    if ! grep -Eq 'patched [1-9][0-9]* changed input sections before loading inputs' "$rebuild_log"; then
+        printf 'cargo +%s rebuild did not patch changed input sections\n' "$toolchain" >&2
+        cat "$rebuild_log" >&2
+        exit 1
+    fi
 
-printf 'cargo +%s native incremental replay passed\n' "$toolchain"
+    printf 'cargo +%s native incremental replay passed\n' "$toolchain"
+else
+    printf 'cargo +%s installed dependency-edit replay passed\n' "$toolchain"
+fi
