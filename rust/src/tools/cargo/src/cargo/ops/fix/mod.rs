@@ -91,7 +91,10 @@ const MAX_RETRIES_ENV: &str = "CARGO_FIX_MAX_RETRIES";
 ///
 /// Bump this whenever proxy behavior changes in a way that can affect the
 /// contents written by `cargo fix`, even if there is no new user-facing option.
-const FIX_PROXY_METADATA_SCHEMA_VERSION: u32 = 2;
+const FIX_PROXY_METADATA_SCHEMA_VERSION: u32 = 3;
+/// **Internal only.**
+/// The resolved Cargo home path used to protect registry and Git cache sources.
+const CARGO_HOME_INTERNAL: &str = "__CARGO_FIX_CARGO_HOME";
 /// **Internal only.**
 /// The sysroot path.
 ///
@@ -178,6 +181,7 @@ pub fn fix(
     let lock_server = LockServer::new()?;
     let mut wrapper = ProcessBuilder::new(env::current_exe()?);
     wrapper.env(FIX_ENV_INTERNAL, lock_server.addr().to_string());
+    wrapper.env(CARGO_HOME_INTERNAL, gctx.home().as_path_unlocked());
     let _started = lock_server.start()?;
 
     if opts.broken_code {
@@ -192,7 +196,8 @@ pub fn fix(
     }
 
     let sysroot = &target_data.info(CompileKind::Host).sysroot;
-    if sysroot.is_dir() {
+    let protected_sysroot = sysroot.is_dir().then_some(sysroot.as_path());
+    if let Some(sysroot) = protected_sysroot {
         wrapper.env(SYSROOT_INTERNAL, sysroot);
     }
 
@@ -224,7 +229,7 @@ pub fn fix(
     // without reusing artifacts from a behaviorally different fix mode.
     opts.compile_opts.build_config.primary_unit_rustc = Some(PrimaryUnitRustc {
         process: wrapper,
-        metadata: fix_proxy_metadata(gctx, opts),
+        metadata: fix_proxy_metadata(gctx, opts, protected_sysroot)?,
     });
 
     ops::compile(&ws, &opts.compile_opts)?;
@@ -236,14 +241,21 @@ pub fn fix(
 /// Do not derive this from the proxy process itself. The process contains
 /// per-invocation socket addresses, while these options are the settings that
 /// can change how the proxy applies suggestions.
-fn fix_proxy_metadata(gctx: &GlobalContext, opts: &FixOptions) -> String {
-    format_fix_proxy_metadata(
+fn fix_proxy_metadata(
+    gctx: &GlobalContext,
+    opts: &FixOptions,
+    sysroot: Option<&Path>,
+) -> CargoResult<String> {
+    let protected_source_roots =
+        ProtectedSourceRoots::new(gctx.home().as_path_unlocked(), sysroot)?.metadata_digest();
+    Ok(format_fix_proxy_metadata(
         opts.edition.as_ref(),
         opts.idioms,
         opts.broken_code,
         gctx.get_env_os(YOLO_ENV_INTERNAL).is_some(),
         max_iterations(gctx),
-    )
+        &protected_source_roots.to_hex(),
+    ))
 }
 
 fn format_fix_proxy_metadata(
@@ -252,11 +264,12 @@ fn format_fix_proxy_metadata(
     broken_code: bool,
     yolo: bool,
     max_retries: usize,
+    protected_source_roots: &str,
 ) -> String {
     let edition = edition.map(EditionFixMode::to_string).unwrap_or_default();
     format!(
-        "cargo-fix:v{FIX_PROXY_METADATA_SCHEMA_VERSION}:edition={edition}:idioms={}:broken-code={}:yolo={}:max-retries={}",
-        idioms, broken_code, yolo, max_retries
+        "cargo-fix:v{FIX_PROXY_METADATA_SCHEMA_VERSION}:edition={edition}:idioms={}:broken-code={}:yolo={}:max-retries={}:protected-source-roots={protected_source_roots}",
+        idioms, broken_code, yolo, max_retries,
     )
 }
 
@@ -802,6 +815,7 @@ pub fn fix_exec_rustc(gctx: &GlobalContext, lock_addr: &str) -> CargoResult<()> 
     let mut rustc = ProcessBuilder::new(&args.rustc).wrapped(workspace_rustc.as_ref());
     rustc.retry_with_argfile(true);
     rustc.env_remove(FIX_ENV_INTERNAL);
+    rustc.env_remove(CARGO_HOME_INTERNAL);
     args.apply(&mut rustc);
     // Removes `FD_CLOEXEC` set by `jobserver::Client` to ensure that the
     // compiler can access the jobserver.
@@ -1128,8 +1142,11 @@ fn collect_file_suggestions(
     // deliberate:
     // rustfix can only edit existing files, and skipping an unresolvable path
     // is safer than applying a suggestion through an unchecked alias.
-    let protected_roots =
-        ProtectedSourceRoots::new(gctx.home().as_path_unlocked(), args.sysroot.as_deref())?;
+    let protected_home = args
+        .cargo_home
+        .as_deref()
+        .unwrap_or_else(|| gctx.home().as_path_unlocked());
+    let protected_roots = ProtectedSourceRoots::new(protected_home, args.sysroot.as_deref())?;
     for suggestion in suggestions {
         trace!("suggestion");
         // Make sure we've got a file associated with this suggestion and all
@@ -1216,6 +1233,20 @@ impl ProtectedSourceRoots {
         })
     }
 
+    fn metadata_digest(&self) -> blake3::Hash {
+        let mut hasher = blake3::Hasher::new();
+        self.home.update_metadata_digest(&mut hasher, b"home");
+        self.cached_sources[0].update_metadata_digest(&mut hasher, b"registry");
+        self.cached_sources[1].update_metadata_digest(&mut hasher, b"git");
+        match &self.sysroot {
+            Some(sysroot) => sysroot.update_metadata_digest(&mut hasher, b"sysroot"),
+            None => {
+                hasher.update(b"sysroot:none");
+            }
+        };
+        hasher.finalize()
+    }
+
     fn resolve_unprotected(&self, file_name: &str, cwd: &Path) -> Option<PathBuf> {
         let file_path = Path::new(file_name);
         let is_absolute = file_path.is_absolute();
@@ -1282,6 +1313,25 @@ impl ProtectedSourceRoot {
                 .canonical
                 .as_deref()
                 .is_some_and(|root| canonical.starts_with(root))
+    }
+
+    fn update_metadata_digest(&self, hasher: &mut blake3::Hasher, name: &[u8]) {
+        fn update_path(hasher: &mut blake3::Hasher, kind: &[u8], path: &Path) {
+            let bytes = path.as_os_str().as_encoded_bytes();
+            hasher.update(&(kind.len() as u64).to_le_bytes());
+            hasher.update(kind);
+            hasher.update(&(bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        }
+
+        update_path(hasher, name, &self.normalized);
+        if let Some(canonical) = self
+            .canonical
+            .as_deref()
+            .filter(|canonical| *canonical != self.normalized)
+        {
+            update_path(hasher, b"canonical", canonical);
+        }
     }
 }
 
@@ -1459,6 +1509,8 @@ struct FixArgs {
     other: Vec<OsString>,
     /// Path to the `rustc` executable.
     rustc: PathBuf,
+    /// Resolved Cargo home path used to protect registry and Git cache sources.
+    cargo_home: Option<PathBuf>,
     /// Path to host sysroot.
     sysroot: Option<PathBuf>,
 }
@@ -1539,6 +1591,11 @@ impl FixArgs {
             reason = "internal only, no reason for config support"
         )]
         let sysroot = env::var_os(SYSROOT_INTERNAL).map(PathBuf::from);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "internal only, no reason for config support"
+        )]
+        let cargo_home = env::var_os(CARGO_HOME_INTERNAL).map(PathBuf::from);
 
         Ok(FixArgs {
             file,
@@ -1547,6 +1604,7 @@ impl FixArgs {
             enabled_edition,
             other,
             rustc,
+            cargo_home,
             sysroot,
         })
     }
@@ -1647,30 +1705,107 @@ mod tests {
 
     #[test]
     fn fix_proxy_metadata_distinguishes_behavioral_modes() {
-        let plain = format_fix_proxy_metadata(None, false, false, false, 4);
+        let plain = format_fix_proxy_metadata(None, false, false, false, 4, "roots-a");
         assert_eq!(
             plain,
-            "cargo-fix:v2:edition=:idioms=false:broken-code=false:yolo=false:max-retries=4"
+            "cargo-fix:v3:edition=:idioms=false:broken-code=false:yolo=false:max-retries=4:protected-source-roots=roots-a"
         );
         let variants = [
-            format_fix_proxy_metadata(Some(&EditionFixMode::NextRelative), false, false, false, 4),
-            format_fix_proxy_metadata(None, true, false, false, 4),
-            format_fix_proxy_metadata(Some(&EditionFixMode::NextRelative), true, false, false, 4),
+            format_fix_proxy_metadata(
+                Some(&EditionFixMode::NextRelative),
+                false,
+                false,
+                false,
+                4,
+                "roots-a",
+            ),
+            format_fix_proxy_metadata(None, true, false, false, 4, "roots-a"),
+            format_fix_proxy_metadata(
+                Some(&EditionFixMode::NextRelative),
+                true,
+                false,
+                false,
+                4,
+                "roots-a",
+            ),
             format_fix_proxy_metadata(
                 Some(&EditionFixMode::OverrideSpecific(Edition::Edition2024)),
                 false,
                 false,
                 false,
                 4,
+                "roots-a",
             ),
-            format_fix_proxy_metadata(None, false, true, false, 4),
-            format_fix_proxy_metadata(None, false, false, true, 4),
-            format_fix_proxy_metadata(None, false, false, false, 5),
+            format_fix_proxy_metadata(None, false, true, false, 4, "roots-a"),
+            format_fix_proxy_metadata(None, false, false, true, 4, "roots-a"),
+            format_fix_proxy_metadata(None, false, false, false, 5, "roots-a"),
+            format_fix_proxy_metadata(None, false, false, false, 4, "roots-b"),
         ];
 
         for variant in variants {
             assert_ne!(plain, variant);
         }
+    }
+
+    #[test]
+    fn protected_source_root_metadata_distinguishes_write_policies() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let other_home = temp.path().join("other-home");
+        let sysroot = temp.path().join("sysroot");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&other_home).unwrap();
+        std::fs::create_dir_all(&sysroot).unwrap();
+
+        let roots = ProtectedSourceRoots::new(&home, None).unwrap();
+        let other_roots = ProtectedSourceRoots::new(&other_home, None).unwrap();
+        let sysroot_roots = ProtectedSourceRoots::new(&home, Some(&sysroot)).unwrap();
+
+        assert_ne!(roots.metadata_digest(), other_roots.metadata_digest());
+        assert_ne!(roots.metadata_digest(), sysroot_roots.metadata_digest());
+    }
+
+    #[test]
+    fn protected_source_root_metadata_ignores_directory_creation() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let before = ProtectedSourceRoots::new(&home, None)
+            .unwrap()
+            .metadata_digest();
+        std::fs::create_dir_all(home.join("registry")).unwrap();
+        std::fs::create_dir_all(home.join("git")).unwrap();
+        let after = ProtectedSourceRoots::new(&home, None)
+            .unwrap()
+            .metadata_digest();
+
+        assert_eq!(before, after);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_source_root_metadata_tracks_symlink_retargets() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let registry = home.join("registry");
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        symlink(&first, &registry).unwrap();
+        let before = ProtectedSourceRoots::new(&home, None)
+            .unwrap()
+            .metadata_digest();
+
+        std::fs::remove_file(&registry).unwrap();
+        symlink(&second, &registry).unwrap();
+        let after = ProtectedSourceRoots::new(&home, None)
+            .unwrap()
+            .metadata_digest();
+
+        assert_ne!(before, after);
     }
 
     #[test]
