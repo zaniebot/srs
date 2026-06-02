@@ -43,6 +43,10 @@ fn prepend_path(path: &Path) -> OsString {
     env::join_paths(paths).unwrap()
 }
 
+fn isolated_artifact_cache_loader_path() -> PathBuf {
+    root().join("empty-compiler-loader-path")
+}
+
 struct RustupEnvironment {
     /// Path for ~/.cargo/bin
     cargo_bin: PathBuf,
@@ -284,6 +288,10 @@ fn artifact_cache_rejects_unresolved_rustup_proxy() {
         .masquerade_as_nightly_cargo(&["artifact-cache"])
         .env_remove("RUSTUP_HOME")
         .env_remove("RUSTUP_TOOLCHAIN")
+        .env(
+            cargo_util::paths::dylib_path_envvar(),
+            isolated_artifact_cache_loader_path(),
+        )
         .env("PATH", prepend_path(&cargo_bin))
         .run();
 
@@ -323,6 +331,10 @@ fn artifact_cache_models_rustup_proxy_with_default_home() {
         .masquerade_as_nightly_cargo(&["artifact-cache"])
         .env_remove("RUSTUP_HOME")
         .env("RUSTUP_TOOLCHAIN", "test-toolchain")
+        .env(
+            cargo_util::paths::dylib_path_envvar(),
+            isolated_artifact_cache_loader_path(),
+        )
         .env("PATH", &proxy_only_bin)
         .run();
 
