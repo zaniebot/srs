@@ -6469,6 +6469,28 @@ fn sld_native_incremental_scopes_root_linker_environment() {
             "src/main.rs",
             r#"
                 use std::ffi::OsStr;
+                use std::os::unix::fs::MetadataExt;
+                use std::path::Path;
+
+                fn assert_private_root_output_is_detached(args: &[String]) {
+                    let out_dir = args
+                        .windows(2)
+                        .find(|args| args[0] == "--out-dir")
+                        .map(|args| args[1].as_str())
+                        .unwrap();
+                    let extra_filename = args
+                        .iter()
+                        .find_map(|arg| arg.strip_prefix("extra-filename="))
+                        .unwrap();
+                    let private_binary = Path::new(out_dir).join(format!("foo{extra_filename}"));
+                    let public_binary = Path::new(out_dir).parent().unwrap().join("foo");
+                    let private_metadata = std::fs::metadata(private_binary).unwrap();
+                    let public_metadata = std::fs::metadata(public_binary).unwrap();
+                    assert_ne!(
+                        (private_metadata.dev(), private_metadata.ino()),
+                        (public_metadata.dev(), public_metadata.ino()),
+                    );
+                }
 
                 fn main() {
                     let args: Vec<_> = std::env::args().collect();
@@ -6487,6 +6509,7 @@ fn sld_native_incremental_scopes_root_linker_environment() {
                     ];
                     match crate_name {
                         Some("foo") => {
+                            assert_private_root_output_is_detached(&args);
                             for (variable, value) in [
                                 ("SLD_INCREMENTAL", "1"),
                                 ("SLD_INCREMENTAL_PADDING_PERCENT", "set"),
@@ -6538,6 +6561,15 @@ fn sld_native_incremental_scopes_root_linker_environment() {
         .build();
     wrapper_project.cargo("build").run();
 
+    p.cargo("build").enable_mac_dsym().run();
+    let private_binary = p
+        .glob("target/debug/deps/foo-*")
+        .filter_map(Result::ok)
+        .find(|path| path.is_file() && path.extension().is_none())
+        .unwrap();
+    fs::remove_file(p.bin("foo")).unwrap();
+    fs::hard_link(private_binary, p.bin("foo")).unwrap();
+
     p.cargo("build -Z sld-native-incremental -Z unstable-options --artifact-dir out")
         .masquerade_as_nightly_cargo(&["sld-native-incremental", "artifact-dir"])
         .env("RUSTC_WRAPPER", wrapper_project.bin("sld-env-wrapper"))
@@ -6549,6 +6581,7 @@ fn sld_native_incremental_scopes_root_linker_environment() {
         .env("SLD_EXPERIMENT_PRIVATE_PERSISTENT_OUTPUT", "poison")
         .env("SLD_EXPERIMENT_UNSIGNED_PERSISTENT_OUTPUT", "poison")
         .enable_mac_dsym()
+        .with_stderr_contains("[COMPILING] bar v0.1.0 ([ROOT]/foo/bar)")
         .run();
 
     let private_binary = p
@@ -6563,6 +6596,28 @@ fn sld_native_incremental_scopes_root_linker_environment() {
         );
     }
     assert!(p.target_debug_dir().join("foo.dSYM").is_dir());
+}
+
+#[cargo_test]
+fn sld_native_incremental_warns_on_unsupported_host() {
+    if rustc_host() == "aarch64-apple-darwin" {
+        return;
+    }
+
+    let p = project()
+        .file("Cargo.toml", &basic_bin_manifest("foo"))
+        .file("src/main.rs", "fn main() {}")
+        .build();
+
+    p.cargo("build -Z sld-native-incremental")
+        .masquerade_as_nightly_cargo(&["sld-native-incremental"])
+        .with_stderr_data(str![[r#"
+[WARNING] `-Z sld-native-incremental` is ignored because it only supports aarch64-apple-darwin hosts and targets
+[COMPILING] foo v0.5.0 ([ROOT]/foo)
+[FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
+
+"#]])
+        .run();
 }
 
 #[cargo_test(nightly, reason = "-Zno-embed-metadata is nightly only")]
