@@ -577,7 +577,9 @@ copying when the cache and build directory are on different filesystems.
 In `hardlink` mode, restored `.rlib` and `.rmeta` files share storage with the
 central cache. Tools outside Cargo must not mutate those restored files in
 place; use `copy` materialization for workflows that modify build artifacts
-after compilation.
+after compilation. Changing the cache setting does not eagerly detach
+already-fresh outputs. Clean the target directory or force a rebuild before
+allowing an external tool to mutate artifacts previously restored by hardlink.
 
 `artifact-cache-max-size` caps completed cache entries using oldest-first
 eviction and accepts human-readable sizes such as `"100GB"` or `"2GiB"`.
@@ -585,11 +587,13 @@ The cache is unbounded when this setting is omitted. Individual entries larger
 than an explicitly configured limit are not published. The cap counts logical
 bytes reachable under completed entries; it is not a bound on physical blocks
 or a guarantee that eviction immediately reclaims storage while target
-directory hardlinks remain. Cargo allows concurrent restorations under shared
-cache locks and protects publication, size accounting, cleanup of aborted
-publications, and eviction with an exclusive cache lock. Conflicting cache locks
-fall back to an opportunistic ordinary compilation rather than delaying the
-build.
+directory hardlinks remain. `cargo clean` removes target-directory links but
+leaves the shared cache intact. To reclaim shared-cache storage manually, remove
+the cache directory only while no Cargo process is using it. Cargo allows
+concurrent restorations under shared cache locks and protects publication, size
+accounting, cleanup of aborted publications, and eviction with an exclusive
+cache lock. Conflicting cache locks fall back to an opportunistic ordinary
+compilation rather than delaying the build.
 
 ## update-breaking
 
