@@ -2932,6 +2932,9 @@ impl ProgramInputs {
                 }
             }
 
+            let changed_log_before = std::fs::read_to_string(&log_path).with_context(|| {
+                format!("Failed to read incremental log `{}`", log_path.display())
+            })?;
             let link_output_3 =
                 Linker::Sld.link(self.name(), inputs, &incremental_config, cross_arch)?;
             let changed_content = std::fs::read(&link_output_3.binary).with_context(|| {
@@ -3054,19 +3057,24 @@ impl ProgramInputs {
             let log = std::fs::read_to_string(&log_path).with_context(|| {
                 format!("Failed to read incremental log `{}`", log_path.display())
             })?;
+            let changed_link_log = log
+                .strip_prefix(&changed_log_before)
+                .unwrap_or(log.as_str());
             let fallback_message = "changed-input patch unavailable before loading inputs";
-            let fallback_recorded =
-                log.contains(fallback_message) && log.contains("full relink: input file changed:");
+            let fallback_recorded = changed_link_log.contains(fallback_message)
+                && changed_link_log.contains("full relink: input file changed:");
             let allowed_fallback_recorded = fallback_recorded
                 && config
                     .test_incremental_changed_fallback_reasons
                     .iter()
-                    .any(|reason| log.contains(reason));
+                    .any(|reason| changed_link_log.contains(reason));
             if config.platform == PlatformKind::MachO
                 && !config.test_incremental_unsigned_macho_output
                 && !config.test_incremental_private_signed_macho_output
             {
-                if log.contains("patched ") && log.contains(" changed input file") {
+                if changed_link_log.contains("patched ")
+                    && changed_link_log.contains(" changed input file")
+                {
                     bail!(
                         "Incremental test failed for {}: Mach-O changed-input relink patched \
                         the output before loading inputs, which would bypass code signing. \
@@ -3075,7 +3083,7 @@ impl ProgramInputs {
                         log
                     );
                 }
-                if !log.contains("full relink: input file changed:") {
+                if !changed_link_log.contains("full relink: input file changed:") {
                     bail!(
                         "Incremental test failed for {}: Mach-O changed-input relink did not \
                         fall back to a full relink. Log:\n{}",
@@ -3083,7 +3091,9 @@ impl ProgramInputs {
                         log
                     );
                 }
-                if !log.contains("reused ") || !log.contains(" unchanged input sections") {
+                if !changed_link_log.contains("reused ")
+                    || !changed_link_log.contains(" unchanged input sections")
+                {
                     bail!(
                         "Incremental test failed for {}: Mach-O changed-input relink did not \
                         reuse unchanged input sections. Log:\n{}",
@@ -3097,7 +3107,7 @@ impl ProgramInputs {
                     "patched {changed_input_count} changed input file{} before loading inputs",
                     if changed_input_count == 1 { "" } else { "s" }
                 );
-                let patched_input_recorded = log.contains(&patched_input_message);
+                let patched_input_recorded = changed_link_log.contains(&patched_input_message);
                 if !patched_input_recorded && !allowed_fallback_recorded {
                     bail!(
                         "Incremental test failed for {}: changed-input relink did not patch \
@@ -3121,7 +3131,7 @@ impl ProgramInputs {
                         let patched_section_message = format!(
                             "patched {patched_section_count} changed input sections before loading inputs"
                         );
-                        log.contains(&patched_section_message)
+                        changed_link_log.contains(&patched_section_message)
                     }) {
                         bail!(
                             "Incremental test failed for {}: changed-input relink did not narrow \
@@ -3131,7 +3141,9 @@ impl ProgramInputs {
                         );
                     }
                 }
-            } else if log.contains("patched ") && log.contains(" changed input file") {
+            } else if changed_link_log.contains("patched ")
+                && changed_link_log.contains(" changed input file")
+            {
                 bail!(
                     "Incremental test failed for {}: changed input was unexpectedly patched \
                     before loading all inputs. Log:\n{}",
@@ -3143,7 +3155,7 @@ impl ProgramInputs {
                     && !config
                         .test_incremental_changed_fallback_reasons
                         .iter()
-                        .any(|reason| log.contains(reason)))
+                        .any(|reason| changed_link_log.contains(reason)))
             {
                 bail!(
                     "Incremental test failed for {}: changed-input relink did not record the \
@@ -3153,7 +3165,8 @@ impl ProgramInputs {
                 );
             }
             if config.test_incremental_changed_expect_reuse
-                && (!log.contains("reused ") || !log.contains(" unchanged input sections"))
+                && (!changed_link_log.contains("reused ")
+                    || !changed_link_log.contains(" unchanged input sections"))
             {
                 bail!(
                     "Incremental test failed for {}: changed-input relink did not reuse \

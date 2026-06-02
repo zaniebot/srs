@@ -338,6 +338,7 @@ impl<T> RecordBuffers<T> {
 pub(crate) struct PreparedState<'data> {
     mode: IncrementalMode,
     current: CurrentState,
+    retained_output_to_restore: Option<FileContentState>,
     reusable_inputs: HashSet<String>,
     previous_sections: HashSet<SectionRecord>,
     previous_relocations: Vec<RelocationRecord>,
@@ -602,6 +603,7 @@ pub(crate) fn maybe_prepare<'data>(
                 link_start: None,
                 input_files: Vec::new(),
             },
+            retained_output_to_restore: None,
             reusable_inputs: HashSet::new(),
             previous_sections: HashSet::new(),
             previous_relocations: Vec::new(),
@@ -621,17 +623,25 @@ pub(crate) fn maybe_prepare<'data>(
 
     let state_dir = state_dir_for_output(args.output());
     let previous_metadata = PersistedState::read_metadata(&state_dir);
-    if args.should_retain_output_snapshot()
+    let retained_output_to_restore = if args.should_retain_output_snapshot()
         && let Ok(Some(previous)) = &previous_metadata
+        && !args.output().try_exists().unwrap_or(false)
     {
-        match restore_missing_output_for_loaded_classification(args, &state_dir, previous) {
-            Ok(_) => {}
-            Err(error) => append_log(
-                &state_dir,
-                &format!("retained output restoration unavailable: {error:?}"),
-            )?,
+        match retained_output_snapshot_matches_previous(&state_dir, &previous.output, args.output())
+        {
+            Ok(true) => Some(previous.output.clone()),
+            Ok(false) => None,
+            Err(error) => {
+                append_log(
+                    &state_dir,
+                    &format!("retained output restoration unavailable: {error:?}"),
+                )?;
+                None
+            }
         }
-    }
+    } else {
+        None
+    };
     let current = CurrentState::new(
         args,
         file_loader,
@@ -650,6 +660,7 @@ pub(crate) fn maybe_prepare<'data>(
                 &current,
                 &previous,
                 args.should_trust_persistent_output_data_identity(),
+                retained_output_to_restore.is_some(),
             ),
             Some(previous),
         ),
@@ -702,10 +713,14 @@ pub(crate) fn maybe_prepare<'data>(
         .as_ref()
         .map(|previous| reusable_input_files(&current.input_files, &previous.input_files))
         .unwrap_or_default();
+    let retained_output_to_restore = matches!(mode, IncrementalMode::Reuse)
+        .then_some(retained_output_to_restore)
+        .flatten();
 
     Ok(PreparedState {
         mode,
         current,
+        retained_output_to_restore,
         reusable_inputs,
         previous_sections,
         previous_relocations,
@@ -778,9 +793,12 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
     if sld_version_relink_reason(previous.sld_version.as_deref(), &current_sld_version).is_some() {
         return Ok(false);
     }
-    if args.should_retain_output_snapshot() && !args.output().try_exists().unwrap_or(false) {
-        match restore_missing_output_snapshot(&state_dir, &previous.output, args.output()) {
-            Ok(true) => {}
+    let retained_output_to_restore = if args.should_retain_output_snapshot()
+        && !args.output().try_exists().unwrap_or(false)
+    {
+        match retained_output_snapshot_matches_previous(&state_dir, &previous.output, args.output())
+        {
+            Ok(true) => Some(previous.output.clone()),
             Ok(false) => return Ok(false),
             Err(error) => {
                 append_log(
@@ -790,15 +808,19 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
                 return Ok(false);
             }
         }
-    }
-    if !{
-        timing_phase!("Validate incremental fast-path output content");
-        output_content_matches_previous(
-            &previous.output,
-            args.output(),
-            args.should_trust_persistent_output_data_identity(),
-        )?
-    } {
+    } else {
+        None
+    };
+    if retained_output_to_restore.is_none()
+        && !{
+            timing_phase!("Validate incremental fast-path output content");
+            output_content_matches_previous(
+                &previous.output,
+                args.output(),
+                args.should_trust_persistent_output_data_identity(),
+            )?
+        }
+    {
         return Ok(false);
     }
 
@@ -1039,6 +1061,11 @@ pub(crate) fn maybe_reuse_output_before_loading(args: &impl platform::Args) -> R
                 if rewritten_inputs.len() == 1 { "" } else { "s" }
             ),
         )?;
+    }
+    if let Some(previous_output) = retained_output_to_restore.as_ref()
+        && !restore_missing_output_snapshot(&state_dir, previous_output, args.output())?
+    {
+        return Ok(false);
     }
     append_log(&state_dir, "reused existing output before loading inputs")?;
     Ok(true)
@@ -2895,12 +2922,7 @@ fn patch_changed_inputs(
     drop(file);
     directly_patched_output.install(&flush_ranges)?;
 
-    let output = if args.should_hash_directly_patched_output() {
-        FileContentState::from_path(args.output())
-    } else {
-        FileContentState::from_path_identity_only(args.output())
-    }
-    .with_context(|| {
+    let output = directly_patched_output_content_state(args, args.output()).with_context(|| {
         format!(
             "Failed to record patched output `{}` for incremental state",
             args.output().display()
@@ -3028,6 +3050,17 @@ fn patch_changed_inputs(
         &format!("patched {patched_section_count} changed input sections before loading inputs"),
     )?;
     Ok(ChangedInputPatchResult::Patched)
+}
+
+fn directly_patched_output_content_state(
+    args: &impl platform::Args,
+    output: &Path,
+) -> Result<FileContentState> {
+    if args.should_hash_directly_patched_output() || args.should_retain_output_snapshot() {
+        FileContentState::from_path(output)
+    } else {
+        FileContentState::from_path_identity_only(output)
+    }
 }
 
 struct PreviousPatchState {
@@ -3631,6 +3664,7 @@ fn write_directly_patched_output_standby_state(
     let ranges = merged_output_ranges(ranges);
     if ranges.len() > DIRECT_PATCH_STANDBY_MAX_RANGES {
         let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(standby);
         return Ok(());
     }
     let output_identity = FileIdentity::from_path(output)?
@@ -4313,6 +4347,18 @@ impl<'data> PreparedState<'data> {
             return Ok(None);
         }
 
+        if let Some(previous_output) = self.retained_output_to_restore.as_ref()
+            && !restore_missing_output_snapshot(
+                &self.current.state_dir,
+                previous_output,
+                args.output(),
+            )?
+        {
+            return Err(crate::error!(
+                "Retained incremental output snapshot could not be restored"
+            ));
+        }
+
         let output = if args.should_retain_output_snapshot() {
             FileContentState::from_path(args.output())
         } else {
@@ -4518,7 +4564,7 @@ fn classify_incremental_mode(
     current: &CurrentState,
     previous: &PersistedState,
 ) -> IncrementalMode {
-    classify_incremental_mode_with_output_policy(output, current, previous, false)
+    classify_incremental_mode_with_output_policy(output, current, previous, false, false)
 }
 
 fn classify_incremental_mode_with_output_policy(
@@ -4526,6 +4572,7 @@ fn classify_incremental_mode_with_output_policy(
     current: &CurrentState,
     previous: &PersistedState,
     trust_persistent_output_data_identity: bool,
+    retained_output_snapshot_matches: bool,
 ) -> IncrementalMode {
     if let Some(reason) = interrupted_update_relink_reason(&current.state_dir) {
         return IncrementalMode::Relink {
@@ -4554,23 +4601,25 @@ fn classify_incremental_mode_with_output_policy(
         };
     }
 
-    match output_content_matches_previous(
-        &previous.output,
-        output,
-        trust_persistent_output_data_identity,
-    ) {
-        Ok(true) => {}
-        Ok(false) => {
-            return IncrementalMode::Relink {
-                reason: "output file changed since previous link".to_owned(),
-                can_reuse_unchanged_sections: false,
-            };
-        }
-        Err(error) => {
-            return IncrementalMode::Relink {
-                reason: format!("output file could not be reused: {error:?}"),
-                can_reuse_unchanged_sections: false,
-            };
+    if !retained_output_snapshot_matches {
+        match output_content_matches_previous(
+            &previous.output,
+            output,
+            trust_persistent_output_data_identity,
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                return IncrementalMode::Relink {
+                    reason: "output file changed since previous link".to_owned(),
+                    can_reuse_unchanged_sections: false,
+                };
+            }
+            Err(error) => {
+                return IncrementalMode::Relink {
+                    reason: format!("output file could not be reused: {error:?}"),
+                    can_reuse_unchanged_sections: false,
+                };
+            }
         }
     }
 
@@ -6357,7 +6406,7 @@ impl FileContentState {
             };
         }
 
-        let mut state = Self::from_bytes(input_file.data());
+        let mut state = Self::from_bytes(input_file.full_data());
         state.identity = identity;
         state
     }
@@ -6719,7 +6768,7 @@ where
             true,
         )?;
         if patch.is_some() && input.content.hash.is_empty() {
-            input.content.hash = hash_bytes(input_file.data());
+            input.content.hash = hash_bytes(input_file.full_data());
         }
         input.patch = patch;
     }
@@ -13386,14 +13435,14 @@ fn snapshot_loaded_input_files(
                 return Ok((
                     index,
                     false,
-                    should_hash.then(|| hash_loaded_input_bytes(input_file.data())),
+                    should_hash.then(|| hash_loaded_input_bytes(input_file.full_data())),
                     None,
                 ));
             }
             let (did_snapshot, hash, snapshot_identity) = snapshot_loaded_input_file(
                 state_dir,
                 &input_file.filename,
-                input_file.data(),
+                input_file.full_data(),
                 should_hash,
             )?;
             Ok((index, did_snapshot, hash, snapshot_identity))
@@ -13437,7 +13486,7 @@ fn hash_loaded_input_files(loaded_files: &[&InputFile], input_files: &mut [FileS
         .collect::<Vec<_>>();
     let hashes = tasks
         .into_par_iter()
-        .map(|(index, input_file)| (index, hash_loaded_input_bytes(input_file.data())))
+        .map(|(index, input_file)| (index, hash_loaded_input_bytes(input_file.full_data())))
         .collect::<Vec<_>>();
     for (index, hash) in hashes {
         input_files[index].content.hash = hash;
@@ -13472,7 +13521,7 @@ fn hash_pending_reuse_input_files(
         .collect::<Vec<_>>();
     let hashes = tasks
         .into_par_iter()
-        .map(|(index, input_file)| (index, hash_loaded_input_bytes(input_file.data())))
+        .map(|(index, input_file)| (index, hash_loaded_input_bytes(input_file.full_data())))
         .collect::<Vec<_>>();
     for (index, hash) in hashes {
         input_files[index].content.hash = hash;
@@ -13575,15 +13624,10 @@ fn restore_missing_output_snapshot(
     previous: &FileContentState,
     output: &Path,
 ) -> Result<bool> {
-    if output.try_exists().unwrap_or(false) || previous.hash.is_empty() {
+    if !retained_output_snapshot_matches_previous(state_dir, previous, output)? {
         return Ok(false);
     }
     let snapshot = output_snapshot_path(state_dir);
-    if !snapshot.try_exists().unwrap_or(false)
-        || FileContentState::from_path(&snapshot)? != *previous
-    {
-        return Ok(false);
-    }
     install_isolated_output_copy(&snapshot, output).with_context(|| {
         format!(
             "Failed to restore incremental output snapshot to `{}`",
@@ -13594,22 +13638,17 @@ fn restore_missing_output_snapshot(
     Ok(true)
 }
 
-fn restore_missing_output_for_loaded_classification(
-    args: &impl platform::Args,
+fn retained_output_snapshot_matches_previous(
     state_dir: &Path,
-    previous: &PersistedState,
+    previous: &FileContentState,
+    output: &Path,
 ) -> Result<bool> {
-    let previous_link_options_hash = previous
-        .link_options_hash
-        .as_deref()
-        .unwrap_or(&previous.args_hash);
-    if previous_link_options_hash != link_options_hash(args)
-        || sld_version_relink_reason(previous.sld_version.as_deref(), &sld_version(args)).is_some()
-        || args.output().try_exists().unwrap_or(false)
-    {
+    if output.try_exists().unwrap_or(false) || previous.hash.is_empty() {
         return Ok(false);
     }
-    restore_missing_output_snapshot(state_dir, &previous.output, args.output())
+    let snapshot = output_snapshot_path(state_dir);
+    Ok(snapshot.try_exists().unwrap_or(false)
+        && FileContentState::from_path(&snapshot)? == *previous)
 }
 
 fn install_isolated_output_copy(source: &Path, target: &Path) -> Result {
@@ -13676,7 +13715,9 @@ fn read_verified_input_snapshot(
     {
         return Ok(None);
     }
-    Ok(Some(bytes))
+    Ok(Some(
+        crate::file_kind::FileKind::select_input_bytes(&bytes)?.to_vec(),
+    ))
 }
 
 fn snapshot_identity_matches_previous_atomic_replacement_input(
@@ -13725,7 +13766,7 @@ fn read_file_with_stable_identity_and_hashing(
     should_hash: bool,
 ) -> Result<Option<(Vec<u8>, FileContentState)>> {
     let before = FileIdentity::from_path(path)?;
-    let bytes = {
+    let full_bytes = {
         verbose_timing_phase!("Read stable input bytes");
         std::fs::read(path).with_context(|| format!("Failed to read `{}`", path.display()))?
     };
@@ -13735,16 +13776,17 @@ fn read_file_with_stable_identity_and_hashing(
     }
     let Some(identity) = after else {
         let mut content = FileContentState {
-            len: bytes.len() as u64,
+            len: full_bytes.len() as u64,
             hash: String::new(),
             identity: None,
         };
-        if should_hash {
-            ensure_loaded_input_content_hash(&bytes, &mut content);
+        let bytes = crate::file_kind::FileKind::select_input_bytes(&full_bytes)?.to_vec();
+        if should_hash || bytes.len() != full_bytes.len() {
+            ensure_loaded_input_content_hash(&full_bytes, &mut content);
         }
         return Ok(Some((bytes, content)));
     };
-    if bytes.len() as u64 != identity.len {
+    if full_bytes.len() as u64 != identity.len {
         return Ok(None);
     }
     let mut content = FileContentState {
@@ -13752,8 +13794,9 @@ fn read_file_with_stable_identity_and_hashing(
         hash: String::new(),
         identity: Some(identity),
     };
-    if should_hash {
-        ensure_loaded_input_content_hash(&bytes, &mut content);
+    let bytes = crate::file_kind::FileKind::select_input_bytes(&full_bytes)?.to_vec();
+    if should_hash || bytes.len() != full_bytes.len() {
+        ensure_loaded_input_content_hash(&full_bytes, &mut content);
     }
     Ok(Some((bytes, content)))
 }
@@ -15830,6 +15873,30 @@ mod tests {
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
+    fn directly_patched_output_generation_discards_standby_above_range_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join(DIRECT_PATCH_STANDBY_STATE_FILE);
+        let standby = dir.path().join(DIRECT_PATCH_STANDBY_FILE);
+        std::fs::write(&state_path, b"state").unwrap();
+        std::fs::write(&standby, b"standby").unwrap();
+        let ranges = (0..=DIRECT_PATCH_STANDBY_MAX_RANGES)
+            .map(|index| index * 2..index * 2 + 1)
+            .collect::<Vec<_>>();
+
+        write_directly_patched_output_standby_state(
+            &state_path,
+            Path::new("unused-output"),
+            &standby,
+            &ranges,
+        )
+        .unwrap();
+
+        assert!(!state_path.exists());
+        assert!(!standby.exists());
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
     fn begin_update_invalidates_directly_patched_output_standby_only_for_relinks() {
         fn prepared_state(mode: IncrementalMode, state_dir: PathBuf) -> PreparedState<'static> {
             PreparedState {
@@ -15843,6 +15910,7 @@ mod tests {
                     link_start: None,
                     input_files: Vec::new(),
                 },
+                retained_output_to_restore: None,
                 reusable_inputs: HashSet::new(),
                 previous_sections: HashSet::new(),
                 previous_relocations: Vec::new(),
@@ -21965,6 +22033,19 @@ mod tests {
         assert!(output_content_matches_previous(&content, &path, true).unwrap());
     }
 
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn directly_patched_elf_output_keeps_hash_for_snapshot_restoration() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("output");
+        std::fs::write(&output, b"patched output").unwrap();
+        let args = crate::args::elf::ElfArgs::default();
+
+        let content = directly_patched_output_content_state(&args, &output).unwrap();
+
+        assert_eq!(content.hash, hash_bytes(b"patched output"));
+    }
+
     #[test]
     fn changed_output_snapshot_updates_only_patched_ranges() {
         let dir = tempfile::tempdir().unwrap();
@@ -22033,6 +22114,30 @@ mod tests {
                 .unwrap()
                 .contains("restored missing output from retained snapshot")
         );
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn preloading_does_not_restore_deleted_output_before_changed_input_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out");
+        let input = dir.path().join("input.o");
+        std::fs::write(&output, b"output").unwrap();
+        std::fs::write(&input, b"input").unwrap();
+
+        let mut args = crate::args::elf::ElfArgs::default();
+        args.common.incremental = true;
+        args.output = Arc::from(output.as_path());
+        let state_dir = state_dir_for_output(&output);
+        let mut state = publishing_metadata_state(&args, &output, &input);
+        state.output = FileContentState::from_path(&output).unwrap();
+        state.write(&state_dir).unwrap();
+        install_output_snapshot(&state_dir, &output).unwrap();
+        std::fs::remove_file(&output).unwrap();
+        std::fs::write(&input, b"changed").unwrap();
+
+        assert!(!maybe_reuse_output_before_loading(&args).unwrap());
+        assert!(!output.exists());
     }
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
@@ -22117,7 +22222,7 @@ mod tests {
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
-    fn loaded_classification_restores_deleted_output_after_input_argument_change() {
+    fn loaded_classification_defers_deleted_output_restore_after_input_argument_change() {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("out");
         let input = dir.path().join("input.o");
@@ -22144,10 +22249,9 @@ mod tests {
             link_options_hash(&current_args)
         );
         assert!(
-            restore_missing_output_for_loaded_classification(&current_args, &state_dir, &state)
-                .unwrap()
+            retained_output_snapshot_matches_previous(&state_dir, &state.output, &output).unwrap()
         );
-        assert_eq!(std::fs::read(&output).unwrap(), b"output");
+        assert!(!output.exists());
     }
 
     #[test]
@@ -22206,6 +22310,61 @@ mod tests {
         ensure_loaded_input_content_hash(&bytes, &mut content);
 
         assert_eq!(content, FileContentState::from_path(&path).unwrap());
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn stable_identity_read_selects_universal_macho_arm64_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("input.a");
+        let payload = b"arm64 payload";
+        let bytes = universal_macho_arm64_input(payload);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let (selected, content) = read_file_with_stable_identity(&path).unwrap().unwrap();
+
+        assert_eq!(selected, payload);
+        assert_eq!(content, FileContentState::from_path(&path).unwrap());
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn verified_snapshot_selects_universal_macho_arm64_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("out.incr");
+        let path = dir.path().join("input.a");
+        let payload = b"arm64 payload";
+        let bytes = universal_macho_arm64_input(payload);
+        std::fs::write(&path, &bytes).unwrap();
+        snapshot_input_paths(&state_dir, [path.as_path()]).unwrap();
+        let input = FileState {
+            path: encode_path(&path),
+            content: FileContentState::from_path(&path).unwrap(),
+            snapshot_identity: None,
+            patch: None,
+        };
+
+        assert_eq!(
+            read_verified_input_snapshot(&state_dir, &input)
+                .unwrap()
+                .unwrap(),
+            payload
+        );
+    }
+
+    fn universal_macho_arm64_input(payload: &[u8]) -> Vec<u8> {
+        const PAYLOAD_OFFSET: usize = 0x100;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&object::macho::FAT_MAGIC.to_be_bytes());
+        bytes.extend_from_slice(&1_u32.to_be_bytes());
+        bytes.extend_from_slice(&(object::macho::CPU_TYPE_ARM64 as u32).to_be_bytes());
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        bytes.extend_from_slice(&(PAYLOAD_OFFSET as u32).to_be_bytes());
+        bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        bytes.resize(PAYLOAD_OFFSET, 0);
+        bytes.extend_from_slice(payload);
+        bytes
     }
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
@@ -22549,6 +22708,28 @@ mod tests {
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
     #[test]
+    fn classifies_missing_output_from_matching_retained_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out");
+        let previous = state("args", b"output", &[("a.o", b"a")]);
+        let current = CurrentState {
+            state_dir: dir.path().join("out.incr"),
+            args_hash: "args".to_owned(),
+            link_options_hash: "args".to_owned(),
+            input_order_hash: previous.input_order_hash.clone().unwrap(),
+            sld_version: "sld-test".to_owned(),
+            link_start: None,
+            input_files: previous.input_files.clone(),
+        };
+
+        assert_eq!(
+            classify_incremental_mode_with_output_policy(&output, &current, &previous, false, true,),
+            IncrementalMode::Reuse
+        );
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
     fn replaced_hashless_output_forces_initial_link() {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("out");
@@ -22577,7 +22758,7 @@ mod tests {
             } if reason == "output file changed since previous link"
         ));
         assert!(matches!(
-            classify_incremental_mode_with_output_policy(&output, &current, &previous, true),
+            classify_incremental_mode_with_output_policy(&output, &current, &previous, true, false),
             IncrementalMode::Relink {
                 reason,
                 can_reuse_unchanged_sections: false,
@@ -23088,6 +23269,7 @@ mod tests {
                 link_start: None,
                 input_files: Vec::new(),
             },
+            retained_output_to_restore: None,
             reusable_inputs: [encode_path(Path::new("a.o"))].into_iter().collect(),
             previous_sections: [record].into_iter().collect(),
             previous_relocations: Vec::new(),
@@ -23130,6 +23312,7 @@ mod tests {
                 link_start: None,
                 input_files: Vec::new(),
             },
+            retained_output_to_restore: None,
             reusable_inputs: HashSet::new(),
             previous_sections: HashSet::new(),
             previous_relocations: Vec::new(),
@@ -23164,6 +23347,7 @@ mod tests {
                 link_start: None,
                 input_files: Vec::new(),
             },
+            retained_output_to_restore: None,
             reusable_inputs: HashSet::new(),
             previous_sections: HashSet::new(),
             previous_relocations: Vec::new(),
@@ -23213,6 +23397,7 @@ mod tests {
                 link_start: None,
                 input_files: Vec::new(),
             },
+            retained_output_to_restore: None,
             reusable_inputs: HashSet::new(),
             previous_sections: HashSet::new(),
             previous_relocations: Vec::new(),
@@ -23279,6 +23464,7 @@ mod tests {
                 link_start: None,
                 input_files: Vec::new(),
             },
+            retained_output_to_restore: None,
             reusable_inputs: HashSet::new(),
             previous_sections: HashSet::new(),
             previous_relocations: Vec::new(),
@@ -23420,6 +23606,7 @@ mod tests {
                 link_start: None,
                 input_files: Vec::new(),
             },
+            retained_output_to_restore: None,
             reusable_inputs: HashSet::new(),
             previous_sections: HashSet::new(),
             previous_relocations: Vec::new(),
