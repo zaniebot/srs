@@ -37,7 +37,6 @@ fn disable_incr_cache() -> bool {
 struct ModuleCodegenResult {
     module_regular: CompiledModule,
     module_global_asm: Option<CompiledModule>,
-    existing_work_product: Option<(WorkProductId, WorkProduct)>,
 }
 
 enum OngoingModuleCodegen {
@@ -80,42 +79,38 @@ impl OngoingCodegen {
                 Ok(module_codegen_result) => module_codegen_result,
                 Err(err) => sess.dcx().fatal(err),
             };
-            let ModuleCodegenResult {
-                mut module_regular,
-                module_global_asm,
-                existing_work_product,
-            } =
+            let ModuleCodegenResult { mut module_regular, module_global_asm } =
                 module_codegen_result;
 
-            if let Some((work_product_id, work_product)) = existing_work_product {
-                work_products.insert(work_product_id, work_product);
+            let work_product = if disable_incr_cache {
+                None
+            } else if let Some(module_global_asm) = &module_global_asm {
+                rustc_incremental::copy_cgu_workproduct_to_incr_comp_cache_dir(
+                    sess,
+                    &module_regular.name,
+                    &[
+                        ("o", module_regular.object.as_ref().unwrap()),
+                        ("asm.o", module_global_asm.object.as_ref().unwrap()),
+                    ],
+                    &[
+                        module_regular.links_from_incr_cache.as_slice(),
+                        module_global_asm.links_from_incr_cache.as_slice(),
+                    ]
+                    .concat(),
+                    module_regular.object_digest.as_deref(),
+                )
             } else {
-                let work_product = if disable_incr_cache {
-                    None
-                } else if let Some(module_global_asm) = &module_global_asm {
-                    rustc_incremental::copy_cgu_workproduct_to_incr_comp_cache_dir(
-                        sess,
-                        &module_regular.name,
-                        &[
-                            ("o", module_regular.object.as_ref().unwrap()),
-                            ("asm.o", module_global_asm.object.as_ref().unwrap()),
-                        ],
-                        &[],
-                        None,
-                    )
-                } else {
-                    rustc_incremental::copy_cgu_workproduct_to_incr_comp_cache_dir(
-                        sess,
-                        &module_regular.name,
-                        &[("o", module_regular.object.as_ref().unwrap())],
-                        &[],
-                        None,
-                    )
-                };
-                if let Some((work_product_id, work_product, object_digest)) = work_product {
-                    module_regular.object_digest = object_digest;
-                    work_products.insert(work_product_id, work_product);
-                }
+                rustc_incremental::copy_cgu_workproduct_to_incr_comp_cache_dir(
+                    sess,
+                    &module_regular.name,
+                    &[("o", module_regular.object.as_ref().unwrap())],
+                    &module_regular.links_from_incr_cache,
+                    module_regular.object_digest.as_deref(),
+                )
+            };
+            if let Some((work_product_id, work_product, object_digest)) = work_product {
+                module_regular.object_digest = object_digest;
+                work_products.insert(work_product_id, work_product);
             }
 
             modules.push(module_regular);
@@ -192,7 +187,6 @@ fn emit_cgu(
             links_from_incr_cache: Vec::new(),
             object_digest: None,
         }),
-        existing_work_product: None,
     })
 }
 
@@ -317,7 +311,6 @@ fn reuse_workproduct_for_cgu(
             links_from_incr_cache: vec![source_file],
             object_digest: None,
         }),
-        existing_work_product: Some((cgu.work_product_id(), work_product)),
     })
 }
 
