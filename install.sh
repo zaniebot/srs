@@ -144,7 +144,10 @@ acquire_install_lock() {
         printf 'refusing invalid SRS toolchain snapshot lock file at %s\n' "$lock_file" >&2
         return 1
     fi
-    exec 9> "$lock_file"
+    if ! exec 9> "$lock_file"; then
+        printf 'failed to open SRS toolchain snapshot lock file at %s\n' "$lock_file" >&2
+        return 1
+    fi
     case "$(uname -s)" in
         Darwin)
             if ! command -v lockf >/dev/null 2>&1; then
@@ -174,7 +177,10 @@ acquire_install_lock() {
     if ! recover_stale_install; then
         return 1
     fi
-    transaction_tmp="$(mktemp -d "$install_root_physical/.${name}.transaction.XXXXXX")"
+    if ! transaction_tmp="$(mktemp -d "$install_root_physical/.${name}.transaction.XXXXXX")"; then
+        printf 'failed to create SRS toolchain snapshot transaction under %s\n' "$install_root_physical" >&2
+        return 1
+    fi
     if ! printf 'preparing\n' > "$transaction_tmp/phase"; then
         rm -rf "$transaction_tmp"
         return 1

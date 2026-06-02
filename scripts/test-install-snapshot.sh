@@ -232,6 +232,54 @@ if [[ "$(cat "$lock_sentinel")" != "lock sentinel" ]]; then
 fi
 rm "$lock_file"
 
+read_only_install_root="$scratch/read-only-install-root"
+mkdir "$read_only_install_root"
+chmod a-w "$read_only_install_root"
+if [[ ! -w "$read_only_install_root" ]]; then
+    if env \
+        SRS_INSTALL_ROOT="$read_only_install_root" \
+        SRS_RUSTUP_BIN="$rustup_bin" \
+        SRS_SLD_BIN="$sld_bin" \
+        SRS_TEST_RUSTUP_LINKS="$rustup_links" \
+        "$root/install.sh" srs-read-only-root "$toolchain_dir" "$cargo_bin" > "$scratch/read-only-root.log" 2>&1
+    then
+        printf 'installer unexpectedly accepted an unwritable snapshot root\n' >&2
+        exit 1
+    fi
+    if ! grep -q 'failed to open SRS toolchain snapshot lock file' "$scratch/read-only-root.log"; then
+        printf 'installer did not explain the unwritable snapshot-root refusal\n' >&2
+        exit 1
+    fi
+fi
+chmod u+w "$read_only_install_root"
+
+failing_mktemp_bin="$scratch/failing-mktemp-bin"
+mkdir "$failing_mktemp_bin"
+cat > "$failing_mktemp_bin/mktemp" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+chmod +x "$failing_mktemp_bin/mktemp"
+if env \
+    PATH="$failing_mktemp_bin:$PATH" \
+    SRS_INSTALL_ROOT="$install_root" \
+    SRS_RUSTUP_BIN="$rustup_bin" \
+    SRS_SLD_BIN="$sld_bin" \
+    SRS_TEST_RUSTUP_LINKS="$rustup_links" \
+    "$root/install.sh" srs-mktemp-failure "$toolchain_dir" "$cargo_bin" > "$scratch/mktemp-failure.log" 2>&1
+then
+    printf 'installer unexpectedly accepted a failed transaction-directory creation\n' >&2
+    exit 1
+fi
+if ! grep -q 'failed to create SRS toolchain snapshot transaction' "$scratch/mktemp-failure.log"; then
+    printf 'installer did not explain the failed transaction-directory creation\n' >&2
+    exit 1
+fi
+if [[ -e "$physical_install_root/.srs-mktemp-failure.transaction" || -L "$physical_install_root/.srs-mktemp-failure.transaction" ]]; then
+    printf 'installer left transaction metadata after failed transaction-directory creation\n' >&2
+    exit 1
+fi
+
 transaction_sentinel="$scratch/transaction-sentinel"
 mkdir "$transaction_sentinel"
 ln -s "$transaction_sentinel" "$transaction_dir"
