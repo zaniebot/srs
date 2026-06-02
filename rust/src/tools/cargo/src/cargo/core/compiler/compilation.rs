@@ -455,6 +455,7 @@ impl<'gctx> Compilation<'gctx> {
         apply_env_config(self.gctx, &mut cmd)?;
         if self.gctx.cli_unstable().sld_native_incremental
             && super::sld_native_incremental_supported(&self.host)
+            && !matches!(tool_kind, ToolKind::Rustc | ToolKind::TargetProcess)
         {
             super::remove_sld_native_incremental_env(&mut cmd);
         }
