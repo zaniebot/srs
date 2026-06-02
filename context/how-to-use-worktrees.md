@@ -196,14 +196,19 @@ Then remove the completed task worktree from the canonical checkout:
 ```bash
 NAME=srs-<task-slug>
 SNAPSHOT_ROOT="${SRS_INSTALL_ROOT:-$HOME/code/tmp/srs-toolchains}"
-rustup toolchain uninstall "$NAME"
-rm -rf -- "$SNAPSHOT_ROOT/$NAME"
-git -C "$SRS" worktree remove "$WT"
-git -C "$SRS" worktree prune
+SNAPSHOT_ROOT="$(cd -P "$SNAPSHOT_ROOT" && pwd)"
+RUSTUP_HOME="$(rustup show home)"
+SNAPSHOT="$(readlink "$RUSTUP_HOME/toolchains/$NAME")"
+test "$SNAPSHOT" = "$SNAPSHOT_ROOT/$NAME" &&
+    rustup toolchain uninstall "$NAME" &&
+    rm -rf -- "$SNAPSHOT" &&
+    git -C "$SRS" worktree remove "$WT" &&
+    git -C "$SRS" worktree prune
 ```
 
-Uninstalling the custom rustup toolchain removes its rustup link. Remove the
-snapshot separately because it lives outside the task worktree.
+Capture and validate the installed snapshot's physical path before uninstalling
+the custom rustup toolchain, which removes its rustup link. Remove the snapshot
+separately because it lives outside the task worktree.
 
 Do not use force removal on a task worktree containing unpreserved changes or
 results.
