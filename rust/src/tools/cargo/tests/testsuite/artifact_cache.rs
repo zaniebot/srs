@@ -378,6 +378,28 @@ fn runtime_cranelift_gnu_as_request_is_not_cacheable() {
 }
 
 #[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
+fn inherited_gcc_backend_control_is_not_cacheable() {
+    let cache = paths::root().join("shared-cache");
+    let project = project_with_cache("project", &cache, "hardlink", 42);
+    let target = project.root().join("target-dir");
+
+    project
+        .cargo("-Zartifact-cache build --lib")
+        .arg("--target-dir")
+        .arg(&target)
+        .masquerade_as_nightly_cargo(&["artifact-cache"])
+        .env(
+            cargo_util::paths::dylib_path_envvar(),
+            isolated_loader_path(),
+        )
+        .env("CARGO_INCREMENTAL", "1")
+        .env("CG_GCCJIT_DUMP_TO_FILE", "1")
+        .run();
+
+    assert!(cached_rlibs(&cache).is_empty());
+}
+
+#[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
 fn rustc_forced_version_inputs_are_not_cacheable() {
     let cache = paths::root().join("shared-cache");
     let project = project_with_cache("project", &cache, "hardlink", 42);
