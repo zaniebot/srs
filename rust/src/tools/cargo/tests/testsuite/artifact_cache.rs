@@ -1752,6 +1752,43 @@ fn changed_loader_input_after_materialization_forces_compile() {
 
 #[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
 #[cfg(unix)]
+fn stale_compiler_identity_after_materialization_forces_compile() {
+    use std::os::unix::fs::MetadataExt;
+
+    let cache = paths::root().join("shared-cache");
+    let project = project_with_cache("project", &cache, "hardlink", 42);
+    let producer_target = project.root().join("producer-target");
+    let consumer_target = project.root().join("consumer-target");
+
+    build_in_target(&project, &producer_target);
+    let stored = cached_rlib(&cache);
+
+    project
+        .cargo("-Zartifact-cache build --lib")
+        .arg("--target-dir")
+        .arg(&consumer_target)
+        .masquerade_as_nightly_cargo(&["artifact-cache"])
+        .env(
+            cargo_util::paths::dylib_path_envvar(),
+            isolated_loader_path(),
+        )
+        .env("CARGO_INCREMENTAL", "1")
+        .env(
+            "__CARGO_TEST_ARTIFACT_CACHE_RESTORE_MATERIALIZED_STALE_IDENTITY",
+            "1",
+        )
+        .run();
+
+    let consumer = cached_rlib(&consumer_target.join("debug").join("deps"));
+    assert_ne!(
+        fs::metadata(&stored).unwrap().ino(),
+        fs::metadata(&consumer).unwrap().ino()
+    );
+    assert_eq!(cached_rlibs(&cache).len(), 1);
+}
+
+#[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
+#[cfg(unix)]
 fn corrupt_cache_entry_is_removed_and_rebuilt() {
     use std::os::unix::fs::MetadataExt;
 
