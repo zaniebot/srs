@@ -28,7 +28,10 @@ Cargo detaches restored hardlinks before rebuilding them, including when the
 cache feature is later disabled. Tools outside Cargo must not overwrite
 restored `.rlib` or `.rmeta` files in place: in hardlink mode, those files
 share storage with the central cache. Use copy materialization for workflows
-that mutate build artifacts after compilation.
+that mutate build artifacts after compilation. Changing the cache setting does
+not eagerly detach already-fresh outputs. Clean the target directory or force a
+rebuild before allowing an external tool to mutate artifacts previously
+restored by hardlink.
 
 ## Cache Admission
 
@@ -89,6 +92,9 @@ are not published. Aborted publications are cleaned during later cache
 publication activity. The configured cap counts logical bytes reachable under
 completed entries; it is not a bound on physical blocks or a guarantee that
 eviction immediately reclaims storage while target-directory hardlinks remain.
+`cargo clean` removes target-directory links but leaves the central cache
+intact. To reclaim central-cache storage manually, remove the cache root only
+while no Cargo process is using it.
 
 Concurrent restores use shared cache locks. Publication, cleanup, and eviction
 use an exclusive cache lock. When the filesystem does not provide reliable
@@ -115,7 +121,8 @@ setting is present, Cargo's normal `hardlink` default applies and a TOML
 `artifact-cache-materialization` setting remains effective.
 
 Set `SRS_CARGO_ARTIFACT_CACHE_MAX_SIZE` to a human-readable cache limit such as
-`100GiB`. The cache is unbounded when this variable is unset.
+`100GiB`. The cache is unbounded when neither this alias, the lower-level
+environment setting, nor a TOML `artifact-cache-max-size` setting is present.
 
 The lower-level `CARGO_BUILD_ARTIFACT_CACHE_DIR`,
 `CARGO_BUILD_ARTIFACT_CACHE_MATERIALIZATION`, and
@@ -128,6 +135,6 @@ another writer with access to that directory.
 
 Set `CARGO_LOG=cargo::core::compiler=debug` when diagnosing cache admission,
 restoration, or publication. When switching an existing target directory from
-hardlink to copy mode, run one Cargo build with the new setting before allowing
-external tools to mutate artifacts so Cargo can detach or rematerialize prior
-links.
+hardlink to copy mode or disabling the cache, clean that target directory or
+force a rebuild before allowing external tools to mutate artifacts previously
+restored by hardlink.
