@@ -3016,7 +3016,13 @@ fn reconcile_rlib_cache_size(
     retained_entry: Option<&Path>,
 ) -> CargoResult<u64> {
     cleanup_abandoned_rlib_cache_transients(cache_root);
-    let size = prune_rlib_cache_entries(cache_root, max_size, retained_entry)?;
+    let size = match prune_rlib_cache_entries(cache_root, max_size, retained_entry) {
+        Ok(size) => size,
+        Err(error) => {
+            mark_rlib_cache_size_dirty(cache_root)?;
+            return Err(error);
+        }
+    };
     write_rlib_cache_size(cache_root, size)?;
     Ok(size)
 }
@@ -3061,6 +3067,17 @@ fn prune_rlib_cache_entries(
     cache_root: &Path,
     max_size: Option<u64>,
     retained_entry: Option<&Path>,
+) -> CargoResult<u64> {
+    prune_rlib_cache_entries_with(cache_root, max_size, retained_entry, |path| {
+        paths::remove_dir_all(path)
+    })
+}
+
+fn prune_rlib_cache_entries_with(
+    cache_root: &Path,
+    max_size: Option<u64>,
+    retained_entry: Option<&Path>,
+    mut remove_entry: impl FnMut(&Path) -> CargoResult<()>,
 ) -> CargoResult<u64> {
     let entry_roots = fs::read_dir(cache_root)?;
     let mut completed = Vec::new();
@@ -3120,12 +3137,15 @@ fn prune_rlib_cache_entries(
         if retained_entry.is_some_and(|retained_entry| path == retained_entry) {
             continue;
         }
-        if paths::remove_dir_all(&path).is_ok() {
+        if remove_entry(&path).is_ok() {
             total_size = total_size.saturating_sub(size);
             if let Some(parent) = path.parent() {
                 let _ = fs::remove_dir(parent);
             }
         }
+    }
+    if total_size > max_size {
+        anyhow::bail!("failed to evict artifact cache entries below configured limit");
     }
     Ok(total_size)
 }
@@ -3136,13 +3156,34 @@ fn rlib_cache_size_within_limit(size: u64, max_size: Option<u64>) -> bool {
 
 #[cfg(test)]
 mod artifact_cache_size_tests {
-    use super::{artifact_cache_entry_size, hash_path_tree, rlib_cache_size_within_limit};
+    use super::{
+        artifact_cache_entry_size, hash_path_tree, prune_rlib_cache_entries_with,
+        rlib_cache_size_within_limit,
+    };
 
     #[test]
     fn unconfigured_size_limit_is_unbounded() {
         assert!(rlib_cache_size_within_limit(u64::MAX, None));
         assert!(rlib_cache_size_within_limit(10, Some(10)));
         assert!(!rlib_cache_size_within_limit(11, Some(10)));
+    }
+
+    #[test]
+    fn eviction_failure_does_not_report_oversized_cache_as_reconciled() {
+        let temp = tempfile::tempdir().unwrap();
+        let entry = temp.path().join("action").join("entry");
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("complete"), b"complete").unwrap();
+
+        let error = prune_rlib_cache_entries_with(temp.path(), Some(0), None, |_| {
+            anyhow::bail!("injected removal failure")
+        })
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("failed to evict artifact cache entries")
+        );
     }
 
     #[test]
