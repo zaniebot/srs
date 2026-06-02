@@ -6,6 +6,7 @@
 //#TestIncremental:true
 //#TestIncrementalPrivateSignedMachOOutput:true
 //#TestIncrementalChanged:true
+//#TestIncrementalChangedImmediately:true
 //#TestIncrementalChangedInput:incremental-signed-private-rlib-value.rs.rlib
 //#TestIncrementalChangedSection:__data
 //#TestIncrementalChangedRun:true

@@ -3560,6 +3560,27 @@ fn directly_patched_output_standby_state_path(state_dir: &Path) -> PathBuf {
     state_dir.join(DIRECT_PATCH_STANDBY_STATE_FILE)
 }
 
+fn invalidate_directly_patched_output_standby(state_dir: &Path) -> Result {
+    for path in [
+        directly_patched_output_standby_state_path(state_dir),
+        directly_patched_output_standby_path(state_dir),
+    ] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Failed to remove directly patched output standby `{}`",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 fn read_directly_patched_output_standby_ranges(
     output: &Path,
     standby: &Path,
@@ -4084,6 +4105,9 @@ impl<'data> PreparedState<'data> {
             return Ok(None);
         }
         let lock = acquire_incremental_state_lock(&self.current.state_dir)?;
+        if matches!(self.mode, IncrementalMode::Relink { .. }) {
+            invalidate_directly_patched_output_standby(&self.current.state_dir)?;
+        }
         if !self.can_publish_in_background() {
             remove_incremental_index(&self.current.state_dir)?;
         }
@@ -15802,6 +15826,78 @@ mod tests {
 
         let fallback = DirectlyPatchedOutput::new(&output, &state_dir, true).unwrap();
         assert_eq!(std::fs::read(fallback.path()).unwrap(), b"changed!");
+    }
+
+    #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
+    #[test]
+    fn begin_update_invalidates_directly_patched_output_standby_only_for_relinks() {
+        fn prepared_state(mode: IncrementalMode, state_dir: PathBuf) -> PreparedState<'static> {
+            PreparedState {
+                mode,
+                current: CurrentState {
+                    state_dir,
+                    args_hash: String::new(),
+                    link_options_hash: String::new(),
+                    input_order_hash: String::new(),
+                    sld_version: String::new(),
+                    link_start: None,
+                    input_files: Vec::new(),
+                },
+                reusable_inputs: HashSet::new(),
+                previous_sections: HashSet::new(),
+                previous_relocations: Vec::new(),
+                previous_fdes: Vec::new(),
+                previous_dynamic_relocations: Vec::new(),
+                current_sections: RecordBuffers::default(),
+                current_relocations: RecordBuffers::default(),
+                current_fdes: RecordBuffers::default(),
+                current_dynamic_relocations: RecordBuffers::default(),
+                record_texts: RecordTextInterner::default(),
+                reused_sections: AtomicUsize::new(0),
+                prepared_fast_build_id_state: Mutex::new(None),
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let reused_state_dir = dir.path().join("reused.incr");
+        std::fs::create_dir(&reused_state_dir).unwrap();
+        std::fs::write(
+            directly_patched_output_standby_path(&reused_state_dir),
+            b"output",
+        )
+        .unwrap();
+        std::fs::write(
+            directly_patched_output_standby_state_path(&reused_state_dir),
+            b"state",
+        )
+        .unwrap();
+        let reused = prepared_state(IncrementalMode::Reuse, reused_state_dir.clone());
+        drop(reused.begin_update().unwrap());
+        assert!(directly_patched_output_standby_path(&reused_state_dir).exists());
+        assert!(directly_patched_output_standby_state_path(&reused_state_dir).exists());
+
+        let relinked_state_dir = dir.path().join("relinked.incr");
+        std::fs::create_dir(&relinked_state_dir).unwrap();
+        std::fs::write(
+            directly_patched_output_standby_path(&relinked_state_dir),
+            b"output",
+        )
+        .unwrap();
+        std::fs::write(
+            directly_patched_output_standby_state_path(&relinked_state_dir),
+            b"state",
+        )
+        .unwrap();
+        let relinked = prepared_state(
+            IncrementalMode::Relink {
+                reason: "input file changed".to_owned(),
+                can_reuse_unchanged_sections: true,
+            },
+            relinked_state_dir.clone(),
+        );
+        drop(relinked.begin_update().unwrap());
+        assert!(!directly_patched_output_standby_path(&relinked_state_dir).exists());
+        assert!(!directly_patched_output_standby_state_path(&relinked_state_dir).exists());
     }
 
     #[cfg_attr(target_os = "wasi", ignore = "wasi doesn't have a temp dir")]
