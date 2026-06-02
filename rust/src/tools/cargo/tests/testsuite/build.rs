@@ -3,6 +3,8 @@
 use std::env;
 use std::fs;
 use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
 use std::process::Stdio;
 
 use crate::prelude::*;
@@ -6512,8 +6514,8 @@ fn sld_native_incremental_scopes_root_linker_environment() {
                             assert_private_root_output_is_detached(&args);
                             for (variable, value) in [
                                 ("SLD_INCREMENTAL", "1"),
-                                ("SLD_INCREMENTAL_PADDING_PERCENT", "set"),
-                                ("SLD_RUSTC_WORK_PRODUCT_PROVENANCE", "poison"),
+                                ("SLD_INCREMENTAL_PADDING_PERCENT", "configured"),
+                                ("SLD_RUSTC_WORK_PRODUCT_PROVENANCE", "configured"),
                                 ("SLD_STABILIZE_RUSTC_TRANSIENT_INPUTS", "set"),
                                 ("SLD_EXPERIMENT_PRIVATE_PERSISTENT_OUTPUT", "1"),
                             ] {
@@ -6569,12 +6571,21 @@ fn sld_native_incremental_scopes_root_linker_environment() {
         .unwrap();
     fs::remove_file(p.bin("foo")).unwrap();
     fs::hard_link(private_binary, p.bin("foo")).unwrap();
+    fs::create_dir_all(p.root().join(".cargo")).unwrap();
+    fs::write(
+        p.root().join(".cargo/config.toml"),
+        r#"
+            [env]
+            SLD_INCREMENTAL_PADDING_PERCENT = "configured"
+            SLD_RUSTC_WORK_PRODUCT_PROVENANCE = { value = "configured", force = true }
+        "#,
+    )
+    .unwrap();
 
     p.cargo("build -Z sld-native-incremental -Z unstable-options --artifact-dir out")
         .masquerade_as_nightly_cargo(&["sld-native-incremental", "artifact-dir"])
         .env("RUSTC_WRAPPER", wrapper_project.bin("sld-env-wrapper"))
         .env("SLD_INCREMENTAL", "poison")
-        .env("SLD_INCREMENTAL_PADDING_PERCENT", "set")
         .env("SLD_RUSTC_WORK_PRODUCT_PROVENANCE", "poison")
         .env("SLD_RUSTC_WORK_PRODUCT_PROVENANCE_FILE", "poison")
         .env("SLD_STABILIZE_RUSTC_TRANSIENT_INPUTS", "set")
@@ -6582,6 +6593,7 @@ fn sld_native_incremental_scopes_root_linker_environment() {
         .env("SLD_EXPERIMENT_UNSIGNED_PERSISTENT_OUTPUT", "poison")
         .enable_mac_dsym()
         .with_stderr_contains("[COMPILING] bar v0.1.0 ([ROOT]/foo/bar)")
+        .with_stderr_contains("[COMPILING] baz v0.1.0 ([ROOT]/foo/baz)")
         .run();
 
     let private_binary = p
@@ -6596,6 +6608,185 @@ fn sld_native_incremental_scopes_root_linker_environment() {
         );
     }
     assert!(p.target_debug_dir().join("foo.dSYM").is_dir());
+}
+
+#[cargo_test]
+fn sld_native_incremental_preserves_target_process_environment() {
+    if rustc_host() != "aarch64-apple-darwin" {
+        return;
+    }
+
+    let p = project()
+        .file("Cargo.toml", &basic_bin_manifest("foo"))
+        .file(
+            "src/main.rs",
+            r#"
+                fn main() {
+                    assert_eq!(
+                        std::env::var("SLD_INCREMENTAL").as_deref(),
+                        Ok("visible-to-target")
+                    );
+                    assert_eq!(
+                        std::env::var("SLD_INCREMENTAL_PADDING_PERCENT").as_deref(),
+                        Ok("visible-padding")
+                    );
+                }
+            "#,
+        )
+        .build();
+
+    p.cargo("run -Z sld-native-incremental")
+        .masquerade_as_nightly_cargo(&["sld-native-incremental"])
+        .env("SLD_INCREMENTAL", "visible-to-target")
+        .env("SLD_INCREMENTAL_PADDING_PERCENT", "visible-padding")
+        .run();
+}
+
+#[cfg(unix)]
+#[cargo_test]
+fn sld_native_incremental_removes_private_root_output_symlinks() {
+    if rustc_host() != "aarch64-apple-darwin" {
+        return;
+    }
+
+    let p = project()
+        .file("Cargo.toml", &basic_bin_manifest("foo"))
+        .file("src/main.rs", "fn main() {}")
+        .build();
+    let wrapper_project = project()
+        .at("sld-symlink-wrapper")
+        .file("Cargo.toml", &basic_bin_manifest("sld-symlink-wrapper"))
+        .file(
+            "src/main.rs",
+            r#"
+                use std::path::Path;
+
+                fn main() {
+                    let args: Vec<_> = std::env::args().collect();
+                    let crate_name = args
+                        .windows(2)
+                        .find(|args| args[0] == "--crate-name")
+                        .map(|args| args[1].as_str());
+                    if crate_name == Some("foo") {
+                        let out_dir = args
+                            .windows(2)
+                            .find(|args| args[0] == "--out-dir")
+                            .map(|args| args[1].as_str())
+                            .unwrap();
+                        let extra_filename = args
+                            .iter()
+                            .find_map(|arg| arg.strip_prefix("extra-filename="))
+                            .unwrap();
+                        let private_binary =
+                            Path::new(out_dir).join(format!("foo{extra_filename}"));
+                        assert!(
+                            std::fs::symlink_metadata(private_binary).is_err(),
+                            "Cargo must remove a private-output symlink before invoking rustc"
+                        );
+                    }
+                    let status = std::process::Command::new(&args[1])
+                        .args(&args[2..])
+                        .status()
+                        .unwrap();
+                    std::process::exit(status.code().unwrap_or(1));
+                }
+            "#,
+        )
+        .build();
+    wrapper_project.cargo("build").run();
+
+    p.cargo("build").run();
+    let private_binary = p
+        .glob("target/debug/deps/foo-*")
+        .filter_map(Result::ok)
+        .find(|path| path.is_file() && path.extension().is_none())
+        .unwrap();
+    let victim = p.root().join("victim");
+    fs::write(&victim, "untouched").unwrap();
+    fs::remove_file(&private_binary).unwrap();
+    symlink(&victim, &private_binary).unwrap();
+
+    p.cargo("build -Z sld-native-incremental")
+        .masquerade_as_nightly_cargo(&["sld-native-incremental"])
+        .env("RUSTC_WRAPPER", wrapper_project.bin("sld-symlink-wrapper"))
+        .run();
+    assert_eq!(fs::read_to_string(victim).unwrap(), "untouched");
+}
+
+#[cargo_test]
+fn sld_native_incremental_no_write_reuse_stays_fresh() {
+    if rustc_host() != "aarch64-apple-darwin" {
+        return;
+    }
+
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                bar = { path = "bar" }
+            "#,
+        )
+        .file(
+            "src/main.rs",
+            "fn main() { println!(\"{}\", bar::value()); }",
+        )
+        .file("bar/Cargo.toml", &basic_manifest("bar", "0.1.0"))
+        .file("bar/src/lib.rs", "pub fn value() -> u8 { 42 }")
+        .build();
+    let wrapper_project = project()
+        .at("sld-no-write-wrapper")
+        .file("Cargo.toml", &basic_bin_manifest("sld-no-write-wrapper"))
+        .file(
+            "src/main.rs",
+            r#"
+                fn main() {
+                    let args: Vec<_> = std::env::args().collect();
+                    let crate_name = args
+                        .windows(2)
+                        .find(|args| args[0] == "--crate-name")
+                        .map(|args| args[1].as_str());
+                    if crate_name == Some("foo") {
+                        assert!(
+                            std::env::var_os("SLD_TEST_PANIC_IF_ROOT_RUSTC").is_none(),
+                            "retained root output should remain fresh after successful reuse"
+                        );
+                        if std::env::var_os("SLD_TEST_SKIP_ROOT_RUSTC").is_some() {
+                            return;
+                        }
+                    }
+                    let status = std::process::Command::new(&args[1])
+                        .args(&args[2..])
+                        .status()
+                        .unwrap();
+                    std::process::exit(status.code().unwrap_or(1));
+                }
+            "#,
+        )
+        .build();
+    wrapper_project.cargo("build").run();
+
+    let cargo = || {
+        let mut cargo = p.cargo("build -Z sld-native-incremental");
+        cargo
+            .masquerade_as_nightly_cargo(&["sld-native-incremental"])
+            .env("RUSTC_WRAPPER", wrapper_project.bin("sld-no-write-wrapper"));
+        cargo
+    };
+    cargo().run();
+
+    sleep_ms(1000);
+    p.change_file("bar/src/lib.rs", "pub fn value() -> u8 { 43 }");
+    cargo().env("SLD_TEST_SKIP_ROOT_RUSTC", "1").run();
+    cargo()
+        .env("SLD_TEST_PANIC_IF_ROOT_RUSTC", "1")
+        .with_stderr_does_not_contain("[COMPILING] foo v0.1.0 ([ROOT]/foo)")
+        .run();
 }
 
 #[cargo_test]
@@ -6617,6 +6808,34 @@ fn sld_native_incremental_warns_on_unsupported_host() {
 [FINISHED] `dev` profile [unoptimized + debuginfo] target(s) in [ELAPSED]s
 
 "#]])
+        .run();
+}
+
+#[cargo_test]
+fn sld_native_incremental_warns_only_for_unsupported_targets() {
+    if rustc_host() != "aarch64-apple-darwin" {
+        return;
+    }
+
+    let p = project()
+        .file("Cargo.toml", &basic_bin_manifest("foo"))
+        .file("src/main.rs", "fn main() {}")
+        .build();
+
+    p.cargo("build -Z sld-native-incremental")
+        .arg("--target")
+        .arg("aarch64-apple-darwin")
+        .arg("--target")
+        .arg("x86_64-apple-darwin")
+        .masquerade_as_nightly_cargo(&["sld-native-incremental"])
+        .with_stderr_contains(
+            "[WARNING] `-Z sld-native-incremental` is only enabled for \
+             [HOST_TARGET] targets; unsupported targets are ignored",
+        )
+        .with_stderr_does_not_contain(
+            "[WARNING] `-Z sld-native-incremental` is ignored because [..]",
+        )
+        .without_status()
         .run();
 }
 
