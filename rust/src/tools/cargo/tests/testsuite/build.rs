@@ -6766,6 +6766,55 @@ fn sld_native_incremental_removes_private_root_output_symlinks() {
     assert!(!dangling_victim.exists());
 }
 
+#[cfg(unix)]
+#[cargo_test]
+fn sld_native_incremental_removes_private_sbom_symlinks() {
+    if rustc_host() != "aarch64-apple-darwin" {
+        return;
+    }
+
+    let p = project()
+        .file("Cargo.toml", &basic_bin_manifest("foo"))
+        .file("src/main.rs", "fn main() {}")
+        .build();
+    let cargo = || {
+        let mut cargo = p.cargo("build -Z sld-native-incremental -Z sbom");
+        cargo
+            .env("CARGO_BUILD_SBOM", "true")
+            .masquerade_as_nightly_cargo(&["sld-native-incremental", "sbom"]);
+        cargo
+    };
+    let append_sbom_suffix = |path: &std::path::Path| {
+        let mut path = path.as_os_str().to_owned();
+        path.push(".cargo-sbom.json");
+        std::path::PathBuf::from(path)
+    };
+
+    cargo().run();
+    let private_binary = p
+        .glob("target/debug/deps/foo-*")
+        .filter_map(Result::ok)
+        .find(|path| path.is_file() && path.extension().is_none())
+        .unwrap();
+    let private_sbom = append_sbom_suffix(&private_binary);
+    let victim = p.root().join("victim");
+    fs::write(&victim, "untouched").unwrap();
+    fs::remove_file(&private_sbom).unwrap();
+    symlink(&victim, &private_sbom).unwrap();
+
+    p.change_file("src/main.rs", "fn main() { println!(\"rebuilt\"); }");
+    cargo().run();
+
+    assert_eq!(fs::read_to_string(victim).unwrap(), "untouched");
+    assert!(private_sbom.is_file());
+    assert!(
+        !fs::symlink_metadata(private_sbom)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+}
+
 #[cargo_test]
 fn sld_native_incremental_no_write_reuse_stays_fresh() {
     if rustc_host() != "aarch64-apple-darwin" {
