@@ -685,9 +685,10 @@ mod artifact_cache_identity_tests {
             FileTime::from_last_modification_time(&std::fs::metadata(&lib).unwrap());
         let first = artifact_cache_identity_for_program(&rustc).unwrap();
 
-        std::fs::remove_file(&driver).unwrap();
-        std::fs::write(&driver, b"other driver").unwrap();
-        filetime::set_file_times(&driver, driver_timestamp, driver_timestamp).unwrap();
+        let replacement_driver = lib.join("replacement-librustc_driver.dylib");
+        std::fs::write(&replacement_driver, b"other driver").unwrap();
+        filetime::set_file_times(&replacement_driver, driver_timestamp, driver_timestamp).unwrap();
+        std::fs::rename(&replacement_driver, &driver).unwrap();
         filetime::set_file_times(&lib, lib_timestamp, lib_timestamp).unwrap();
         let second = artifact_cache_identity_for_program(&rustc).unwrap();
 
