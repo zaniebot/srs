@@ -260,7 +260,16 @@ impl Rustc {
                     .as_ref()
                     .is_some_and(|proxy| same_file::is_same_file(&program, proxy).unwrap_or(false));
                 if !is_rustup_proxy {
-                    return None;
+                    let mut sysroot = ProcessBuilder::new(&path)
+                        .wrapped(workspace_wrapper.as_ref())
+                        .wrapped(wrapper.as_deref());
+                    apply_env_config(gctx, &mut sysroot).ok()?;
+                    sysroot.env(crate::CARGO_ENV, gctx.cargo_exe().ok()?);
+                    sysroot.arg("--print").arg("sysroot");
+                    let reported = cache.cached_output(&sysroot, 0).ok()?.0;
+                    let reported = std::fs::canonicalize(reported.trim()).ok()?;
+                    let adjacent = std::fs::canonicalize(program.parent()?.parent()?).ok()?;
+                    return (reported == adjacent).then_some(program);
                 }
                 let rustup_home = home::rustup_home().ok()?;
                 let rustup_toolchain = gctx.get_env_os("RUSTUP_TOOLCHAIN")?;
