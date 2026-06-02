@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$(uname -s)" != "Darwin" || "$(uname -m)" != "arm64" ]]; then
+    printf 'cargo +srs native incremental replay skipped: requires macOS arm64\n'
+    exit 0
+fi
+
+scratch_root="${SRS_TEST_TMPDIR:-$HOME/code/tmp}"
+toolchain="${SRS_TEST_TOOLCHAIN:-srs}"
+mkdir -p "$scratch_root"
+scratch="$(mktemp -d "$scratch_root/srs-native-incremental.XXXXXX")"
+trap 'rm -rf "$scratch"' EXIT
+
+mkdir -p "$scratch/src" "$scratch/replay-lib/src"
+cat > "$scratch/Cargo.toml" <<'EOF'
+[package]
+name = "srs-native-incremental-replay"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+replay-lib = { path = "replay-lib" }
+EOF
+cat > "$scratch/src/main.rs" <<'EOF'
+fn main() {
+    println!("{}", replay_lib::value());
+}
+EOF
+cat > "$scratch/replay-lib/Cargo.toml" <<'EOF'
+[package]
+name = "replay-lib"
+version = "0.1.0"
+edition = "2021"
+EOF
+cat > "$scratch/replay-lib/src/lib.rs" <<'EOF'
+pub static VALUE: i32 = 41;
+
+pub fn value() -> i32 {
+    VALUE
+}
+EOF
+
+target_dir="$scratch/target"
+binary="$target_dir/debug/srs-native-incremental-replay"
+
+CARGO_TARGET_DIR="$target_dir" cargo +"$toolchain" build --manifest-path "$scratch/Cargo.toml"
+if [[ "$("$binary")" != "41" ]]; then
+    printf 'seed cargo +%s binary did not print 41\n' "$toolchain" >&2
+    exit 1
+fi
+
+shopt -s nullglob
+incremental_logs=("$target_dir"/debug/deps/*.incr/log)
+shopt -u nullglob
+if [[ "${#incremental_logs[@]}" -ne 1 ]]; then
+    printf 'expected one private root SLD incremental log, found %s\n' \
+        "${#incremental_logs[@]}" >&2
+    find "$target_dir" -path '*.incr/log' -print >&2
+    exit 1
+fi
+
+incremental_log="${incremental_logs[0]}"
+log_offset="$(wc -c < "$incremental_log")"
+cat > "$scratch/replay-lib/src/lib.rs" <<'EOF'
+pub static VALUE: i32 = 42;
+
+pub fn value() -> i32 {
+    VALUE
+}
+EOF
+
+CARGO_TARGET_DIR="$target_dir" cargo +"$toolchain" build --manifest-path "$scratch/Cargo.toml"
+if [[ "$("$binary")" != "42" ]]; then
+    printf 'rebuilt cargo +%s binary did not print 42\n' "$toolchain" >&2
+    exit 1
+fi
+
+rebuild_log="$scratch/rebuild.log"
+dd if="$incremental_log" bs=1 skip="$log_offset" 2>/dev/null > "$rebuild_log"
+if ! grep -Fq 'patched 1 changed input file before loading inputs' "$rebuild_log"; then
+    printf 'cargo +%s rebuild did not patch its changed rlib input\n' "$toolchain" >&2
+    cat "$rebuild_log" >&2
+    exit 1
+fi
+if ! grep -Eq 'patched [1-9][0-9]* changed input sections before loading inputs' "$rebuild_log"; then
+    printf 'cargo +%s rebuild did not patch changed input sections\n' "$toolchain" >&2
+    cat "$rebuild_log" >&2
+    exit 1
+fi
+
+printf 'cargo +%s native incremental replay passed\n' "$toolchain"
