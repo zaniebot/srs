@@ -303,7 +303,7 @@ pub fn provide(providers: &mut Providers) {
     providers.queries.global_backend_features = |_tcx: TyCtxt<'_>, ()| vec![];
 }
 
-const RLINK_VERSION: u32 = 1;
+const RLINK_VERSION: u32 = 2;
 const RLINK_MAGIC: &[u8] = b"rustlink";
 
 impl CompiledModules {
