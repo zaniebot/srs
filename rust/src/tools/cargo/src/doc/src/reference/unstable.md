@@ -68,7 +68,7 @@ Each new feature described below should explain how to use it.
     * [Metabuild](#metabuild) --- Provides declarative build scripts.
     * [Multiple Build Scripts](#multiple-build-scripts) --- Allows use of multiple build scripts.
     * [Any Build Script Metadata](#any-build-script-metadata) --- Allow any build script to specify env vars via `cargo::metadata=key=value`
-    * [sld native incremental links](#sld-native-incremental-links) --- Preserve macOS arm64 root executable outputs for incremental relinks.
+    * [sld native incremental links](#sld-native-incremental-links) --- On Apple silicon macOS hosts, preserve macOS arm64 root executable outputs for incremental relinks.
 * Resolver and features
     * [no-index-update](#no-index-update) --- Prevents cargo from updating the index cache.
     * [avoid-dev-deps](#avoid-dev-deps) --- Prevents the resolver from including dev-dependencies during resolution.
@@ -264,6 +264,11 @@ dependencies, rustdoc, and build-script processes.
 This mode assumes root executable links resolve to `sld`; Cargo does not verify
 linker identity. Omit the feature when selecting another linker through target
 configuration, environment rustflags, or `cargo rustc` arguments.
+
+This feature is supported only when Cargo's compiler host is
+`aarch64-apple-darwin`, the Apple silicon macOS host triple. On other compiler
+hosts Cargo currently accepts the flag as a no-op: it does not preserve private
+outputs or scope and forward the `sld` incremental-link environment.
 
 ```console
 cargo +nightly build -Z sld-native-incremental
