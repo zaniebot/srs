@@ -16,6 +16,9 @@ use crate::core::compiler::apply_env_config;
 use crate::util::interning::InternedString;
 use crate::util::{CargoResult, GlobalContext, StableHasher};
 
+const ARTIFACT_CACHE_SAFE_CODEGEN_BACKEND_MARKER: &[u8] =
+    b"rustc-codegen-backend-artifact-cache-safe-v1";
+
 #[derive(Clone, Debug)]
 struct ArtifactCacheIdentity {
     digest: blake3::Hash,
@@ -602,8 +605,15 @@ fn artifact_cache_identity_for_program(path: &Path) -> Option<ArtifactCacheIdent
         hasher.update(&modified.as_secs().to_le_bytes());
         hasher.update(&modified.subsec_nanos().to_le_bytes());
         if is_codegen_backend(&modeled_file) {
+            let contents = std::fs::read(&modeled_file).ok()?;
+            if !contents
+                .windows(ARTIFACT_CACHE_SAFE_CODEGEN_BACKEND_MARKER.len())
+                .any(|window| window == ARTIFACT_CACHE_SAFE_CODEGEN_BACKEND_MARKER)
+            {
+                return None;
+            }
             hasher.update(b"\0sysroot-codegen-backend-content\0");
-            hasher.update(&std::fs::read(&modeled_file).ok()?);
+            hasher.update(&contents);
         }
     }
     let mut witness = artifact_cache_identity_witness_for_sysroot(sysroot)?;
@@ -640,16 +650,46 @@ mod artifact_cache_identity_tests {
         std::fs::create_dir_all(&backends).unwrap();
         std::fs::write(&rustc, b"rustc").unwrap();
         let backend = backends.join("librustc_codegen_cranelift.dylib");
-        std::fs::write(&backend, b"first backend").unwrap();
+        std::fs::write(
+            &backend,
+            b"rustc-codegen-backend-artifact-cache-safe-v1 first backend",
+        )
+        .unwrap();
         let timestamp =
             FileTime::from_last_modification_time(&std::fs::metadata(&backend).unwrap());
         let first = artifact_cache_identity_for_program(&rustc).unwrap().digest;
 
-        std::fs::write(&backend, b"other backend").unwrap();
+        std::fs::write(
+            &backend,
+            b"rustc-codegen-backend-artifact-cache-safe-v1 other backend",
+        )
+        .unwrap();
         filetime::set_file_times(&backend, timestamp, timestamp).unwrap();
         let second = artifact_cache_identity_for_program(&rustc).unwrap().digest;
 
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn unmarked_sysroot_codegen_backend_disables_compiler_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let sysroot = temp.path().join("toolchain");
+        let rustc = sysroot.join("bin").join("rustc");
+        let backends = sysroot
+            .join("lib")
+            .join("rustlib")
+            .join("test-host")
+            .join("codegen-backends");
+        std::fs::create_dir_all(rustc.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&backends).unwrap();
+        std::fs::write(&rustc, b"rustc").unwrap();
+        std::fs::write(
+            backends.join("librustc_codegen_unmodeled.dylib"),
+            b"unmodeled backend",
+        )
+        .unwrap();
+
+        assert!(artifact_cache_identity_for_program(&rustc).is_none());
     }
 
     #[test]

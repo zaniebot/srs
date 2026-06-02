@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -e
 
-# CG_CLIF_FORCE_GNU_AS will force usage of as instead of the LLVM backend of rustc as
-# the LLVM backend isn't compiled in here.
+# CG_CLIF_FORCE_GNU_AS forces runtime usage of as instead of the LLVM backend of rustc
+# as the LLVM backend isn't compiled in here.
 export CG_CLIF_FORCE_GNU_AS=1
 
 # Compiletest expects all standard library paths to start with /rustc/FAKE_PREFIX.

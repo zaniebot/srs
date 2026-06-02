@@ -913,6 +913,7 @@ fn rlib_action_is_cacheable_with_search_paths(
         "RUSTC_LOG_FORMAT_JSON",
         "RUSTC_LOG_OUTPUT_TARGET",
         "RUST_TARGET_PATH",
+        "CG_CLIF_FORCE_GNU_AS",
         "CG_CLIF_DISABLE_INCR_CACHE",
         "CG_CLIF_ENABLE_VERIFIER",
         "CG_CLIF_JIT_ARGS",
@@ -1210,6 +1211,7 @@ mod artifact_cache_admission_tests {
 
         for (key, value) in [
             ("PATH", "/configured/compiler/path"),
+            ("CG_CLIF_FORCE_GNU_AS", "1"),
             ("CG_CLIF_DISABLE_INCR_CACHE", "1"),
             ("CG_CLIF_ENABLE_VERIFIER", "1"),
             ("CG_CLIF_JIT_ARGS", "--example"),

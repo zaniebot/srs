@@ -520,7 +520,7 @@ unmodeled dependency search paths, or unsupported native-link or extra-output
 inputs.
 Cache keys preserve source-location and a content identity for modeled
 Cargo-selected compiler paths, installed sysroot compiler and target library
-file identity, installed codegen backend contents, and compiler-visible
+file identity, cache-safe installed codegen backend contents, and compiler-visible
 dynamic library search inputs. Installed sysroot library identity follows ordinary
 toolchain publication metadata; overwriting a sysroot file's contents in place
 while preserving its identity, size, and modification time is outside this
