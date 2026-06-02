@@ -90,12 +90,23 @@ impl FileKind {
     }
 
     pub(crate) fn identify_input_bytes(bytes: &[u8]) -> Result<(FileKind, Option<Range<usize>>)> {
-        let data_range = macho_arm64_slice_range(bytes)?;
+        let data_range = Self::input_data_range(bytes)?;
         let selected_bytes = match &data_range {
             Some(range) => &bytes[range.clone()],
             None => bytes,
         };
         Ok((Self::identify_bytes(selected_bytes)?, data_range))
+    }
+
+    pub(crate) fn input_data_range(bytes: &[u8]) -> Result<Option<Range<usize>>> {
+        macho_arm64_slice_range(bytes)
+    }
+
+    pub(crate) fn select_input_bytes(bytes: &[u8]) -> Result<&[u8]> {
+        Ok(match Self::input_data_range(bytes)? {
+            Some(range) => &bytes[range],
+            None => bytes,
+        })
     }
 
     pub(crate) fn is_compiler_ir(self) -> bool {

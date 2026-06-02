@@ -137,8 +137,12 @@ pub(crate) struct InputRef<'data> {
 }
 
 impl InputFile {
+    pub(crate) fn full_data(&self) -> &[u8] {
+        self.data.as_deref().unwrap_or_default()
+    }
+
     pub(crate) fn data(&self) -> &[u8] {
-        let data = self.data.as_deref().unwrap_or_default();
+        let data = self.full_data();
         match &self.data_range {
             Some(range) => &data[range.clone()],
             None => data,
@@ -559,6 +563,13 @@ fn process_thin_archive<'data, P: Platform>(
                                 input_file.filename.display()
                             )
                         })?;
+                let (kind, data_range) = FileKind::identify_input_bytes(&file_data.bytes)
+                    .with_context(|| {
+                        format!(
+                            "Failed to identify file referenced by thin archive `{}`",
+                            input_file.filename.display()
+                        )
+                    })?;
 
                 let input_file = InputFile {
                     filename: entry_path.clone(),
@@ -568,7 +579,7 @@ fn process_thin_archive<'data, P: Platform>(
                         ..input_file.modifiers
                     },
                     data: Some(file_data),
-                    data_range: None,
+                    data_range,
                 };
 
                 let input_file = &*state.inputs_arena.alloc(input_file);
@@ -577,9 +588,6 @@ fn process_thin_archive<'data, P: Platform>(
                     file: input_file,
                     entry: None,
                 };
-
-                let kind = FileKind::identify_bytes(input_ref.data())
-                    .with_context(|| format!("Failed process input `{input_ref}`"))?;
 
                 parsed_files.push(state.process_input(input_ref, &Arc::new(file), kind)?);
                 files.push(input_file);
