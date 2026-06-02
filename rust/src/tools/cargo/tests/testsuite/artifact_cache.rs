@@ -1,5 +1,6 @@
 //! Tests for `-Zartifact-cache`.
 
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -235,6 +236,47 @@ fn explicitly_configured_rustc_is_not_cacheable() {
         )
         .env("CARGO_INCREMENTAL", "1")
         .env("RUSTC", rustc)
+        .run();
+
+    assert!(cached_rlibs(&cache).is_empty());
+}
+
+#[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
+#[cfg(unix)]
+fn path_shadowed_rustc_is_not_cacheable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let cache = paths::root().join("shared-cache");
+    let project = project_with_cache("project", &cache, "hardlink", 42);
+    let target = project.root().join("target-dir");
+    let bin = project.root().join("bin");
+    let shim = bin.join("rustc");
+    let rustc = cargo_util::paths::resolve_executable(Path::new("rustc")).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::write(
+        &shim,
+        format!("#!/bin/sh\nexec '{}' \"$@\"\n", rustc.display()),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&shim).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&shim, permissions).unwrap();
+    let path = env::join_paths(
+        std::iter::once(bin).chain(env::split_paths(&env::var_os("PATH").unwrap_or_default())),
+    )
+    .unwrap();
+
+    project
+        .cargo("-Zartifact-cache build --lib")
+        .arg("--target-dir")
+        .arg(&target)
+        .masquerade_as_nightly_cargo(&["artifact-cache"])
+        .env(
+            cargo_util::paths::dylib_path_envvar(),
+            isolated_loader_path(),
+        )
+        .env("CARGO_INCREMENTAL", "1")
+        .env("PATH", path)
         .run();
 
     assert!(cached_rlibs(&cache).is_empty());

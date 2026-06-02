@@ -260,7 +260,7 @@ impl Rustc {
                     .as_ref()
                     .is_some_and(|proxy| same_file::is_same_file(&program, proxy).unwrap_or(false));
                 if !is_rustup_proxy {
-                    return Some(program);
+                    return None;
                 }
                 let rustup_home = home::rustup_home().ok()?;
                 let rustup_toolchain = gctx.get_env_os("RUSTUP_TOOLCHAIN")?;
