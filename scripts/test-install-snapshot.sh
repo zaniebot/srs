@@ -104,6 +104,20 @@ if ! grep -q 'invalid SRS toolchain name' "$scratch/option-like-name.log"; then
     printf 'installer did not explain the option-like toolchain name refusal\n' >&2
     exit 1
 fi
+if env \
+    SRS_INSTALL_ROOT="$install_root" \
+    SRS_RUSTUP_BIN="$rustup_bin" \
+    SRS_SLD_BIN="$sld_bin" \
+    SRS_TEST_RUSTUP_LINKS="$rustup_links" \
+    "$root/install.sh" .private-label "$toolchain_dir" "$cargo_bin" > "$scratch/private-name.log" 2>&1
+then
+    printf 'installer unexpectedly accepted a private-prefix toolchain name\n' >&2
+    exit 1
+fi
+if ! grep -q 'invalid SRS toolchain name' "$scratch/private-name.log"; then
+    printf 'installer did not explain the private-prefix toolchain name refusal\n' >&2
+    exit 1
+fi
 
 install_snapshot
 snapshot_dir="$physical_install_root/$name"
@@ -175,8 +189,17 @@ if ! grep -q 'SRS toolchain snapshot already exists' "$scratch/reinstall.log"; t
     exit 1
 fi
 
-lock_dir="$physical_install_root/.${name}.lock"
-mkdir "$lock_dir"
+lock_file="$physical_install_root/.${name}.lock"
+transaction_dir="$physical_install_root/.${name}.transaction"
+exec 8> "$lock_file"
+case "$(uname -s)" in
+    Darwin) lockf -s -t 0 8 ;;
+    Linux) flock -n 8 ;;
+    *)
+        printf 'unsupported smoke-test host: %s\n' "$(uname -s)" >&2
+        exit 1
+        ;;
+esac
 if SRS_INSTALL_REPLACE=1 install_snapshot > "$scratch/concurrent-install.log" 2>&1; then
     printf 'installer unexpectedly allowed concurrent installation of the same label\n' >&2
     exit 1
@@ -185,9 +208,93 @@ if ! grep -q 'installation is already in progress' "$scratch/concurrent-install.
     printf 'installer did not explain the concurrent same-label refusal\n' >&2
     exit 1
 fi
-rmdir "$lock_dir"
+exec 8>&-
 if [[ "$("$snapshot_dir/bin/cargo")" != "fake cargo A" ]]; then
     printf 'installer changed snapshot while refusing concurrent same-label installation\n' >&2
+    exit 1
+fi
+
+lock_sentinel="$scratch/lock-sentinel"
+printf 'lock sentinel\n' > "$lock_sentinel"
+rm "$lock_file"
+ln -s "$lock_sentinel" "$lock_file"
+if install_snapshot > "$scratch/invalid-lock-file.log" 2>&1; then
+    printf 'installer unexpectedly accepted a symlinked lock file\n' >&2
+    exit 1
+fi
+if ! grep -q 'refusing invalid SRS toolchain snapshot lock file' "$scratch/invalid-lock-file.log"; then
+    printf 'installer did not explain the symlinked lock-file refusal\n' >&2
+    exit 1
+fi
+if [[ "$(cat "$lock_sentinel")" != "lock sentinel" ]]; then
+    printf 'installer followed a symlinked lock file\n' >&2
+    exit 1
+fi
+rm "$lock_file"
+
+transaction_sentinel="$scratch/transaction-sentinel"
+mkdir "$transaction_sentinel"
+ln -s "$transaction_sentinel" "$transaction_dir"
+if install_snapshot > "$scratch/invalid-transaction-path.log" 2>&1; then
+    printf 'installer unexpectedly accepted a symlinked transaction path\n' >&2
+    exit 1
+fi
+if ! grep -q 'refusing invalid SRS toolchain snapshot transaction path' "$scratch/invalid-transaction-path.log"; then
+    printf 'installer did not explain the symlinked transaction-path refusal\n' >&2
+    exit 1
+fi
+rm "$transaction_dir"
+
+mkdir "$transaction_dir"
+printf 'transaction marker\n' > "$transaction_dir/marker"
+if install_snapshot > "$scratch/missing-transaction-phase.log" 2>&1; then
+    printf 'installer unexpectedly accepted transaction metadata without a phase\n' >&2
+    exit 1
+fi
+if ! grep -q 'refusing SRS toolchain snapshot transaction without readable phase' "$scratch/missing-transaction-phase.log"; then
+    printf 'installer did not explain the missing transaction phase refusal\n' >&2
+    exit 1
+fi
+if [[ "$(cat "$transaction_dir/marker")" != "transaction marker" ]]; then
+    printf 'installer removed transaction metadata without a readable phase\n' >&2
+    exit 1
+fi
+rm -rf "$transaction_dir"
+
+unowned_staging_dir="$physical_install_root/.${name}.tmp.preserved"
+mkdir "$unowned_staging_dir"
+printf 'preserved marker\n' > "$unowned_staging_dir/marker"
+if install_snapshot > "$scratch/unowned-staging.log" 2>&1; then
+    printf 'installer unexpectedly replaced a snapshot while checking unowned staging paths\n' >&2
+    exit 1
+fi
+if [[ "$(cat "$unowned_staging_dir/marker")" != "preserved marker" ]]; then
+    printf 'installer removed an unowned private-prefix staging path\n' >&2
+    exit 1
+fi
+rm -rf "$unowned_staging_dir"
+
+mkdir -p "$transaction_dir/staging"
+printf 'preparing\n' > "$transaction_dir/phase"
+mv "$snapshot_dir" "$transaction_dir/replaced-snapshot"
+if install_snapshot > "$scratch/stale-install.log" 2>&1; then
+    printf 'installer unexpectedly replaced a recovered snapshot without opt-in\n' >&2
+    exit 1
+fi
+if ! grep -q 'recovering stale SRS toolchain snapshot installation' "$scratch/stale-install.log"; then
+    printf 'installer did not explain stale installation recovery\n' >&2
+    exit 1
+fi
+if ! grep -q 'SRS toolchain snapshot already exists' "$scratch/stale-install.log"; then
+    printf 'installer did not restore immutable-label handling after stale recovery\n' >&2
+    exit 1
+fi
+if [[ -e "$transaction_dir" || -L "$transaction_dir" ]]; then
+    printf 'installer left stale transaction paths after recovery\n' >&2
+    exit 1
+fi
+if [[ "$("$snapshot_dir/bin/cargo")" != "fake cargo A" ]]; then
+    printf 'installer did not restore snapshot after stale replacement recovery\n' >&2
     exit 1
 fi
 
@@ -228,6 +335,122 @@ set -euo pipefail
 printf 'fake sld B\n'
 EOF
 chmod +x "$sld_bin"
+
+mkdir -p "$transaction_dir/staging"
+printf 'published\n' > "$transaction_dir/phase"
+mv "$snapshot_dir" "$transaction_dir/replaced-snapshot"
+mkdir -p "$snapshot_dir/bin"
+cat > "$snapshot_dir/bin/cargo" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'stale published cargo\n'
+EOF
+chmod +x "$snapshot_dir/bin/cargo"
+if install_snapshot > "$scratch/stale-published-replacement.log" 2>&1; then
+    printf 'installer unexpectedly retained an interrupted replacement without opt-in\n' >&2
+    exit 1
+fi
+if ! grep -q 'recovering stale SRS toolchain snapshot installation' "$scratch/stale-published-replacement.log"; then
+    printf 'installer did not explain interrupted replacement recovery\n' >&2
+    exit 1
+fi
+if ! grep -q 'SRS toolchain snapshot already exists' "$scratch/stale-published-replacement.log"; then
+    printf 'installer did not restore immutable-label handling after interrupted replacement recovery\n' >&2
+    exit 1
+fi
+if [[ -e "$transaction_dir" || -L "$transaction_dir" ]]; then
+    printf 'installer left interrupted replacement transaction paths after recovery\n' >&2
+    exit 1
+fi
+if [[ "$("$snapshot_dir/bin/cargo")" != "fake cargo A" ]]; then
+    printf 'installer did not roll back an interrupted published replacement\n' >&2
+    exit 1
+fi
+
+stale_initial_name="srs-stale-initial"
+stale_initial_snapshot="$physical_install_root/$stale_initial_name"
+stale_initial_transaction="$physical_install_root/.${stale_initial_name}.transaction"
+mkdir -p "$stale_initial_snapshot/bin" "$stale_initial_transaction"
+printf 'stale snapshot marker\n' > "$stale_initial_snapshot/bin/stale-marker"
+printf 'published\n' > "$stale_initial_transaction/phase"
+env \
+    SRS_INSTALL_ROOT="$install_root" \
+    SRS_RUSTUP_BIN="$rustup_bin" \
+    SRS_SLD_BIN="$sld_bin" \
+    SRS_TEST_RUSTUP_LINKS="$rustup_links" \
+    "$root/install.sh" "$stale_initial_name" "$toolchain_dir" "$cargo_bin"
+if [[ -e "$stale_initial_snapshot/bin/stale-marker" ]]; then
+    printf 'installer retained an interrupted initial publication\n' >&2
+    exit 1
+fi
+if [[ "$("$stale_initial_snapshot/bin/cargo")" != "fake cargo B" ]]; then
+    printf 'installer did not recover an interrupted initial publication\n' >&2
+    exit 1
+fi
+if [[ -e "$stale_initial_transaction" || -L "$stale_initial_transaction" ]]; then
+    printf 'installer left stale initial-publication transaction paths after recovery\n' >&2
+    exit 1
+fi
+
+stale_linking_name="srs-stale-linking"
+stale_linking_snapshot="$physical_install_root/$stale_linking_name"
+stale_linking_transaction="$physical_install_root/.${stale_linking_name}.transaction"
+mkdir -p "$stale_linking_snapshot/bin" "$stale_linking_transaction"
+printf 'linked snapshot marker\n' > "$stale_linking_snapshot/bin/linked-marker"
+printf 'linking\n' > "$stale_linking_transaction/phase"
+if env \
+    SRS_INSTALL_ROOT="$install_root" \
+    SRS_RUSTUP_BIN="$rustup_bin" \
+    SRS_SLD_BIN="$sld_bin" \
+    SRS_TEST_RUSTUP_LINKS="$rustup_links" \
+    "$root/install.sh" "$stale_linking_name" "$toolchain_dir" "$cargo_bin" > "$scratch/stale-linking.log" 2>&1
+then
+    printf 'installer unexpectedly replaced a recovered linking snapshot without opt-in\n' >&2
+    exit 1
+fi
+if [[ ! -e "$stale_linking_snapshot/bin/linked-marker" ]]; then
+    printf 'installer did not retain a linking snapshot during stale cleanup\n' >&2
+    exit 1
+fi
+if [[ "$(readlink "$rustup_links/$stale_linking_name")" != "$stale_linking_snapshot" ]]; then
+    printf 'installer did not replay an interrupted rustup link\n' >&2
+    exit 1
+fi
+if [[ -e "$stale_linking_transaction" || -L "$stale_linking_transaction" ]]; then
+    printf 'installer left linking transaction paths after stale cleanup\n' >&2
+    exit 1
+fi
+
+stale_complete_name="srs-stale-complete"
+stale_complete_snapshot="$physical_install_root/$stale_complete_name"
+stale_complete_transaction="$physical_install_root/.${stale_complete_name}.transaction"
+mkdir -p "$stale_complete_snapshot/bin" "$stale_complete_transaction/replaced-snapshot/bin"
+cat > "$stale_complete_snapshot/bin/cargo" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'committed cargo\n'
+EOF
+chmod +x "$stale_complete_snapshot/bin/cargo"
+printf 'old snapshot marker\n' > "$stale_complete_transaction/replaced-snapshot/bin/old-marker"
+printf 'complete\n' > "$stale_complete_transaction/phase"
+if env \
+    SRS_INSTALL_ROOT="$install_root" \
+    SRS_RUSTUP_BIN="$rustup_bin" \
+    SRS_SLD_BIN="$sld_bin" \
+    SRS_TEST_RUSTUP_LINKS="$rustup_links" \
+    "$root/install.sh" "$stale_complete_name" "$toolchain_dir" "$cargo_bin" > "$scratch/stale-complete.log" 2>&1
+then
+    printf 'installer unexpectedly replaced a recovered committed snapshot without opt-in\n' >&2
+    exit 1
+fi
+if [[ "$("$stale_complete_snapshot/bin/cargo")" != "committed cargo" ]]; then
+    printf 'installer did not retain a committed snapshot during stale cleanup\n' >&2
+    exit 1
+fi
+if [[ -e "$stale_complete_transaction" || -L "$stale_complete_transaction" ]]; then
+    printf 'installer left committed transaction paths after stale cleanup\n' >&2
+    exit 1
+fi
 
 if \
     SRS_INSTALL_REPLACE=1 \

@@ -11,7 +11,7 @@ install_root="${SRS_INSTALL_ROOT:-$HOME/code/tmp/srs-toolchains}"
 rustup_bin="${SRS_RUSTUP_BIN:-rustup}"
 replace="${SRS_INSTALL_REPLACE:-0}"
 
-if [[ -z "$name" || "$name" == -* || "$name" == */* || "$name" == *\\* || "$name" == "." || "$name" == ".." ]]; then
+if [[ -z "$name" || "$name" == -* || "$name" == .* || "$name" == */* || "$name" == *\\* || "$name" == "." || "$name" == ".." ]]; then
     printf 'invalid SRS toolchain name %s: use a single path component\n' "$name" >&2
     exit 2
 fi
@@ -24,43 +24,178 @@ fi
 mkdir -p "$install_root"
 install_root_physical="$(cd -P "$install_root" && pwd)"
 snapshot_dir="$install_root_physical/$name"
-lock_dir="$install_root_physical/.${name}.lock"
+lock_file="$install_root_physical/.${name}.lock"
+transaction_dir="$install_root_physical/.${name}.transaction"
 staging_dir=""
-replacement_parent=""
 replaced_snapshot=""
-lock_acquired=0
-snapshot_published=0
-install_complete=0
+transaction_started=0
+write_transaction_phase() {
+    local phase="$1"
+    local phase_tmp="$transaction_dir/.phase.$$"
+
+    if ! printf '%s\n' "$phase" > "$phase_tmp"; then
+        return 1
+    fi
+    mv "$phase_tmp" "$transaction_dir/phase"
+}
+recover_stale_install() {
+    local quiet="${1:-0}"
+    local phase=""
+    local transaction_replaced_snapshot="$transaction_dir/replaced-snapshot"
+
+    if [[ -L "$transaction_dir" ]] || [[ -e "$transaction_dir" && ! -d "$transaction_dir" ]]; then
+        printf 'refusing invalid SRS toolchain snapshot transaction path at %s\n' "$transaction_dir" >&2
+        return 1
+    fi
+    if [[ ! -d "$transaction_dir" ]]; then
+        return 0
+    fi
+    if [[ ! -r "$transaction_dir/phase" ]]; then
+        printf 'refusing SRS toolchain snapshot transaction without readable phase at %s\n' "$transaction_dir" >&2
+        return 1
+    fi
+    phase="$(cat "$transaction_dir/phase")"
+    case "$phase" in
+        preparing|publishing|published|linking|rolling-back-initial|rolling-back-replacement|rolled-back|complete) ;;
+        *)
+            printf 'refusing invalid SRS toolchain snapshot transaction phase at %s\n' "$transaction_dir/phase" >&2
+            return 1
+            ;;
+    esac
+    if [[ "$quiet" != "1" ]]; then
+        printf 'recovering stale SRS toolchain snapshot installation at %s\n' "$transaction_dir" >&2
+    fi
+
+    if [[ "$phase" == "linking" ]]; then
+        if [[ ! -e "$snapshot_dir" && ! -L "$snapshot_dir" ]]; then
+            printf 'cannot recover stale SRS installation: missing published snapshot for %s\n' "$name" >&2
+            return 1
+        fi
+        if ! "$rustup_bin" toolchain link "$name" "$snapshot_dir"; then
+            return 1
+        fi
+        if ! write_transaction_phase complete; then
+            return 1
+        fi
+        phase="complete"
+    fi
+    if [[ "$phase" == "publishing" || "$phase" == "published" ]]; then
+        if [[ -e "$transaction_replaced_snapshot" || -L "$transaction_replaced_snapshot" ]]; then
+            if ! write_transaction_phase rolling-back-replacement; then
+                return 1
+            fi
+            phase="rolling-back-replacement"
+        else
+            if ! write_transaction_phase rolling-back-initial; then
+                return 1
+            fi
+            phase="rolling-back-initial"
+        fi
+    fi
+    if [[ "$phase" == "rolling-back-initial" ]]; then
+        if [[ -e "$snapshot_dir" || -L "$snapshot_dir" ]]; then
+            if ! rm -rf "$snapshot_dir"; then
+                return 1
+            fi
+        fi
+        if ! write_transaction_phase rolled-back; then
+            return 1
+        fi
+        phase="rolled-back"
+    elif [[ "$phase" == "rolling-back-replacement" ]]; then
+        if [[ -e "$transaction_replaced_snapshot" || -L "$transaction_replaced_snapshot" ]]; then
+            if [[ -e "$snapshot_dir" || -L "$snapshot_dir" ]]; then
+                if ! rm -rf "$snapshot_dir"; then
+                    return 1
+                fi
+            fi
+            if ! mv "$transaction_replaced_snapshot" "$snapshot_dir"; then
+                return 1
+            fi
+        elif [[ ! -e "$snapshot_dir" && ! -L "$snapshot_dir" ]]; then
+            printf 'cannot recover stale SRS installation: missing replacement snapshot for %s\n' "$name" >&2
+            return 1
+        fi
+        if ! write_transaction_phase rolled-back; then
+            return 1
+        fi
+        phase="rolled-back"
+    elif [[ "$phase" == "preparing" ]]; then
+        if [[ ! -e "$snapshot_dir" && ! -L "$snapshot_dir" ]] \
+            && [[ -e "$transaction_replaced_snapshot" || -L "$transaction_replaced_snapshot" ]]
+        then
+            if ! mv "$transaction_replaced_snapshot" "$snapshot_dir"; then
+                return 1
+            fi
+        fi
+        if ! write_transaction_phase rolled-back; then
+            return 1
+        fi
+    fi
+
+    if ! rm -rf "$transaction_dir"; then
+        return 1
+    fi
+}
+acquire_install_lock() {
+    local transaction_tmp
+
+    if [[ -L "$lock_file" ]] || [[ -e "$lock_file" && ! -f "$lock_file" ]]; then
+        printf 'refusing invalid SRS toolchain snapshot lock file at %s\n' "$lock_file" >&2
+        return 1
+    fi
+    exec 9> "$lock_file"
+    case "$(uname -s)" in
+        Darwin)
+            if ! command -v lockf >/dev/null 2>&1; then
+                printf 'missing lockf required for SRS toolchain snapshot installation\n' >&2
+                return 1
+            fi
+            if ! lockf -s -t 0 9; then
+                printf 'SRS toolchain snapshot installation is already in progress at %s\n' "$lock_file" >&2
+                return 1
+            fi
+            ;;
+        Linux)
+            if ! command -v flock >/dev/null 2>&1; then
+                printf 'missing flock required for SRS toolchain snapshot installation\n' >&2
+                return 1
+            fi
+            if ! flock -n 9; then
+                printf 'SRS toolchain snapshot installation is already in progress at %s\n' "$lock_file" >&2
+                return 1
+            fi
+            ;;
+        *)
+            printf 'unsupported host for SRS toolchain snapshot installation: %s\n' "$(uname -s)" >&2
+            return 1
+            ;;
+    esac
+    if ! recover_stale_install; then
+        return 1
+    fi
+    transaction_tmp="$(mktemp -d "$install_root_physical/.${name}.transaction.XXXXXX")"
+    if ! printf 'preparing\n' > "$transaction_tmp/phase"; then
+        rm -rf "$transaction_tmp"
+        return 1
+    fi
+    if ! mv "$transaction_tmp" "$transaction_dir"; then
+        rm -rf "$transaction_tmp"
+        printf 'failed to create SRS toolchain snapshot transaction at %s\n' "$transaction_dir" >&2
+        return 1
+    fi
+    transaction_started=1
+}
 cleanup() {
-    if [[ -n "$staging_dir" ]] && [[ -e "$staging_dir" || -L "$staging_dir" ]]; then
-        rm -rf "$staging_dir"
-    fi
-    if [[ "$install_complete" == "1" ]]; then
-        if [[ -n "$replacement_parent" ]] && [[ -e "$replacement_parent" || -L "$replacement_parent" ]]; then
-            rm -rf "$replacement_parent"
-        fi
-    else
-        if [[ "$snapshot_published" == "1" ]] && [[ -e "$snapshot_dir" || -L "$snapshot_dir" ]]; then
-            rm -rf "$snapshot_dir"
-        fi
-        if [[ -n "$replaced_snapshot" ]] && [[ -e "$replaced_snapshot" || -L "$replaced_snapshot" ]]; then
-            mv "$replaced_snapshot" "$snapshot_dir"
-        fi
-        if [[ -n "$replacement_parent" ]] && [[ -e "$replacement_parent" || -L "$replacement_parent" ]]; then
-            rm -rf "$replacement_parent"
-        fi
-    fi
-    if [[ "$lock_acquired" == "1" ]] && [[ -d "$lock_dir" ]]; then
-        rmdir "$lock_dir"
+    if [[ "$transaction_started" == "1" ]]; then
+        recover_stale_install 1 || true
     fi
 }
 trap cleanup EXIT
 
-if ! mkdir "$lock_dir"; then
-    printf 'SRS toolchain snapshot installation is already in progress at %s\n' "$lock_dir" >&2
+if ! acquire_install_lock; then
     exit 2
 fi
-lock_acquired=1
 
 if [[ -e "$snapshot_dir" || -L "$snapshot_dir" ]] && [[ "$replace" != "1" ]]; then
     printf 'SRS toolchain snapshot already exists at %s; set SRS_INSTALL_REPLACE=1 to replace it\n' "$snapshot_dir" >&2
@@ -131,7 +266,8 @@ if [[ ! -x "$sld_bin" ]]; then
     exit 2
 fi
 
-staging_dir="$(mktemp -d "$install_root_physical/.${name}.tmp.XXXXXX")"
+staging_dir="$transaction_dir/staging"
+mkdir "$staging_dir"
 staging_dir_physical="$(cd -P "$staging_dir" && pwd)"
 
 # Prefer copy-on-write filesystem clones where the host supports them. The
@@ -203,20 +339,22 @@ if [[ -e "$snapshot_dir" || -L "$snapshot_dir" ]]; then
         printf 'SRS toolchain snapshot already exists at %s; set SRS_INSTALL_REPLACE=1 to replace it\n' "$snapshot_dir" >&2
         exit 2
     fi
-    replacement_parent="$(mktemp -d "$install_root_physical/.${name}.replaced.XXXXXX")"
-    replaced_snapshot="$replacement_parent/snapshot"
+    replaced_snapshot="$transaction_dir/replaced-snapshot"
     mv "$snapshot_dir" "$replaced_snapshot"
 fi
 
+write_transaction_phase publishing
 mv "$staging_dir" "$snapshot_dir"
 staging_dir=""
-snapshot_published=1
+write_transaction_phase published
 
+write_transaction_phase linking
 if ! "$rustup_bin" toolchain link "$name" "$snapshot_dir"; then
+    write_transaction_phase published
     exit 1
 fi
 
-install_complete=1
+write_transaction_phase complete
 
 printf 'linked rustup toolchain %s -> %s\n' "$name" "$snapshot_dir"
 printf 'installed copied Cargo wrapper at %s\n' "$snapshot_dir/bin/cargo"
