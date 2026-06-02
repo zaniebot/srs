@@ -6512,10 +6512,24 @@ fn sld_native_incremental_scopes_root_linker_environment() {
                     match crate_name {
                         Some("foo") => {
                             assert_private_root_output_is_detached(&args);
+                            let expected_padding = std::env::var(
+                                "SLD_TEST_EXPECT_ROOT_PADDING",
+                            )
+                            .unwrap_or_else(|_| "configured".to_owned());
+                            let expected_provenance = std::env::var(
+                                "SLD_TEST_EXPECT_ROOT_PROVENANCE",
+                            )
+                            .unwrap_or_else(|_| "configured".to_owned());
                             for (variable, value) in [
                                 ("SLD_INCREMENTAL", "1"),
-                                ("SLD_INCREMENTAL_PADDING_PERCENT", "configured"),
-                                ("SLD_RUSTC_WORK_PRODUCT_PROVENANCE", "configured"),
+                                (
+                                    "SLD_INCREMENTAL_PADDING_PERCENT",
+                                    expected_padding.as_str(),
+                                ),
+                                (
+                                    "SLD_RUSTC_WORK_PRODUCT_PROVENANCE",
+                                    expected_provenance.as_str(),
+                                ),
                                 ("SLD_STABILIZE_RUSTC_TRANSIENT_INPUTS", "set"),
                                 ("SLD_EXPERIMENT_PRIVATE_PERSISTENT_OUTPUT", "1"),
                             ] {
@@ -6608,6 +6622,30 @@ fn sld_native_incremental_scopes_root_linker_environment() {
         );
     }
     assert!(p.target_debug_dir().join("foo.dSYM").is_dir());
+
+    fs::write(
+        p.root().join(".cargo/config.toml"),
+        r#"
+            [env]
+            SLD_INCREMENTAL_PADDING_PERCENT = "reconfigured"
+            SLD_RUSTC_WORK_PRODUCT_PROVENANCE = { value = "reconfigured", force = true }
+        "#,
+    )
+    .unwrap();
+    p.cargo("build -Z sld-native-incremental -Z unstable-options --artifact-dir out")
+        .masquerade_as_nightly_cargo(&["sld-native-incremental", "artifact-dir"])
+        .env("RUSTC_WRAPPER", wrapper_project.bin("sld-env-wrapper"))
+        .env("SLD_INCREMENTAL", "poison")
+        .env("SLD_RUSTC_WORK_PRODUCT_PROVENANCE", "poison")
+        .env("SLD_RUSTC_WORK_PRODUCT_PROVENANCE_FILE", "poison")
+        .env("SLD_STABILIZE_RUSTC_TRANSIENT_INPUTS", "set")
+        .env("SLD_EXPERIMENT_PRIVATE_PERSISTENT_OUTPUT", "poison")
+        .env("SLD_EXPERIMENT_UNSIGNED_PERSISTENT_OUTPUT", "poison")
+        .env("SLD_TEST_EXPECT_ROOT_PADDING", "reconfigured")
+        .env("SLD_TEST_EXPECT_ROOT_PROVENANCE", "reconfigured")
+        .enable_mac_dsym()
+        .with_stderr_contains("[COMPILING] foo v0.1.0 ([ROOT]/foo)")
+        .run();
 }
 
 #[cargo_test]
@@ -6711,6 +6749,21 @@ fn sld_native_incremental_removes_private_root_output_symlinks() {
         .env("RUSTC_WRAPPER", wrapper_project.bin("sld-symlink-wrapper"))
         .run();
     assert_eq!(fs::read_to_string(victim).unwrap(), "untouched");
+
+    let private_binary = p
+        .glob("target/debug/deps/foo-*")
+        .filter_map(Result::ok)
+        .find(|path| path.is_file() && path.extension().is_none())
+        .unwrap();
+    let dangling_victim = p.root().join("dangling-victim");
+    fs::remove_file(&private_binary).unwrap();
+    symlink(&dangling_victim, &private_binary).unwrap();
+
+    p.cargo("build -Z sld-native-incremental")
+        .masquerade_as_nightly_cargo(&["sld-native-incremental"])
+        .env("RUSTC_WRAPPER", wrapper_project.bin("sld-symlink-wrapper"))
+        .run();
+    assert!(!dangling_victim.exists());
 }
 
 #[cargo_test]
