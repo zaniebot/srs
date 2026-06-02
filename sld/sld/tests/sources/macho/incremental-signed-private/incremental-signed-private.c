@@ -6,6 +6,7 @@
 //#TestIncrementalInterrupted:true
 //#TestIncrementalChanged:true
 //#TestIncrementalChangedSection:__data
+//#TestIncrementalChangedSymbolBytes:_incremental_value=0x2b000000
 
 extern int value(void);
 
