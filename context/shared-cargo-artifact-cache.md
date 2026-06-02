@@ -54,8 +54,9 @@ Restoration is skipped for inputs including:
 - explicit sysroot overrides
 - unmodeled dynamic loader overrides
 - unmodeled dependency search paths
+- inherited SLD work-product provenance controls
 - rustc `-Z` options other than selecting a cache-safe named sysroot codegen
-  backend
+  backend or setting `-Zpreserve-duplicate-constants={yes,no}`
 - Windows GNU-family targets, where raw-dylib compilation can invoke unmodeled
   `dlltool` programs
 
