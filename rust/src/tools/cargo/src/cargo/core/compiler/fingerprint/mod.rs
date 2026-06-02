@@ -1634,6 +1634,16 @@ fn calculate_normal(
                 .join(super::ARTIFACT_CACHE_FRESHNESS_STAMP),
         );
     }
+    if super::sld_native_incremental_root_output(build_runner, unit) {
+        // SLD owns the retained private output's identity. This target-local
+        // stamp advances Cargo freshness without changing that output.
+        outputs.push(
+            build_runner
+                .files()
+                .fingerprint_dir(unit)
+                .join(super::SLD_NATIVE_INCREMENTAL_FRESHNESS_STAMP),
+        );
+    }
 
     // Fill out a bunch more information that we'll be tracking typically
     // hashed to take up less space on disk as we just need to know when things
@@ -1683,6 +1693,17 @@ fn calculate_normal(
         .cli_unstable()
         .no_embed_metadata
         .hash(&mut config);
+    // These modes change the rustc environment while intentionally retaining
+    // the ordinary Cargo artifact names.
+    (
+        super::sld_native_incremental_requested(build_runner),
+        super::sld_native_incremental_root_output(build_runner, unit),
+        super::sld_native_incremental_rlib_producer(build_runner, unit),
+    )
+        .hash(&mut config);
+    if super::sld_native_incremental_root_output(build_runner, unit) {
+        super::sld_native_incremental_root_environment(build_runner.bcx.gctx)?.hash(&mut config);
+    }
     build_runner
         .bcx
         .build_config
