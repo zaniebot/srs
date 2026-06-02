@@ -74,6 +74,20 @@ rustc +"$NAME" -Vv
 cargo +"$NAME" -Vv
 ```
 
+After rebuilding, refresh an existing task-specific snapshot explicitly:
+
+```bash
+SRS_INSTALL_REPLACE=1 ./install.sh "$NAME"
+```
+
+Installed snapshots omit the bootstrap `rust-src` symlinks back into the task
+worktree so normal `rustc`, Cargo, and `sld` builds keep working after cleanup.
+For a workflow that requires compiler sources inside the sysroot, such as
+Cargo `-Z build-std`, use the task worktree's stage 2 sysroot instead. Recreate
+and rebuild a task worktree if those sources are needed after cleanup;
+replacing the installed snapshot intentionally does not restore mutable
+`rust-src` symlinks.
+
 On macOS, use `./with-sld.sh <command>` when a proof must explicitly select
 the task's built linker. Use a task-specific `NAME`; concurrent agents must
 not relink the same rustup toolchain name.
@@ -180,9 +194,16 @@ git -C "$WT" status --short --branch
 Then remove the completed task worktree from the canonical checkout:
 
 ```bash
+NAME=srs-<task-slug>
+SNAPSHOT_ROOT="${SRS_INSTALL_ROOT:-$HOME/code/tmp/srs-toolchains}"
+rustup toolchain uninstall "$NAME"
+rm -rf -- "$SNAPSHOT_ROOT/$NAME"
 git -C "$SRS" worktree remove "$WT"
 git -C "$SRS" worktree prune
 ```
+
+Uninstalling the custom rustup toolchain removes its rustup link. Remove the
+snapshot separately because it lives outside the task worktree.
 
 Do not use force removal on a task worktree containing unpreserved changes or
 results.
