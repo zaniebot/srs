@@ -114,9 +114,10 @@ Cargo detaches restored hardlinks before rebuilding them, but tools outside
 Cargo must not overwrite restored `.rlib` or `.rmeta` files in place: in
 hardlink mode, those files share storage with the central cache. Use copy
 materialization when a workflow mutates build artifacts after compilation.
-Changing the cache setting does not eagerly detach already-fresh outputs. Clean
-the target directory or force a rebuild before allowing an external tool to
-mutate artifacts previously restored by hardlink.
+Changing materialization mode or disabling the cache does not eagerly detach
+already-fresh outputs. Run one Cargo build with the new setting or clean the
+target directory before allowing an external tool to mutate artifacts
+previously restored by hardlink.
 
 See [Shared Cargo artifact cache](context/shared-cargo-artifact-cache.md) for
 the cache admission rules, compiler identity model, concurrency behavior, and
@@ -125,7 +126,8 @@ operational details.
 Set `SLD_INCREMENTAL=0` for a full-link comparison or when diagnosing
 incremental-link behavior.
 
-Set `SRS_CARGO_ARTIFACT_CACHE=0` to disable shared artifact restoration.
+Set `SRS_CARGO_ARTIFACT_CACHE=0` to disable shared artifact restoration and
+publication.
 Set `SRS_CARGO_ARTIFACT_CACHE_DIR` to choose a different central cache root or
 `SRS_CARGO_ARTIFACT_CACHE_MATERIALIZATION=copy` to retain cache reuse without
 hardlink materialization. The cache is unbounded by default; set
