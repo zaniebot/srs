@@ -45,8 +45,12 @@ EOF
 
 target_dir="$scratch/target"
 binary="$target_dir/debug/srs-native-incremental-replay"
+# CI disables rustc incremental caches for large workload builds. This replay
+# specifically needs them so rustc can publish reusable work-product digests.
+cargo_incremental="${SRS_TEST_CARGO_INCREMENTAL:-1}"
 
-CARGO_TARGET_DIR="$target_dir" cargo +"$toolchain" build --manifest-path "$scratch/Cargo.toml"
+CARGO_INCREMENTAL="$cargo_incremental" CARGO_TARGET_DIR="$target_dir" \
+    cargo +"$toolchain" build --manifest-path "$scratch/Cargo.toml"
 if [[ "$("$binary")" != "41" ]]; then
     printf 'seed cargo +%s binary did not print 41\n' "$toolchain" >&2
     exit 1
@@ -74,7 +78,8 @@ pub fn value() -> i32 {
 }
 EOF
 
-CARGO_TARGET_DIR="$target_dir" cargo +"$toolchain" build --manifest-path "$scratch/Cargo.toml"
+CARGO_INCREMENTAL="$cargo_incremental" CARGO_TARGET_DIR="$target_dir" \
+    cargo +"$toolchain" build --manifest-path "$scratch/Cargo.toml"
 if [[ "$("$binary")" != "42" ]]; then
     printf 'rebuilt cargo +%s binary did not print 42\n' "$toolchain" >&2
     exit 1
