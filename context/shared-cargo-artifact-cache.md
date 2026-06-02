@@ -28,17 +28,17 @@ Cargo detaches restored hardlinks before rebuilding them, including when the
 cache feature is later disabled. Tools outside Cargo must not overwrite
 restored `.rlib` or `.rmeta` files in place: in hardlink mode, those files
 share storage with the central cache. Use copy materialization for workflows
-that mutate build artifacts after compilation. Changing the cache setting does
-not eagerly detach already-fresh outputs. Clean the target directory or force a
-rebuild before allowing an external tool to mutate artifacts previously
-restored by hardlink.
+that mutate build artifacts after compilation. Changing materialization mode or
+disabling the cache does not eagerly detach already-fresh outputs. Run one Cargo
+build with the new setting or clean the target directory before allowing an
+external tool to mutate artifacts previously restored by hardlink.
 
 ## Cache Admission
 
 The cache is deliberately limited to verified ordinary-library artifacts.
 Builds that use unmodeled inputs execute normally without artifact restoration.
 
-Restoration is skipped for:
+Restoration is skipped for inputs including:
 
 - wrapped `rustc` invocations
 - explicitly configured or otherwise unmodeled compiler dispatch
@@ -108,7 +108,8 @@ ordinary compilation rather than participating in shared restoration.
 
 ## Configuration
 
-Set `SRS_CARGO_ARTIFACT_CACHE=0` to disable shared artifact restoration.
+Set `SRS_CARGO_ARTIFACT_CACHE=0` to disable shared artifact restoration and
+publication.
 
 Set `SRS_CARGO_ARTIFACT_CACHE_DIR` to choose a different central cache root.
 The wrapper exports its per-user default directory, so this alias or the
@@ -135,6 +136,6 @@ another writer with access to that directory.
 
 Set `CARGO_LOG=cargo::core::compiler=debug` when diagnosing cache admission,
 restoration, or publication. When switching an existing target directory from
-hardlink to copy mode or disabling the cache, clean that target directory or
-force a rebuild before allowing external tools to mutate artifacts previously
-restored by hardlink.
+hardlink to copy mode or disabling the cache, run one Cargo build with the new
+setting or clean that target directory before allowing external tools to mutate
+artifacts previously restored by hardlink.

@@ -577,9 +577,10 @@ copying when the cache and build directory are on different filesystems.
 In `hardlink` mode, restored `.rlib` and `.rmeta` files share storage with the
 central cache. Tools outside Cargo must not mutate those restored files in
 place; use `copy` materialization for workflows that modify build artifacts
-after compilation. Changing the cache setting does not eagerly detach
-already-fresh outputs. Clean the target directory or force a rebuild before
-allowing an external tool to mutate artifacts previously restored by hardlink.
+after compilation. Changing materialization mode or disabling the cache does
+not eagerly detach already-fresh outputs. Run one Cargo build with the new
+setting or clean the target directory before allowing an external tool to
+mutate artifacts previously restored by hardlink.
 
 `artifact-cache-max-size` caps completed cache entries using oldest-first
 eviction and accepts human-readable sizes such as `"100GB"` or `"2GiB"`.
