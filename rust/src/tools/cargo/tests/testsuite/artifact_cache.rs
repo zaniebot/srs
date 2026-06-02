@@ -7,7 +7,9 @@ use std::process::Stdio;
 
 use crate::prelude::*;
 use crate::utils::tools;
-use cargo_test_support::{Project, paths, prelude::*, project_in, sleep_ms};
+use cargo_test_support::{
+    Project, basic_manifest, paths, prelude::*, project_in, rustc_host, sleep_ms,
+};
 
 fn project_with_cache(name: &str, cache: &Path, materialization: &str, value: u32) -> Project {
     let cache = cache.to_string_lossy().replace('\\', "\\\\");
@@ -218,6 +220,116 @@ fn rustc_wrappers_are_not_cacheable() {
     assert!(cached_rlibs(&cache).is_empty());
 }
 
+#[cargo_test(
+    nightly,
+    reason = "-Zartifact-cache and -Zsld-native-incremental are unstable"
+)]
+#[cfg(unix)]
+fn sld_native_incremental_rlibs_use_distinct_cache_entries() {
+    if rustc_host() != "aarch64-apple-darwin" {
+        return;
+    }
+
+    // This testsuite runs against stable rustc, which cannot execute the
+    // wrapper's unstable duplicate-constant flag. Admission coverage for the
+    // exact composed rustc action lives in the compiler unit tests.
+    let cache = paths::root().join("shared-cache");
+    let cache_config = cache.to_string_lossy().replace('\\', "\\\\");
+    let project = project_in("project")
+        .file(
+            ".cargo/config.toml",
+            &format!(
+                r#"
+                [build]
+                artifact-cache-dir = "{cache_config}"
+                artifact-cache-materialization = "hardlink"
+                "#,
+            ),
+        )
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "project"
+                version = "0.1.0"
+                edition = "2021"
+
+                [dependencies]
+                bar = { path = "bar" }
+            "#,
+        )
+        .file(
+            "src/main.rs",
+            "fn main() { println!(\"{}\", bar::value()); }",
+        )
+        .file("bar/Cargo.toml", &basic_manifest("bar", "0.1.0"))
+        .file("bar/src/lib.rs", "pub fn value() -> u8 { 42 }")
+        .build();
+    let ordinary_target = project.root().join("ordinary-target");
+    let sld_target = project.root().join("sld-target");
+    let restored_target = project.root().join("restored-target");
+    let build = |target: &Path, sld_native_incremental: bool| {
+        let mut cargo = if sld_native_incremental {
+            project.cargo("-Zartifact-cache -Zsld-native-incremental build")
+        } else {
+            project.cargo("-Zartifact-cache build")
+        };
+        cargo.arg("--target-dir").arg(target);
+        if sld_native_incremental {
+            cargo.masquerade_as_nightly_cargo(&["artifact-cache", "sld-native-incremental"]);
+        } else {
+            cargo.masquerade_as_nightly_cargo(&["artifact-cache"]);
+        }
+        cargo
+            .env(
+                cargo_util::paths::dylib_path_envvar(),
+                isolated_loader_path(),
+            )
+            .env("CARGO_INCREMENTAL", "1")
+            .run();
+    };
+
+    build(&ordinary_target, false);
+    assert_eq!(cached_rlibs(&cache).len(), 1);
+
+    build(&sld_target, true);
+    assert_eq!(
+        cached_rlibs(&cache).len(),
+        2,
+        "SLD provenance-bearing rlibs must not reuse ordinary cache entries"
+    );
+    assert!(
+        !contains_cache_entry_with_marker(&cache, "project-"),
+        "root executables must not enter the shared artifact cache"
+    );
+
+    let private_binary = fs::read_dir(sld_target.join("debug/deps"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.is_file()
+                && path.extension().is_none()
+                && path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("project-"))
+        })
+        .unwrap();
+    assert!(
+        !same_file::is_same_file(sld_target.join("debug/project"), private_binary).unwrap(),
+        "public SLD root output must remain detached from the private output"
+    );
+
+    build(&restored_target, true);
+    assert_eq!(cached_rlibs(&cache).len(), 2);
+    let restored_rlib = cached_rlib(&restored_target.join("debug/deps"));
+    assert!(
+        cached_rlibs(&cache)
+            .iter()
+            .any(|cached| same_file::is_same_file(cached, &restored_rlib).unwrap()),
+        "a later SLD build should restore its provenance-bearing rlib"
+    );
+}
+
 #[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
 fn explicitly_configured_rustc_is_not_cacheable() {
     let cache = paths::root().join("shared-cache");
@@ -350,6 +462,28 @@ fn rustc_bootstrap_requests_are_not_cacheable() {
         )
         .env("CARGO_INCREMENTAL", "1")
         .env("RUSTC_BOOTSTRAP", "1")
+        .run();
+
+    assert!(cached_rlibs(&cache).is_empty());
+}
+
+#[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
+fn inherited_sld_provenance_is_not_cacheable() {
+    let cache = paths::root().join("shared-cache");
+    let project = project_with_cache("project", &cache, "hardlink", 42);
+    let target = project.root().join("target-dir");
+
+    project
+        .cargo("-Zartifact-cache build --lib")
+        .arg("--target-dir")
+        .arg(&target)
+        .masquerade_as_nightly_cargo(&["artifact-cache"])
+        .env(
+            cargo_util::paths::dylib_path_envvar(),
+            isolated_loader_path(),
+        )
+        .env("CARGO_INCREMENTAL", "1")
+        .env("SLD_RUSTC_WORK_PRODUCT_PROVENANCE", "1")
         .run();
 
     assert!(cached_rlibs(&cache).is_empty());

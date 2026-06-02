@@ -538,8 +538,10 @@ codegen backend libraries, runtime Cranelift or GCC backend controls, custom tar
 specifications or target search paths, explicit sysroot overrides, Windows
 GNU-family targets whose raw-dylib support can invoke unmodeled `dlltool`
 programs, unmodeled unstable rustc options, unmodeled dynamic loader overrides,
-unmodeled dependency search paths, or unsupported native-link or extra-output
-inputs.
+unmodeled dependency search paths, inherited SLD work-product provenance
+controls, or unsupported native-link or extra-output inputs.
+The modeled unstable rustc options are named sysroot codegen backends and
+`-Zpreserve-duplicate-constants={yes,no}`.
 Cache keys preserve source-location and a content identity for modeled
 Cargo-selected compiler paths, installed sysroot compiler and target library
 file identity, cache-safe installed codegen backend contents, and compiler-visible

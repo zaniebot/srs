@@ -6832,10 +6832,32 @@ fn sld_native_incremental_no_write_reuse_stays_fresh() {
         cargo
     };
     cargo().run();
+    let private_binary = p
+        .glob("target/debug/deps/foo-*")
+        .filter_map(Result::ok)
+        .find(|path| path.is_file() && path.extension().is_none())
+        .unwrap();
+    let private_modified = fs::metadata(&private_binary).unwrap().modified().unwrap();
+    let freshness_stamps = p
+        .glob("target/debug/.fingerprint/foo-*/sld-native-incremental-complete.timestamp")
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    assert_eq!(freshness_stamps.len(), 1);
+    let freshness_stamp = &freshness_stamps[0];
+    let freshness_modified = fs::metadata(freshness_stamp).unwrap().modified().unwrap();
 
     sleep_ms(1000);
     p.change_file("bar/src/lib.rs", "pub fn value() -> u8 { 43 }");
     cargo().env("SLD_TEST_SKIP_ROOT_RUSTC", "1").run();
+    assert_eq!(
+        fs::metadata(&private_binary).unwrap().modified().unwrap(),
+        private_modified,
+        "Cargo must not change the SLD-owned private output after no-write reuse"
+    );
+    assert!(
+        fs::metadata(freshness_stamp).unwrap().modified().unwrap() > freshness_modified,
+        "Cargo's SLD freshness stamp must advance after no-write reuse"
+    );
     cargo()
         .env("SLD_TEST_PANIC_IF_ROOT_RUSTC", "1")
         .with_stderr_does_not_contain("[COMPILING] foo v0.1.0 ([ROOT]/foo)")
