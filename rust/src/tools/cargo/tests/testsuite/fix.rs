@@ -1998,9 +1998,19 @@ fn fix_in_dependency() {
         )
         .publish();
 
+    // Use a relative Cargo home from a virtual workspace root so the rustc
+    // proxy runs from a different directory than the process that resolved the
+    // protected cache root.
     let p = project()
         .file(
             "Cargo.toml",
+            r#"
+                [workspace]
+                members = ["member"]
+            "#,
+        )
+        .file(
+            "member/Cargo.toml",
             r#"
                 [package]
                 name = "foo"
@@ -2012,7 +2022,7 @@ fn fix_in_dependency() {
             "#,
         )
         .file(
-            "src/lib.rs",
+            "member/src/lib.rs",
             r#"
                 pub fn foo() {
                     bar::m!(abc);
@@ -2020,7 +2030,7 @@ fn fix_in_dependency() {
             "#,
         )
         .build();
-    p.cargo("fetch").run();
+    p.cargo("fetch").env("CARGO_HOME", "../home/.cargo").run();
 
     // The path in CARGO_HOME.
     let bar_path = std::fs::read_dir(paths::home().join(".cargo/registry/src"))
@@ -2145,11 +2155,12 @@ fn fix_in_dependency() {
     // It is OK to compare the full diagnostic output here because the text is
     // hard-coded in rustc-replay. Normally tests should not be checking the
     // compiler output.
-    p.cargo("fix --lib --allow-no-vcs")
+    p.cargo("fix --lib --allow-no-vcs -p foo")
+        .env("CARGO_HOME", "../home/.cargo")
         .env("RUSTC", &rustc_bin)
         .with_stderr_data(str![[r#"
 [CHECKING] bar v1.0.0
-[CHECKING] foo v0.1.0 ([ROOT]/foo)
+[CHECKING] foo v0.1.0 ([ROOT]/foo/member)
 [WARNING] unused variable: `abc`
  --> [ROOT]/home/.cargo/registry/src/-[HASH]/bar-1.0.0/src/lib.rs:5:29
   |
