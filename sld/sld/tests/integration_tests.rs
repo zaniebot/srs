@@ -2575,6 +2575,11 @@ impl ProgramInputs {
                     self.name()
                 );
             }
+            if config.platform == PlatformKind::MachO
+                && !config.test_incremental_unsigned_macho_output
+            {
+                verify_macho_signature(&immediate_changed_output.binary)?;
+            }
 
             let immediate_log_path =
                 append_to_path(&immediate_changed_output.binary, ".incr").join("log");
@@ -2631,6 +2636,11 @@ impl ProgramInputs {
                     restore the seed output",
                     self.name()
                 );
+            }
+            if config.platform == PlatformKind::MachO
+                && !config.test_incremental_unsigned_macho_output
+            {
+                verify_macho_signature(&restored_output.binary)?;
             }
         }
 
@@ -2741,6 +2751,24 @@ impl ProgramInputs {
                     self.name()
                 )
             })?;
+        let rewritten_input_message = "updated 1 rewritten input file before loading inputs";
+        let normalized_rust_archive_input_message =
+            "updated 1 unchanged normalized Rust archive input file before loading inputs";
+        let metadata_update_count = |log: &str| {
+            log.matches(rewritten_input_message).count()
+                + if rewritten_input
+                    .path
+                    .extension()
+                    .is_some_and(|extension| extension == "rlib")
+                {
+                    log.matches(normalized_rust_archive_input_message).count()
+                } else {
+                    0
+                }
+        };
+        let log = std::fs::read_to_string(&log_path)
+            .with_context(|| format!("Failed to read incremental log `{}`", log_path.display()))?;
+        let metadata_update_count_before = metadata_update_count(&log);
         rewrite_file_with_same_contents(&rewritten_input.path)?;
         let link_output_rewritten =
             Linker::Sld.link(self.name(), inputs, &incremental_config, cross_arch)?;
@@ -2759,7 +2787,7 @@ impl ProgramInputs {
         }
         let log = std::fs::read_to_string(&log_path)
             .with_context(|| format!("Failed to read incremental log `{}`", log_path.display()))?;
-        if !log.contains("updated 1 rewritten input file before loading inputs") {
+        if metadata_update_count(&log) <= metadata_update_count_before {
             bail!(
                 "Incremental test failed for {}: rewritten input with unchanged content did not \
                 update metadata before loading all inputs. Log:\n{}",
