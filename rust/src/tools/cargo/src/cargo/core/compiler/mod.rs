@@ -146,6 +146,8 @@ const ARTIFACT_CACHE_RESTORE_MATERIALIZED_READY_FILE_FOR_TESTS: &str =
     "__CARGO_TEST_ARTIFACT_CACHE_RESTORE_MATERIALIZED_READY_FILE";
 const ARTIFACT_CACHE_RESTORE_MATERIALIZED_RELEASE_FILE_FOR_TESTS: &str =
     "__CARGO_TEST_ARTIFACT_CACHE_RESTORE_MATERIALIZED_RELEASE_FILE";
+const ARTIFACT_CACHE_RESTORE_MATERIALIZED_STALE_IDENTITY_FOR_TESTS: &str =
+    "__CARGO_TEST_ARTIFACT_CACHE_RESTORE_MATERIALIZED_STALE_IDENTITY";
 const ARTIFACT_CACHE_RESTORE_ADMITTED_DELAY_MS_FOR_TESTS: &str =
     "__CARGO_TEST_ARTIFACT_CACHE_RESTORE_ADMITTED_DELAY_MS";
 const ARTIFACT_CACHE_RESTORE_ADMITTED_READY_FILE_FOR_TESTS: &str =
@@ -2100,7 +2102,8 @@ fn restore_rlib_cache(
             materialize_rlib_cache_file(&stored, &output.path, materialization)?;
         }
         delay_rlib_cache_restore_materialized_for_tests()?;
-        if compiler_loader_inputs_digest(loader_input_paths)? != *loader_inputs_digest
+        if !restore_materialized_identity_witness_is_current(identity_witness)
+            || compiler_loader_inputs_digest(loader_input_paths)? != *loader_inputs_digest
             || artifact_cache_action_inputs_digest(rustc, rustc_cwd)? != *action_inputs_digest
         {
             debug!("not restoring artifact cache entry with inputs modified during restore");
@@ -2756,6 +2759,19 @@ fn delay_rlib_cache_restore_materialized_for_tests() -> CargoResult<()> {
         paths::write(Path::new(&path), b"ready")?;
     }
     wait_for_rlib_cache_test_release(release)
+}
+
+fn restore_materialized_identity_witness_is_current(
+    identity_witness: &crate::util::rustc::ArtifactCacheIdentityWitness,
+) -> bool {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test-only hook is intentionally outside user configuration"
+    )]
+    if std::env::var_os(ARTIFACT_CACHE_RESTORE_MATERIALIZED_STALE_IDENTITY_FOR_TESTS).is_some() {
+        return false;
+    }
+    identity_witness.is_current()
 }
 
 fn wait_for_rlib_cache_test_release(release: Option<OsString>) -> CargoResult<()> {
