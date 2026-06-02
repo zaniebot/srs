@@ -204,7 +204,7 @@ pub(crate) fn compile_global_asm(
     );
 
     // Assemble `global_asm`
-    if option_env!("CG_CLIF_FORCE_GNU_AS").is_some() {
+    if std::env::var_os("CG_CLIF_FORCE_GNU_AS").is_some() {
         let mut child = Command::new(&config.assembler)
             .arg("-o")
             .arg(&global_asm_object_file)

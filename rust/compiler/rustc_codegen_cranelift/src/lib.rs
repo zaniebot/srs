@@ -364,6 +364,10 @@ fn build_isa(sess: &Session, jit: bool) -> Arc<dyn TargetIsa + 'static> {
 }
 
 /// This is the entrypoint for a hot plugged rustc_codegen_cranelift
+#[used]
+static RUSTC_CODEGEN_BACKEND_ARTIFACT_CACHE_SAFE_V1: [u8; 44] =
+    *b"rustc-codegen-backend-artifact-cache-safe-v1";
+
 #[unsafe(no_mangle)]
 pub fn __rustc_codegen_backend() -> Box<dyn CodegenBackend> {
     Box::new(CraneliftCodegenBackend { config: OnceCell::new() })
