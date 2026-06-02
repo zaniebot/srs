@@ -18,6 +18,19 @@ name="srs-snapshot-smoke"
 snapshot_dir="$install_root/$name"
 host="fake-host"
 
+write_fake_clippy_bins() {
+    local version="$1"
+
+    for bin in cargo-clippy clippy-driver; do
+        cat > "$toolchain_dir/bin/$bin" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'fake $bin $version\n'
+EOF
+        chmod +x "$toolchain_dir/bin/$bin"
+    done
+}
+
 mkdir -p \
     "$toolchain_dir/bin" \
     "$toolchain_dir/lib/rustlib/rustc-src" \
@@ -46,6 +59,7 @@ fi
 printf 'fake rustc A\n'
 EOF
 chmod +x "$toolchain_dir/bin/rustc"
+write_fake_clippy_bins A
 
 cat > "$cargo_bin" <<'EOF'
 #!/usr/bin/env bash
@@ -150,6 +164,8 @@ done
 
 before="$(cksum \
     "$snapshot_dir/bin/rustc" \
+    "$snapshot_dir/bin/cargo-clippy" \
+    "$snapshot_dir/bin/clippy-driver" \
     "$snapshot_dir/bin/cargo" \
     "$snapshot_dir/bin/cargo-srs-real" \
     "$snapshot_dir/lib/rustlib/$host/bin/sld")"
@@ -165,6 +181,14 @@ if [[ "$("$snapshot_dir/bin/cargo")" != "fake cargo A" ]]; then
     printf 'installed Cargo stopped working after source cleanup\n' >&2
     exit 1
 fi
+if [[ "$("$snapshot_dir/bin/cargo-clippy")" != "fake cargo-clippy A" ]]; then
+    printf 'installed cargo-clippy stopped working after source cleanup\n' >&2
+    exit 1
+fi
+if [[ "$("$snapshot_dir/bin/clippy-driver")" != "fake clippy-driver A" ]]; then
+    printf 'installed clippy-driver stopped working after source cleanup\n' >&2
+    exit 1
+fi
 if [[ "$("$snapshot_dir/lib/rustlib/$host/bin/sld")" != "fake sld A" ]]; then
     printf 'installed sld stopped working after source cleanup\n' >&2
     exit 1
@@ -172,6 +196,8 @@ fi
 
 after="$(cksum \
     "$snapshot_dir/bin/rustc" \
+    "$snapshot_dir/bin/cargo-clippy" \
+    "$snapshot_dir/bin/clippy-driver" \
     "$snapshot_dir/bin/cargo" \
     "$snapshot_dir/bin/cargo-srs-real" \
     "$snapshot_dir/lib/rustlib/$host/bin/sld")"
@@ -369,6 +395,7 @@ fi
 printf 'fake rustc B\n'
 EOF
 chmod +x "$toolchain_dir/bin/rustc"
+write_fake_clippy_bins B
 
 cat > "$cargo_bin" <<'EOF'
 #!/usr/bin/env bash
