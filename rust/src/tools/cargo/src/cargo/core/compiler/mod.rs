@@ -2630,14 +2630,15 @@ fn store_rlib_cache(
         debug!("not storing artifact cache entry with action inputs modified during compilation");
         return Ok(false);
     }
-    let Some(inputs_digest) = rlib_cache_inputs_digest(rustc_dep_info_loc, rustc_cwd)? else {
+    let Some(inputs_digest) = rlib_cache_inputs_digest_matching_rustc_dep_info(
+        rustc_dep_info_loc,
+        rustc_cwd,
+        invocation_time,
+    )?
+    else {
         debug!("not storing artifact cache entry with unreadable compiler-discovered inputs");
         return Ok(false);
     };
-    if rlib_cache_inputs_modified_since(rustc_dep_info_loc, rustc_cwd, invocation_time)? {
-        debug!("not storing artifact cache entry with inputs modified during compilation");
-        return Ok(false);
-    }
     let cache_root = entry_root.parent().unwrap_or(entry_root);
     let Some(_lock) = try_write_lock_rlib_cache(cache_root)? else {
         return Ok(false);
@@ -2761,6 +2762,13 @@ fn store_rlib_cache(
         delay_rlib_cache_publish_for_tests()?;
         if compiler_loader_inputs_digest(loader_input_paths)? != *loader_inputs_digest
             || artifact_cache_action_inputs_digest(rustc, rustc_cwd)? != *action_inputs_digest
+            || rlib_cache_inputs_digest_matching_rustc_dep_info(
+                rustc_dep_info_loc,
+                rustc_cwd,
+                invocation_time,
+            )?
+            .as_deref()
+                != Some(&inputs_digest)
         {
             debug!("not storing artifact cache entry with inputs modified during staging");
             paths::remove_dir_all(&staging)?;
@@ -2947,33 +2955,62 @@ fn rlib_cache_inputs_are_supported(
     }))
 }
 
-fn rlib_cache_inputs_digest(
-    rustc_dep_info_loc: &Path,
-    rustc_cwd: &Path,
-) -> CargoResult<Option<String>> {
-    rlib_cache_inputs_digest_with_env(rustc_dep_info_loc, rustc_cwd, |_, value| value.clone())
-}
-
-fn rlib_cache_inputs_modified_since(
+fn rlib_cache_inputs_digest_matching_rustc_dep_info(
     rustc_dep_info_loc: &Path,
     rustc_cwd: &Path,
     invocation_time: filetime::FileTime,
-) -> CargoResult<bool> {
+) -> CargoResult<Option<String>> {
+    if !rustc_dep_info_loc.exists() {
+        return Ok(None);
+    }
     let depinfo = fingerprint::parse_rustc_dep_info(rustc_dep_info_loc)?;
-    for file in depinfo.files.keys() {
+    let mut files = depinfo.files.into_iter().collect::<Vec<_>>();
+    files.sort_by(|(left, _), (right, _)| left.cmp(right));
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"cargo-artifact-cache-inputs-v1\0");
+    for (file, checksum_info) in files {
         let path = if file.is_absolute() {
-            file.to_path_buf()
+            file.clone()
         } else {
-            rustc_cwd.join(file)
+            rustc_cwd.join(&file)
         };
+        let Ok(contents) = fs::read(&path) else {
+            return Ok(None);
+        };
+        if let Some((file_len, checksum)) = checksum_info {
+            // Validate and key the same bytes so a same-mtime edit cannot
+            // publish the compiled artifact under the edited input's digest.
+            if contents.len() as u64 != file_len
+                || fingerprint::Checksum::compute(checksum.algo(), contents.as_slice())? != checksum
+            {
+                return Ok(None);
+            }
+        }
         let Ok(mtime) = paths::mtime(&path) else {
-            return Ok(true);
+            return Ok(None);
         };
         if mtime >= invocation_time {
-            return Ok(true);
+            return Ok(None);
         }
+        hasher.update(file.as_os_str().as_encoded_bytes());
+        hasher.update(b"\0");
+        hasher.update(&contents);
+        hasher.update(b"\0");
     }
-    Ok(false)
+    let mut envs = depinfo.env.iter().collect::<Vec<_>>();
+    envs.sort_by_key(|(key, _)| key.as_str());
+    for (key, value) in envs {
+        hasher.update(key.as_bytes());
+        hasher.update(b"=");
+        if let Some(value) = value {
+            hasher.update(b"set\0");
+            hasher.update(value.as_bytes());
+        } else {
+            hasher.update(b"unset\0");
+        }
+        hasher.update(b"\0");
+    }
+    Ok(Some(hasher.finalize().to_hex().to_string()))
 }
 
 fn rlib_cache_inputs_digest_with_env(
