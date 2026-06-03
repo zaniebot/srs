@@ -1088,6 +1088,7 @@ fn modeled_sysroot_codegen_backend_flag(arg: &str) -> bool {
 
 fn modeled_unstable_flag(arg: &str) -> bool {
     modeled_sysroot_codegen_backend_flag(arg)
+        || arg == "checksum-hash-algorithm=blake3"
         || matches!(
             arg,
             "preserve-duplicate-constants=yes" | "preserve-duplicate-constants=no"
@@ -1592,6 +1593,42 @@ mod artifact_cache_admission_tests {
             Path::new("target/debug/deps"),
             Path::new("rustc"),
             "aarch64-apple-darwin"
+        ));
+    }
+
+    #[test]
+    fn checksum_freshness_hash_algorithm_is_cacheable() {
+        let output_root = Path::new("target/debug/deps");
+        let compiler = Path::new("rustc");
+        let host = "aarch64-apple-darwin";
+
+        let mut split = ordinary_rlib_command();
+        split.arg("-Z").arg("checksum-hash-algorithm=blake3");
+        assert!(rlib_action_is_cacheable(
+            &split,
+            output_root,
+            compiler,
+            host
+        ));
+
+        let mut compact = ordinary_rlib_command();
+        compact.arg("-Zchecksum-hash-algorithm=blake3");
+        assert!(rlib_action_is_cacheable(
+            &compact,
+            output_root,
+            compiler,
+            host
+        ));
+
+        let mut unmodeled_algorithm = ordinary_rlib_command();
+        unmodeled_algorithm
+            .arg("-Z")
+            .arg("checksum-hash-algorithm=unmodeled");
+        assert!(!rlib_action_is_cacheable(
+            &unmodeled_algorithm,
+            output_root,
+            compiler,
+            host
         ));
     }
 

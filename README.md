@@ -119,7 +119,12 @@ cargo +srs build
 ```
 
 The installed Cargo wrapper sets `SLD_INCREMENTAL=1` by default so `sld` can
-reuse link state across development builds. On Apple silicon macOS, it also
+reuse link state across development builds. It passes `-Z checksum-freshness`
+so touched-but-unchanged source files stay fresh and source content changes are
+detected even when their mtimes are preserved. Build-script inputs, including
+`rerun-if-changed` paths and generated outputs, remain mtime-driven.
+
+On Apple silicon macOS, the wrapper also
 requests signed private root-executable outputs and transient-input
 stabilization from the patched Cargo binary. Rustc also supplies SLD with
 persisted work-product digests so unchanged root objects can retain isolated
@@ -166,6 +171,9 @@ previously restored by hardlink.
 See [Shared Cargo artifact cache](context/shared-cargo-artifact-cache.md) for
 the cache admission rules, compiler identity model, concurrency behavior, and
 operational details.
+
+Set `SRS_CARGO_CHECKSUM_FRESHNESS=0` to restore Cargo's default mtime-based
+source freshness while investigating a build.
 
 Set `SRS_CARGO_ARTIFACT_CACHE=0` to disable shared artifact restoration and
 publication.
