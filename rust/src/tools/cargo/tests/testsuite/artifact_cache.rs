@@ -183,6 +183,20 @@ fn build_in_target(project: &Project, target_dir: &Path) {
         .run();
 }
 
+fn build_in_target_with_checksum_freshness(project: &Project, target_dir: &Path) {
+    project
+        .cargo("-Zartifact-cache -Zchecksum-freshness build --lib")
+        .arg("--target-dir")
+        .arg(target_dir)
+        .masquerade_as_nightly_cargo(&["artifact-cache", "checksum-freshness"])
+        .env(
+            cargo_util::paths::dylib_path_envvar(),
+            isolated_loader_path(),
+        )
+        .env("CARGO_INCREMENTAL", "1")
+        .run();
+}
+
 fn build_in_target_with_env(project: &Project, target_dir: &Path, key: &str, value: &str) {
     project
         .cargo("-Zartifact-cache build --lib")
@@ -705,6 +719,42 @@ fn hardlink_restore_detaches_before_rebuild() {
             .iter()
             .any(|path| fs::read(path).unwrap() == stored_before)
     );
+}
+
+#[cargo_test(
+    nightly,
+    reason = "-Zartifact-cache and -Zchecksum-freshness are unstable"
+)]
+#[cfg(unix)]
+fn checksum_freshness_same_mtime_edit_does_not_restore_stale_artifact() {
+    use std::os::unix::fs::MetadataExt;
+
+    let cache = paths::root().join("shared-cache");
+    let project = project_with_cache("project", &cache, "hardlink", 42);
+    let producer_target = project.root().join("producer-target");
+    let restored_target = project.root().join("restored-target");
+    let rebuilt_target = project.root().join("rebuilt-target");
+    let source = project.root().join("src/lib.rs");
+
+    build_in_target_with_checksum_freshness(&project, &producer_target);
+    let stored = cached_rlib(&cache);
+    let stored_contents = fs::read(&stored).unwrap();
+    build_in_target_with_checksum_freshness(&project, &restored_target);
+    let restored = cached_rlib(&restored_target.join("debug").join("deps"));
+    assert_eq!(
+        fs::metadata(&stored).unwrap().ino(),
+        fs::metadata(&restored).unwrap().ino()
+    );
+
+    let source_mtime =
+        filetime::FileTime::from_last_modification_time(&fs::metadata(&source).unwrap());
+    project.change_file("src/lib.rs", "pub fn value() -> u32 { 43 }\n");
+    filetime::set_file_mtime(&source, source_mtime).unwrap();
+    build_in_target_with_checksum_freshness(&project, &rebuilt_target);
+
+    assert_eq!(cached_rlibs(&cache).len(), 2);
+    let rebuilt = fs::read(cached_rlib(&rebuilt_target.join("debug").join("deps"))).unwrap();
+    assert_ne!(stored_contents, rebuilt);
 }
 
 #[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]

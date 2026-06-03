@@ -67,6 +67,7 @@ unset SRS_ENCODED_TARGET_RUSTFLAGS
 unset CARGO_ENCODED_RUSTFLAGS
 unset RUSTFLAGS
 unset SRS_CARGO_ARTIFACT_CACHE
+unset SRS_CARGO_CHECKSUM_FRESHNESS
 unset SRS_CARGO_ARTIFACT_CACHE_DIR
 unset SRS_CARGO_ARTIFACT_CACHE_MATERIALIZATION
 unset SRS_CARGO_ARTIFACT_CACHE_MAX_SIZE
@@ -76,6 +77,7 @@ unset CARGO_BUILD_ARTIFACT_CACHE_MAX_SIZE
 
 SRS_TEST_UNAME_S=Darwin SRS_TEST_UNAME_M=arm64 run_wrapper darwin-default build
 assert_args darwin-default \
+    -Z checksum-freshness \
     -Z artifact-cache \
     -Z sld-native-incremental \
     -Z host-config \
@@ -131,6 +133,7 @@ assert_env_does_not_contain darwin-encoded-overrides "RUSTFLAGS"
 SLD_INCREMENTAL=0 SRS_TEST_UNAME_S=Darwin SRS_TEST_UNAME_M=arm64 \
     run_wrapper darwin-disabled build
 assert_args darwin-disabled \
+    -Z checksum-freshness \
     -Z artifact-cache \
     -Z host-config \
     -Z target-applies-to-host \
@@ -148,6 +151,7 @@ assert_env_does_not_contain darwin-disabled "SLD_RUSTC_WORK_PRODUCT_PROVENANCE"
 
 SRS_TEST_UNAME_S=Linux SRS_TEST_UNAME_M=x86_64 run_wrapper linux-default build
 assert_args linux-default \
+    -Z checksum-freshness \
     -Z artifact-cache \
     -Z host-config \
     -Z target-applies-to-host \
@@ -168,6 +172,7 @@ SRS_TEST_UNAME_S=Linux \
 SRS_TEST_UNAME_M=x86_64 \
     run_wrapper cache-disabled build
 assert_args cache-disabled \
+    -Z checksum-freshness \
     -Z artifact-cache \
     --config build.artifact-cache=false \
     -Z host-config \
@@ -178,6 +183,18 @@ assert_args cache-disabled \
 assert_env_does_not_contain cache-disabled "CARGO_BUILD_ARTIFACT_CACHE_DIR"
 assert_env_does_not_contain cache-disabled "CARGO_BUILD_ARTIFACT_CACHE_MATERIALIZATION"
 assert_env_does_not_contain cache-disabled "CARGO_BUILD_ARTIFACT_CACHE_MAX_SIZE"
+
+SRS_CARGO_CHECKSUM_FRESHNESS=0 \
+SRS_TEST_UNAME_S=Linux \
+SRS_TEST_UNAME_M=x86_64 \
+    run_wrapper checksum-disabled build
+assert_args checksum-disabled \
+    -Z artifact-cache \
+    -Z host-config \
+    -Z target-applies-to-host \
+    --config 'target-applies-to-host=false' \
+    --config 'host.rustflags=["-Zcodegen-backend=llvm"]' \
+    build
 
 SRS_CARGO_ARTIFACT_CACHE_DIR="$scratch/srs-cache" \
 SRS_CARGO_ARTIFACT_CACHE_MATERIALIZATION=copy \

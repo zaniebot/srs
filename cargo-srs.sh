@@ -9,6 +9,14 @@ if [[ ! -x "$real_cargo" ]]; then
     exit 2
 fi
 
+# Use content checksums for source freshness so unchanged touches stay fresh
+# and content edits are detected even when their mtimes are preserved.
+if [[ "${SRS_CARGO_CHECKSUM_FRESHNESS:-1}" != "0" ]]; then
+    checksum_freshness_args=(-Z checksum-freshness)
+else
+    checksum_freshness_args=()
+fi
+
 # Target artifacts link through sld by default. Preserve an explicit override
 # while making incremental link reuse the normal SRS developer-loop behavior.
 export SLD_INCREMENTAL="${SLD_INCREMENTAL:-1}"
@@ -66,6 +74,7 @@ fi
 
 if [[ "${#sld_native_incremental_args[@]}" -gt 0 ]]; then
     exec "$real_cargo" \
+        ${checksum_freshness_args[@]+"${checksum_freshness_args[@]}"} \
         "${artifact_cache_args[@]}" \
         "${sld_native_incremental_args[@]}" \
         -Z host-config \
@@ -76,6 +85,7 @@ if [[ "${#sld_native_incremental_args[@]}" -gt 0 ]]; then
 fi
 
 exec "$real_cargo" \
+    ${checksum_freshness_args[@]+"${checksum_freshness_args[@]}"} \
     "${artifact_cache_args[@]}" \
     -Z host-config \
     -Z target-applies-to-host \
