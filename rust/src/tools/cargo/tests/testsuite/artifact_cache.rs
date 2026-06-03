@@ -3232,6 +3232,119 @@ fn input_changed_after_compilation_is_not_published() {
     assert_eq!(cached_rlibs(&cache).len(), 1);
 }
 
+#[cargo_test(
+    nightly,
+    reason = "-Zartifact-cache and -Zchecksum-freshness are unstable"
+)]
+fn same_mtime_input_changed_after_compilation_is_not_published() {
+    let cache = paths::root().join("shared-cache");
+    let project = project_with_cache("project", &cache, "hardlink", 42);
+    let producer_target = project.root().join("producer-build");
+    let consumer_target = project.root().join("consumer-build");
+    let source = project.root().join("src/lib.rs");
+    let source_mtime =
+        filetime::FileTime::from_last_modification_time(&fs::metadata(&source).unwrap());
+    let ready = project.root().join("input-digest-ready");
+    let release = project.root().join("input-digest-release");
+
+    let mut command = project
+        .cargo("-Zartifact-cache -Zchecksum-freshness build --lib")
+        .arg("--target-dir")
+        .arg(&producer_target)
+        .masquerade_as_nightly_cargo(&["artifact-cache", "checksum-freshness"])
+        .env(
+            cargo_util::paths::dylib_path_envvar(),
+            isolated_loader_path(),
+        )
+        .env("CARGO_INCREMENTAL", "1")
+        .env(
+            "__CARGO_TEST_ARTIFACT_CACHE_INPUT_DIGEST_READY_FILE",
+            &ready,
+        )
+        .env(
+            "__CARGO_TEST_ARTIFACT_CACHE_INPUT_DIGEST_RELEASE_FILE",
+            &release,
+        )
+        .build_command();
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let child = command.spawn().unwrap();
+    for _ in 0..100 {
+        if ready.exists() {
+            break;
+        }
+        sleep_ms(50);
+    }
+    assert!(
+        ready.exists(),
+        "cargo did not reach the input-digest test hook"
+    );
+    project.change_file("src/lib.rs", "pub fn value() -> u32 { 43 }\n");
+    filetime::set_file_mtime(&source, source_mtime).unwrap();
+    fs::write(&release, b"release").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "producer build failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(cached_rlibs(&cache).is_empty());
+    build_in_target_with_checksum_freshness(&project, &consumer_target);
+    assert_eq!(cached_rlibs(&cache).len(), 1);
+}
+
+#[cargo_test(
+    nightly,
+    reason = "-Zartifact-cache and -Zchecksum-freshness are unstable"
+)]
+fn same_mtime_input_changed_during_publication_is_not_published() {
+    let cache = paths::root().join("shared-cache");
+    let project = project_with_cache("project", &cache, "hardlink", 42);
+    let producer_target = project.root().join("producer-build");
+    let consumer_target = project.root().join("consumer-build");
+    let source = project.root().join("src/lib.rs");
+    let source_mtime =
+        filetime::FileTime::from_last_modification_time(&fs::metadata(&source).unwrap());
+    let ready = project.root().join("publish-ready");
+    let release = project.root().join("publish-release");
+
+    let mut command = project
+        .cargo("-Zartifact-cache -Zchecksum-freshness build --lib")
+        .arg("--target-dir")
+        .arg(&producer_target)
+        .masquerade_as_nightly_cargo(&["artifact-cache", "checksum-freshness"])
+        .env(
+            cargo_util::paths::dylib_path_envvar(),
+            isolated_loader_path(),
+        )
+        .env("CARGO_INCREMENTAL", "1")
+        .env("__CARGO_TEST_ARTIFACT_CACHE_PUBLISH_READY_FILE", &ready)
+        .env("__CARGO_TEST_ARTIFACT_CACHE_PUBLISH_RELEASE_FILE", &release)
+        .build_command();
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let child = command.spawn().unwrap();
+    for _ in 0..100 {
+        if ready.exists() {
+            break;
+        }
+        sleep_ms(50);
+    }
+    assert!(ready.exists(), "cargo did not reach the publish test hook");
+    project.change_file("src/lib.rs", "pub fn value() -> u32 { 43 }\n");
+    filetime::set_file_mtime(&source, source_mtime).unwrap();
+    fs::write(&release, b"release").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "producer build failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(cached_rlibs(&cache).is_empty());
+    build_in_target_with_checksum_freshness(&project, &consumer_target);
+    assert_eq!(cached_rlibs(&cache).len(), 1);
+}
+
 #[cargo_test(nightly, reason = "-Zartifact-cache is unstable")]
 #[cfg(unix)]
 fn tracked_environment_values_restore_independent_cached_variants() {
