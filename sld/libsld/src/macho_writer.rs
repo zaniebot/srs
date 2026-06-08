@@ -719,10 +719,12 @@ fn path_matches_library(path: &[u8], library: &[u8]) -> bool {
 mod tests {
     use super::compact_unwind_dwarf_offset_hint;
     use super::compact_unwind_section_addend;
+    use super::encode_chained_rebase;
     use super::path_matches_library;
     use super::rewrite_compacted_macho_eh_frame_cie_pointers;
     use super::section_may_contain_data_fixup;
     use super::sorted_ranges_contain;
+    use crate::macho::MACHO_START_MEM_ADDRESS;
     use linker_utils::relaxation::SectionRelaxDeltas;
 
     #[test]
@@ -793,6 +795,18 @@ mod tests {
             0x10e24
         );
         assert_eq!(compact_unwind_section_addend(None, 0x139d4), 0x139d4);
+    }
+
+    #[test]
+    fn chained_rebase_preserves_high8() {
+        let runtime_offset = 0x1234;
+        let next_stride = 7;
+        let value = (0x80 << 56) | (MACHO_START_MEM_ADDRESS + runtime_offset);
+
+        assert_eq!(
+            encode_chained_rebase(value, next_stride).unwrap(),
+            runtime_offset | (0x80 << 36) | (next_stride << 51)
+        );
     }
 
     #[test]
@@ -1903,7 +1917,9 @@ fn rewrite_pageoff_load_to_add(out: &mut [u8]) -> Result {
 }
 
 fn encode_chained_rebase(value: u64, next_stride: u64) -> Result<u64> {
-    let runtime_offset = value
+    let high8 = value >> 56;
+    let address = value & ((1 << 56) - 1);
+    let runtime_offset = address
         .checked_sub(MACHO_START_MEM_ADDRESS)
         .with_context(|| format!("Cannot encode Mach-O chained rebase target {value:#x}"))?;
     ensure!(
@@ -1914,7 +1930,7 @@ fn encode_chained_rebase(value: u64, next_stride: u64) -> Result<u64> {
         next_stride < 0x1000,
         "Mach-O chained rebase next stride {next_stride:#x} exceeds 12 bits"
     );
-    Ok(runtime_offset | (next_stride << 51))
+    Ok(runtime_offset | (high8 << 36) | (next_stride << 51))
 }
 
 fn encode_chained_bind(import_index: usize, next_stride: u64) -> Result<u64> {
@@ -3851,6 +3867,19 @@ fn write_internal_symbols<'data>(
         };
 
         let symbol_name = layout.symbol_db.symbol_name(symbol_id)?;
+        let optional_section_is_absent = def_info.section_if_present
+            && match def_info.placement {
+                crate::parsing::SymbolPlacement::SectionStart(section_id)
+                | crate::parsing::SymbolPlacement::SectionEnd(section_id) => {
+                    let section_id = layout.output_sections.primary_output_section(section_id);
+                    !<MachO as crate::platform::Platform>::section_boundary_symbol_matches(
+                        def_info.name,
+                        section_id,
+                        &layout.output_sections,
+                    ) || symbol_writer.section_indices.get(section_id).is_none()
+                }
+                _ => false,
+            };
         let (section, symbol_type) = match def_info.placement {
             crate::parsing::SymbolPlacement::Undefined
             | crate::parsing::SymbolPlacement::ForceUndefined => {
@@ -3858,6 +3887,12 @@ fn write_internal_symbols<'data>(
             }
             crate::parsing::SymbolPlacement::DefsymAbsolute(_)
             | crate::parsing::SymbolPlacement::Redirect(_) => {
+                (0, macho_internal_symbol_type(def_info, N_ABS))
+            }
+            crate::parsing::SymbolPlacement::SectionStart(_)
+            | crate::parsing::SymbolPlacement::SectionEnd(_)
+                if optional_section_is_absent =>
+            {
                 (0, macho_internal_symbol_type(def_info, N_ABS))
             }
             crate::parsing::SymbolPlacement::SectionStart(section_id)
