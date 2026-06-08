@@ -2,7 +2,8 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-sld_bin="${SRS_SLD_BIN:-$root/target/sld/opt/sld}"
+sld_profile="${SRS_SLD_PROFILE:-opt}"
+sld_bin="${SRS_SLD_BIN:-$root/target/sld/$sld_profile/sld}"
 
 if [[ "$#" -eq 0 ]]; then
     printf 'usage: %s command [args...]\n' "$0" >&2

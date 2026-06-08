@@ -70,6 +70,35 @@ rustc +srs -Vv
 cargo +srs -Vv
 ```
 
+## Install A Release
+
+Tagged releases provide self-contained toolchain snapshots for Linux x86_64
+and Apple silicon macOS. Download the archive matching the host tuple reported
+by Rust, verify its checksum, and link the extracted snapshot into rustup:
+
+```bash
+tag=2026.06.08
+target="$(rustc -vV | sed -n 's/^host: //p')"
+archive="srs-${tag}-${target}.tar.gz"
+install_root="$HOME/code/tmp/srs-toolchains"
+
+mkdir -p "$install_root"
+gh release download "$tag" \
+    --repo zanieb/srs \
+    --pattern "$archive*" \
+    --dir "$install_root"
+(cd "$install_root" && shasum -a 256 -c "$archive.sha256")
+tar -C "$install_root" -xzf "$install_root/$archive"
+rustup toolchain link "srs-${tag}" \
+    "$install_root/srs-${tag}-${target}"
+```
+
+Dispatch the Release workflow from `main` to publish a release. It uses the
+dispatch's UTC date as a zero-padded CalVer tag such as `2026.06.08`, builds
+both supported hosts, and creates the tag only after both archives are ready.
+A second release on the same UTC date is refused instead of replacing an
+existing tag or release.
+
 `./build.sh` is the slow step. Re-run it after changing Rust, Cargo, Clippy,
 cg_clif, Cranelift, or the linker default. It builds `sld` with `stable` first so the
 installer can attach the built binary. Rust bootstrap stays on the system
@@ -212,8 +241,9 @@ toolchain:
 The wrapper sets the `RUSTFLAGS` form used by sld's own macOS Rust workflows:
 `-C linker=<sld> -C link-arg=-flavor -C link-arg=darwin`. By default it uses
 the `sld` binary from `./build-sld.sh` at `target/sld/opt/sld`; set
-`SRS_SLD_BIN` to test another binary. Normal `cargo +srs` commands do not need
-the wrapper after `./install.sh`.
+`SRS_SLD_PROFILE` to select another Cargo profile or `SRS_SLD_BIN` to test
+another binary. Normal `cargo +srs` commands do not need the wrapper after
+`./install.sh`.
 
 Use a separate rustup toolchain name when keeping multiple SRS builds linked:
 
