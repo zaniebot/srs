@@ -50,7 +50,10 @@ jobs:
           cargo test --lib artifact_cache
           cargo test --lib util::flock
           cargo test -p cargo-util atomic
-          cargo test --test testsuite artifact_cache -- --ignored --test-threads=1
+          cargo test --test testsuite artifact_cache -- --ignored --test-threads=1 \
+            --skip artifact_cache::checksum_freshness_same_mtime_edit_does_not_restore_stale_artifact \
+            --skip artifact_cache::same_mtime_input_changed_after_compilation_is_not_published \
+            --skip artifact_cache::same_mtime_input_changed_during_publication_is_not_published
           cargo test --test testsuite rustup::artifact_cache -- --test-threads=1
           cargo test --test testsuite freshness::workspace_member_dependency_stays_fresh_when_selected_directly -- --exact
 
@@ -94,6 +97,20 @@ jobs:
 
       - name: Install SRS
         run: ./install.sh
+
+      - name: Verify checksum freshness artifact cache composition
+        run: |
+          case "$RUNNER_OS" in
+            Linux) export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=cc ;;
+            macOS) export CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/clang ;;
+          esac
+          export SLD_INCREMENTAL=0
+          cargo +srs test --manifest-path rust/src/tools/cargo/Cargo.toml --test testsuite \
+            artifact_cache::checksum_freshness_same_mtime_edit_does_not_restore_stale_artifact -- --exact
+          cargo +srs test --manifest-path rust/src/tools/cargo/Cargo.toml --test testsuite \
+            artifact_cache::same_mtime_input_changed_after_compilation_is_not_published -- --exact
+          cargo +srs test --manifest-path rust/src/tools/cargo/Cargo.toml --test testsuite \
+            artifact_cache::same_mtime_input_changed_during_publication_is_not_published -- --exact
 
       - name: Verify Rust SRS regressions
         working-directory: rust
