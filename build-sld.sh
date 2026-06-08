@@ -6,6 +6,7 @@ sld_dir="${SRS_SLD_DIR:-$root/sld}"
 toolchain="${SRS_TOOLCHAIN:-srs}"
 target_dir="${SRS_SLD_TARGET_DIR:-$root/target/sld}"
 cargo_home="${SRS_CARGO_HOME:-$root/cargo-home}"
+profile="${SRS_SLD_PROFILE:-opt}"
 
 if [[ ! -f "$sld_dir/Cargo.toml" ]]; then
     printf 'missing sld checkout at %s\n' "$sld_dir" >&2
@@ -18,4 +19,4 @@ cd "$sld_dir"
 exec env \
     CARGO_HOME="$cargo_home" \
     CARGO_TARGET_DIR="$target_dir" \
-    cargo +"$toolchain" build --locked -p sld-linker --profile opt
+    cargo +"$toolchain" build --locked -p sld-linker --profile "$profile"
