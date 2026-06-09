@@ -183,5 +183,5 @@ jobs:
             --draft \
             --verify-tag \
             --generate-notes \
-            --title "SRS $RELEASE_TAG"
+            --title "$RELEASE_TAG"
           gh release edit "$RELEASE_TAG" --draft=false
