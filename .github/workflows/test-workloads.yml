@@ -64,3 +64,15 @@ jobs:
         run: |
           read -ra cargo_packages <<< "$CARGO_PACKAGES"
           cargo +srs build --locked "${cargo_packages[@]}"
+
+      - name: Verify uv panic unwinding
+        if: matrix.name == 'uv' && inputs.platform == 'linux'
+        working-directory: workload
+        run: |
+          for test in \
+            keyring::tests::fetch_url_no_host \
+            keyring::tests::fetch_url_with_empty_username \
+            keyring::tests::fetch_url_with_password
+          do
+            cargo +srs test -p uv-auth --lib "$test" -- --exact
+          done

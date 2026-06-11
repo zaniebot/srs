@@ -96,5 +96,19 @@ jobs:
           rustc +srs -Z unstable-options --print target-spec-json \
             | grep -q '"default-codegen-backend": "cranelift"'
 
+      - name: Verify Cranelift panic unwinding
+        if: runner.os == 'Linux'
+        run: |
+          cat > "$RUNNER_TEMP/catch-unwind.rs" <<'EOF'
+          fn main() {
+              std::panic::set_hook(Box::new(|_| {}));
+              assert!(std::panic::catch_unwind(|| panic!("expected panic")).is_err());
+          }
+          EOF
+          rustc +srs -C panic=unwind \
+            "$RUNNER_TEMP/catch-unwind.rs" \
+            -o "$RUNNER_TEMP/catch-unwind"
+          "$RUNNER_TEMP/catch-unwind"
+
       - name: Verify cargo +srs installed dependency-edit replay
         run: ./scripts/test-cargo-srs-native-incremental.sh
